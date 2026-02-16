@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MACAN // MEDIA PLAYER</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Bebas+Neue&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- NOISE -->
+<canvas id="noise-canvas"></canvas>
+
+<!-- BG VISUALIZER -->
+<div id="visualizer-bg"><canvas id="vis-canvas"></canvas></div>
+
+<!-- ART BLUR BG -->
+<div id="art-blur-bg"></div>
+
+<!-- ═══════════ HEADER ════════════════════════════════════ -->
+<header id="top-bar">
+  <div class="brand">
+    <svg width="26" height="26" viewBox="0 0 28 28" fill="none">
+      <polygon points="14,2 26,8 26,20 14,26 2,20 2,8" stroke="#E8FF00" stroke-width="1.5" fill="none"/>
+      <circle cx="14" cy="14" r="4" fill="#E8FF00"/>
+    </svg>
+    <div class="brand-text">
+      <span class="brand-name">MACAN</span>
+      <span class="brand-sub">MEDIA PLAYER</span>
+    </div>
+  </div>
+
+  <div class="header-center">
+    <div id="marquee-wrapper">
+      <div id="marquee-track">
+        <span id="marquee-text">— SELECT A TRACK TO BEGIN PLAYBACK —</span>
+        <span id="marquee-text-clone" aria-hidden="true">— SELECT A TRACK TO BEGIN PLAYBACK —</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="header-right">
+    <div id="clock-display">
+      <span id="clock-time">00:00:00</span>
+      <span id="clock-date">MON 00</span>
+    </div>
+    <div class="wm-controls">
+      <button class="wm-btn" id="btn-minimize" title="Minimize">─</button>
+      <button class="wm-btn danger" id="btn-close" title="Close">✕</button>
+    </div>
+  </div>
+</header>
+
+<!-- ═══════════ MAIN LAYOUT ══════════════════════════════ -->
+<div id="main-layout">
+
+  <!-- ── LEFT: NOW PLAYING ── -->
+  <section id="now-playing-panel">
+
+    <div id="art-frame">
+      <div id="art-ring-outer"></div>
+      <div id="art-ring-inner"></div>
+      <div id="album-art-wrapper">
+        <img id="album-art" src="" alt="Cover Art"/>
+        <div id="album-art-placeholder">
+          <svg width="72" height="72" viewBox="0 0 80 80" fill="none">
+            <circle cx="40" cy="40" r="38" stroke="#E8FF00" stroke-width="1" stroke-dasharray="4 4"/>
+            <circle cx="40" cy="40" r="18" stroke="#E8FF00" stroke-width="0.5" opacity="0.4"/>
+            <circle cx="40" cy="40" r="4" fill="#E8FF00" opacity="0.5"/>
+          </svg>
+          <p>NO MEDIA LOADED</p>
+        </div>
+      </div>
+    </div>
+
+    <div id="track-info">
+      <div id="track-title-scroll"><span id="track-title">—</span></div>
+      <div id="track-artist">UNKNOWN ARTIST</div>
+      <div id="track-meta-row">
+        <span id="track-format" class="meta-badge">—</span>
+        <span id="track-type" class="meta-badge">AUDIO</span>
+      </div>
+    </div>
+
+    <!-- MINI WAVEFORM -->
+    <div id="mini-vis"><canvas id="mini-canvas" width="320" height="44"></canvas></div>
+
+    <!-- SEEKBAR -->
+    <div id="progress-container">
+      <span id="time-current">0:00</span>
+      <div id="progress-bar" id="seekbar">
+        <div id="progress-track">
+          <div id="progress-fill"></div>
+          <div id="progress-thumb"></div>
+        </div>
+      </div>
+      <span id="time-total">0:00</span>
+    </div>
+
+    <!-- CONTROLS -->
+    <div id="controls">
+      <button id="btn-shuffle" class="ctrl-btn ctrl-secondary" title="Shuffle">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M16 3h5v5M4 20L21 3M16 21h5v-5M4 4l5 5"/>
+        </svg>
+      </button>
+      <button id="btn-prev" class="ctrl-btn ctrl-secondary" title="Previous">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <polygon points="19,20 9,12 19,4"/>
+          <line x1="5" y1="4" x2="5" y2="20"/>
+        </svg>
+      </button>
+      <button id="btn-play" class="ctrl-btn ctrl-primary" title="Play/Pause">
+        <svg id="icon-play" width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+        <svg id="icon-pause" width="26" height="26" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+      </button>
+      <button id="btn-next" class="ctrl-btn ctrl-secondary" title="Next">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <polygon points="5,4 15,12 5,20"/>
+          <line x1="19" y1="4" x2="19" y2="20"/>
+        </svg>
+      </button>
+      <button id="btn-repeat" class="ctrl-btn ctrl-secondary" title="Repeat">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M17 1l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 23l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/>
+        </svg>
+        <span id="repeat-badge" style="display:none">1</span>
+      </button>
+    </div>
+
+    <!-- VOLUME + ACTIONS -->
+    <div id="extra-controls">
+      <div id="volume-row">
+        <button class="vol-icon-btn" id="btn-mute" title="Mute">
+          <svg id="vol-icon-on" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+          </svg>
+          <svg id="vol-icon-off" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="display:none">
+            <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+            <line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>
+          </svg>
+        </button>
+        <input type="range" id="volume-slider" min="0" max="100" value="80">
+        <span id="volume-val">80</span>
+      </div>
+      <div id="action-row">
+        <button class="action-btn" id="btn-add-files">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="12" y1="18" x2="12" y2="12"/>
+            <line x1="9" y1="15" x2="15" y2="15"/>
+          </svg>
+          ADD FILES
+        </button>
+        <button class="action-btn" id="btn-add-folder">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          </svg>
+          ADD FOLDER
+        </button>
+        <button class="action-btn danger-btn" id="btn-clear">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+          </svg>
+          CLEAR
+        </button>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ── RIGHT: PLAYLIST ── -->
+  <section id="playlist-panel">
+    <div id="playlist-header">
+      <div class="pl-header-left">
+        <span class="pl-title">QUEUE</span>
+        <span id="pl-count" class="pl-count-badge">0 TRACKS</span>
+      </div>
+      <div id="search-wrap">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input type="text" id="search-input" placeholder="FILTER..."/>
+      </div>
+    </div>
+
+    <div id="playlist-body">
+      <div id="playlist-list"></div>
+      <div id="playlist-empty">
+        <svg width="56" height="56" viewBox="0 0 56 56" fill="none">
+          <rect x="8" y="14" width="40" height="5" rx="2" fill="#E8FF00" opacity="0.12"/>
+          <rect x="8" y="25" width="30" height="5" rx="2" fill="#E8FF00" opacity="0.08"/>
+          <rect x="8" y="36" width="35" height="5" rx="2" fill="#E8FF00" opacity="0.08"/>
+        </svg>
+        <p>QUEUE IS EMPTY</p>
+        <p class="empty-sub">ADD FILES OR A FOLDER TO BEGIN</p>
+      </div>
+    </div>
+
+    <div id="playlist-footer">
+      <span id="pl-duration-total">Total: —</span>
+      <span id="pl-status-text">IDLE</span>
+    </div>
+  </section>
+
+</div><!-- end main-layout -->
+
+<!-- ═══════════ HIDDEN AUDIO ════════════════════════════════ -->
+<audio id="audio-player" preload="auto"></audio>
+
+<!-- ═══════════ VIDEO FULLSCREEN LAYER ══════════════════════ -->
+<div id="video-layer">
+  <video id="video-player" preload="auto"></video>
+
+  <!-- YouTube-style overlay controls (autohide) -->
+  <div id="video-controls">
+    <!-- top gradient -->
+    <div class="vc-top-bar">
+      <div class="vc-title" id="vc-title-text">—</div>
+      <button class="vc-btn" id="vc-close">✕ CLOSE</button>
+    </div>
+
+    <!-- bottom controls -->
+    <div class="vc-bottom-bar">
+      <!-- Video seekbar -->
+      <div class="vc-seekbar-wrap">
+        <span class="vc-time" id="vc-time-current">0:00</span>
+        <div class="vc-seekbar" id="vc-seekbar">
+          <div class="vc-seek-track">
+            <div class="vc-seek-fill" id="vc-seek-fill"></div>
+            <div class="vc-seek-thumb" id="vc-seek-thumb"></div>
+          </div>
+        </div>
+        <span class="vc-time" id="vc-time-total">0:00</span>
+      </div>
+
+      <!-- Video control buttons -->
+      <div class="vc-btn-row">
+        <button class="vc-btn" id="vc-prev">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="19,20 9,12 19,4"/><line x1="5" y1="4" x2="5" y2="20"/>
+          </svg>
+        </button>
+        <button class="vc-btn vc-play-btn" id="vc-play">
+          <svg id="vc-icon-play" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+          <svg id="vc-icon-pause" width="22" height="22" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+        </button>
+        <button class="vc-btn" id="vc-next">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="5,4 15,12 5,20"/><line x1="19" y1="4" x2="19" y2="20"/>
+          </svg>
+        </button>
+        <div class="vc-vol-wrap">
+          <button class="vc-btn" id="vc-mute">
+            <svg id="vc-vol-on" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+            </svg>
+            <svg id="vc-vol-off" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none">
+              <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+              <line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>
+            </svg>
+          </button>
+          <input type="range" class="vc-vol-slider" id="vc-vol-slider" min="0" max="100" value="80">
+        </div>
+        <div class="vc-spacer"></div>
+        <button class="vc-btn" id="vc-fullscreen" title="Toggle Fullscreen">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
