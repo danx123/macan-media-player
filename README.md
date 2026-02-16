@@ -5,25 +5,31 @@ A sleek, fullscreen desktop media player built with Python and pywebview. Macan 
 ---
 
 ## Screenshot
-<img width="1365" height="767" alt="image" src="https://github.com/user-attachments/assets/85a44ce8-5154-48c9-a896-d7cd18c0c807" />
+<img width="1365" height="767" alt="Screenshot 2026-02-16 215547" src="https://github.com/user-attachments/assets/4c1138aa-7bf9-43cb-b9df-b231b8d8f600" />
+
 
 
 ## ✨ Features
 
-- 🎵 **Audio & Video Playback** — supports MP3, WAV, FLAC, OGG, AAC, M4A, OPUS, MP4, MKV, AVI, WEBM, MOV, and more
-- 📡 **Built-in Media HTTP Server** — streams local files over `http://127.0.0.1` to bypass EdgeWebView2's `file://` CORS restrictions on Windows
-- ⏩ **HTTP Range Request Support** — enables accurate seeking without re-downloading the entire file
-- 🎨 **Animated Background Visualizer** — real-time frequency bars that respond to playback state
-- 📋 **Playlist Management** — add files, add entire folders, reorder, filter, and remove tracks
-- 🔀 **Shuffle & Repeat Modes** — shuffle, repeat all, repeat one
-- 🖼️ **Embedded Cover Art** — extracts and displays album artwork from ID3/FLAC/OGG tags via `mutagen`
-- 🎛️ **Full Playback Controls** — play/pause, previous, next, seek, volume, mute
-- 📺 **Video Overlay Controls** — YouTube-style autohiding controls with fullscreen support
-- 🕐 **Live Clock** — real-time clock and date display in the header
-- 💾 **Persistent Playlist & Settings** — automatically saved to `%LOCALAPPDATA%\MacanMediaPlayer` on Windows
-- ⌨️ **Keyboard Shortcuts** — full keyboard control for power users
-- 🖱️ **Drag & Drop** — drop files directly onto the player window
-- 🪟 **Frameless Fullscreen Window** — custom window chrome with minimize and close controls
+- 🎵 Audio & Video Playback — supports MP3, WAV, FLAC, OGG, AAC, M4A, OPUS, MP4, MKV, AVI, WEBM, MOV, and more
+- 📡 Built-in Media HTTP Server — streams local files over http://127.0.0.1 to bypass EdgeWebView2's file:// CORS restrictions on Windows
+- ⏩ HTTP Range Request Support — enables accurate seeking without re-downloading the entire file
+- 🎨 Animated Background Visualizer — real-time frequency bars that respond to playback state, rendered on a <canvas> element
+- 🎛️ 10-Band Equalizer — full-featured EQ with 17 built-in presets (Flat, Acoustic, Bass Boost, Classical, Dance, Electronic, Hip-Hop, Jazz, Metal, Pop, R&B, Rock, Spoken Word, Treble Boost, Vocal, etc.), custom preset storage via localStorage, and per-band control (31 Hz – 16 kHz)
+- 📋 Playlist Management — add files, add folders, reorder, filter, and delete tracks
+- 💾 Playlist Manager — save/load/delete/export/import named playlists as .macan.json files
+- 🔀 Shuffle & Repeat Modes — shuffle, repeat all, repeat one
+- 🖼️ Embedded Cover Art — extract and display album artwork from ID3/FLAC/OGG tags via mutagen
+- 🎛️ Full Playback Controls — play/pause, previous, next, seek, volume, mute
+- 📺 Video Overlay Controls — YouTube-style autohide controls with fullscreen support
+- 🖼️ Video Seek Thumbnail Preview — thumbnail preview on video seekbar hover, generated server-side via cv2 (OpenCV) in core/video_utils.py
+- 🕐 Live Clock — real-time time and date in header
+- 💾 Persistent Playlist & Settings — automatically saved to %LOCALAPPDATA%\MacanMediaPlayer on Windows
+- ⌨️ Keyboard Shortcuts — full keyboard control for power users
+- 🖱️ Drag & Drop — drop files directly into the player window
+- 🪟 Frameless Fullscreen Window — custom chrome window with minimize and close buttons
+- 🔊 Mini Waveform Visualizer — small waveform visualizer below album art in the now-playing panel
+- 🎞️ Noise Overlay — animated film-grain effect on the canvas for a cinematic aesthetic
 
 ---
 
