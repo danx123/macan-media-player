@@ -2,14 +2,32 @@ import os
 import sys
 import json
 import base64
+import hashlib
 import threading
 import http.server
 import socketserver
 import secrets
 import mimetypes
 import urllib.parse
+import sqlite3
+import requests
+from io import BytesIO
 from pathlib import Path
+
 import webview
+import mutagen
+from mutagen.mp4 import MP4
+from mutagen.id3 import ID3
+from mutagen.flac import FLAC
+from mutagen.oggvorbis import OggVorbis
+
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+from core.video_utils import VideoThumbnailer
 
 if hasattr(webview, 'settings'):
     webview.settings['ALLOW_DOWNLOADS'] = True
@@ -116,7 +134,172 @@ class _MediaServer:
         return f"http://127.0.0.1:{self.port}/media/{self._path_to_token[key]}"
 
 
+# ─── Single instance (declared once, here) ───────────────────────────────────
 _media_server = _MediaServer()
+
+
+# ─── ALBUM ART CACHE ──────────────────────────────────────────────────────────
+
+class AlbumArtCache:
+    """Manages online album art fetching and local SQLite cache."""
+
+    def __init__(self, app_data_dir):
+        self.cache_dir = os.path.join(app_data_dir, "AlbumArtCache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.db_path = os.path.join(self.cache_dir, "art_cache.db")
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('''CREATE TABLE IF NOT EXISTS album_art (
+            query_hash TEXT PRIMARY KEY,
+            artist TEXT, title TEXT, local_path TEXT
+        )''')
+        conn.commit()
+        conn.close()
+
+    def _hash(self, artist, title):
+        s = f"{artist}-{title}".lower().strip()
+        return hashlib.md5(s.encode('utf-8')).hexdigest()
+
+    def get_cached(self, artist, title):
+        h = self._hash(artist, title)
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT local_path FROM album_art WHERE query_hash=?", (h,)).fetchone()
+        conn.close()
+        if row and os.path.exists(row[0]):
+            with open(row[0], 'rb') as f:
+                data = f.read()
+            mime = 'image/jpeg'
+            return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+        return None
+
+    def fetch_online(self, artist, title):
+        """Try iTunes API, save to cache. Returns base64 data-URL or None."""
+        if not artist or not title:
+            return None
+        try:
+            term = f"{artist} {title}"
+            resp = requests.get("https://itunes.apple.com/search",
+                                params={"term": term, "media": "music", "entity": "song", "limit": 1},
+                                timeout=6)
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                if results:
+                    art_url = results[0].get("artworkUrl100", "").replace("100x100", "600x600")
+                    if art_url:
+                        img_resp = requests.get(art_url, timeout=10)
+                        if img_resp.status_code == 200:
+                            return self._save_and_return(artist, title, img_resp.content)
+        except Exception as e:
+            print(f"[ArtCache] Network error: {e}")
+        return None
+
+    def _save_and_return(self, artist, title, image_data):
+        h = self._hash(artist, title)
+        file_path = os.path.join(self.cache_dir, f"{h}.jpg")
+        try:
+            if PIL_AVAILABLE:
+                img = Image.open(BytesIO(image_data))
+                img = img.convert("RGB")
+                img.thumbnail((500, 500))
+                img.save(file_path, "JPEG", quality=85)
+            else:
+                with open(file_path, 'wb') as f:
+                    f.write(image_data)
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("INSERT OR REPLACE INTO album_art (query_hash,artist,title,local_path) VALUES(?,?,?,?)",
+                         (h, artist, title, file_path))
+            conn.commit()
+            conn.close()
+            with open(file_path, 'rb') as f:
+                data = f.read()
+            return f"data:image/jpeg;base64,{base64.b64encode(data).decode()}"
+        except Exception as e:
+            print(f"[ArtCache] Save error: {e}")
+        return None
+
+
+# ─── LYRIC CACHE ──────────────────────────────────────────────────────────────
+
+class LyricCache:
+    """Local SQLite lyrics store + LRCLIB online fetch."""
+
+    def __init__(self, app_data_dir):
+        self.db_path = os.path.join(app_data_dir, "lyrics.db")
+        self._init_db()
+
+    def _conn(self):
+        return sqlite3.connect(self.db_path, check_same_thread=False)
+
+    def _init_db(self):
+        conn = self._conn()
+        conn.execute('''CREATE TABLE IF NOT EXISTS lyrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artist TEXT, title TEXT, content TEXT, is_synced INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(artist, title)
+        )''')
+        conn.commit()
+        conn.close()
+
+    def get(self, artist, title):
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT content, is_synced FROM lyrics WHERE lower(artist)=? AND lower(title)=?",
+            (artist.lower().strip(), title.lower().strip())
+        ).fetchone()
+        conn.close()
+        if row:
+            return {"content": row[0], "is_synced": bool(row[1])}
+        return None
+
+    def save(self, artist, title, content, is_synced):
+        try:
+            conn = self._conn()
+            conn.execute("INSERT OR REPLACE INTO lyrics (artist,title,content,is_synced) VALUES(?,?,?,?)",
+                         (artist.lower().strip(), title.lower().strip(), content, int(is_synced)))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[LyricDB] Error: {e}")
+
+    def fetch_online(self, artist, title, duration=None):
+        """Fetch from LRCLIB, save to DB, return dict or None."""
+        try:
+            clean_artist = artist.split("feat")[0].split("(")[0].strip()
+            clean_title  = title.split("(")[0].strip()
+            params = {"artist_name": clean_artist, "track_name": clean_title}
+            if duration and duration > 0:
+                params["duration"] = int(duration)
+            resp = requests.get("https://lrclib.net/api/get", params=params, timeout=10)
+            if resp.status_code == 200:
+                return self._process(artist, title, resp.json())
+            elif resp.status_code == 404:
+                # fuzzy fallback
+                resp2 = requests.get("https://lrclib.net/api/search",
+                                     params={"q": f"{clean_artist} {clean_title}"}, timeout=10)
+                if resp2.status_code == 200:
+                    results = resp2.json()
+                    if results and isinstance(results, list):
+                        return self._process(artist, title, results[0])
+        except Exception as e:
+            print(f"[LyricDB] Fetch error: {e}")
+        return None
+
+    def _process(self, artist, title, data):
+        content = None
+        is_synced = False
+        if data.get("syncedLyrics"):
+            content = data["syncedLyrics"]
+            is_synced = True
+        elif data.get("plainLyrics"):
+            content = data["plainLyrics"]
+            is_synced = False
+        if content:
+            self.save(artist, title, content, is_synced)
+            return {"content": content, "is_synced": is_synced}
+        return None
 
 
 # ─── MAIN API CLASS ───────────────────────────────────────────────────────────
@@ -129,6 +312,9 @@ class MacanMediaAPI:
         self.playlist = []
         self.settings = {}
         self._load_settings()
+        app_data = self._get_app_data()
+        self._art_cache   = AlbumArtCache(app_data)
+        self._lyric_cache = LyricCache(app_data)
 
     def set_window(self, window):
         self._window = window
@@ -152,6 +338,7 @@ class MacanMediaAPI:
     # ─── DIALOG & FILE BROWSING ───────────────────────────────────────────────
 
     def browse_files(self):
+        """Open file dialog. Returns list of file path strings."""
         file_types = (
             'Media Files (*.mp3;*.mp4;*.wav;*.flac;*.ogg;*.aac;*.mkv;*.avi;*.webm;*.m4a;*.opus)',
             'Audio (*.mp3;*.wav;*.flac;*.ogg;*.aac;*.m4a;*.opus)',
@@ -160,18 +347,19 @@ class MacanMediaAPI:
         )
         result = self._open_dialog(allow_multiple=True, file_types=file_types)
         if result:
-            return [self._build_track_meta(f) for f in result]
+            return list(result)  # raw file paths — JS calls add_tracks() next
         return []
 
     def browse_folder(self):
+        """Open folder dialog. Returns list of media file path strings."""
         result = self._folder_dialog()
         if result and len(result) > 0:
-            return self._scan_media_folder(result[0])
+            return self._scan_media_folder_paths(result[0])  # raw paths
         return []
 
     def get_file_url(self, path):
-        """Return an http:// URL for a local media file, served via MediaServer.
-        This bypasses EdgeWebView2's file:// CORS block on Windows."""
+        """Return an http:// URL for a local media file served via MediaServer.
+        Bypasses EdgeWebView2's file:// CORS block on Windows."""
         try:
             p = Path(path).resolve()
             if not p.exists():
@@ -191,9 +379,12 @@ class MacanMediaAPI:
     def get_playlist(self):
         return self.playlist
 
-    def add_tracks(self, tracks):
-        for track in tracks:
-            if not any(t['path'] == track['path'] for t in self.playlist):
+    def add_tracks(self, file_paths):
+        """Accept list of file path strings, build track metadata, append to playlist."""
+        for fp in file_paths:
+            abs_path = str(Path(fp).resolve())
+            if not any(t['path'] == abs_path for t in self.playlist):
+                track = self._build_track_meta(fp)
                 self.playlist.append(track)
         self._save_playlist()
         return self.playlist
@@ -211,25 +402,57 @@ class MacanMediaAPI:
     # ─── MEDIA METADATA ───────────────────────────────────────────────────────
 
     def get_cover_art(self, path):
+        """Extract Cover Art (MP3, FLAC, M4A/MP4)."""
+        path = str(path)
+        if not os.path.exists(path):
+            return None
         try:
-            from mutagen.id3 import ID3
-            audio = ID3(path)
-            for tag in audio.values():
-                if hasattr(tag, 'data') and tag.data:
-                    encoded = base64.b64encode(tag.data).decode('utf-8')
-                    return f"data:image/jpeg;base64,{encoded}"
-        except Exception:
-            pass
-        try:
-            import mutagen
-            audio = mutagen.File(path)
-            if audio and hasattr(audio, 'pictures') and audio.pictures:
-                pic = audio.pictures[0]
-                encoded = base64.b64encode(pic.data).decode('utf-8')
-                return f"data:{pic.mime};base64,{encoded}"
-        except Exception:
-            pass
+            ext = os.path.splitext(path)[1].lower()
+
+            # 1. Handle M4A / MP4
+            if ext in ['.m4a', '.mp4']:
+                audio_file = MP4(path)
+                if 'covr' in audio_file and audio_file['covr']:
+                    data = bytes(audio_file['covr'][0])
+                    encoded = base64.b64encode(data).decode('utf-8')
+                    mime = 'image/png' if data.startswith(b'\x89PNG') else 'image/jpeg'
+                    return f"data:{mime};base64,{encoded}"
+
+            # 2. Handle MP3 (ID3)
+            elif ext == '.mp3':
+                audio_file = ID3(path)
+                for tag in audio_file.values():
+                    if hasattr(tag, 'data') and tag.data and 'APIC' in tag.HashKey:
+                        encoded = base64.b64encode(tag.data).decode('utf-8')
+                        return f"data:image/jpeg;base64,{encoded}"
+
+            # 3. Handle FLAC
+            elif ext == '.flac':
+                audio_file = FLAC(path)
+                if audio_file.pictures:
+                    pic = audio_file.pictures[0]
+                    encoded = base64.b64encode(pic.data).decode('utf-8')
+                    return f"data:{pic.mime};base64,{encoded}"
+
+            # 4. Fallback Generic Mutagen
+            else:
+                audio_file = mutagen.File(path)
+                if audio_file and hasattr(audio_file, 'pictures') and audio_file.pictures:
+                    pic = audio_file.pictures[0]
+                    encoded = base64.b64encode(pic.data).decode('utf-8')
+                    return f"data:{pic.mime};base64,{encoded}"
+
+        except Exception as e:
+            print(f"[Metadata] Error reading art for {path}: {e}")
+
         return None
+
+    def get_video_preview(self, path, time_sec):
+        """API called from JS when hovering video seekbar.
+        path must be the original file path (track.path), not the http:// URL."""
+        if path.startswith('http'):
+            return None  # can't grab frames from localhost stream via OpenCV
+        return VideoThumbnailer.get_thumbnail_at_time(path, float(time_sec))
 
     def save_settings(self, settings_dict):
         self.settings.update(settings_dict)
@@ -280,36 +503,143 @@ class MacanMediaAPI:
         p = Path(filepath)
         ext = p.suffix.lower()
         is_video = ext in {'.mp4', '.mkv', '.avi', '.webm', '.mov', '.wmv'}
-        duration = self._get_duration(filepath)
         abs_path = str(p.resolve())
-        # url starts as file:// but is overridden to http:// by get_file_url() at play time
+
+        # Read metadata (title, artist, album) from tags
+        meta = self._read_tags(abs_path, ext, is_video)
+        duration = meta.get('duration') or self._get_duration(abs_path)
+
+        # Display name: prefer tag title, else filename stem
+        display_name = meta.get('title') or p.stem
+        artist       = meta.get('artist') or ''
+        album        = meta.get('album')  or ''
+
+        # Pre-fetch cover art for audio files
+        cover_art = None
+        if not is_video:
+            try:
+                cover_art = self.get_cover_art(abs_path)
+            except Exception:
+                cover_art = None
+
         return {
-            "name":         p.stem,
+            "name":         display_name,
+            "artist":       artist,
+            "album":        album,
             "path":         abs_path,
             "url":          p.resolve().as_uri(),
             "ext":          ext.lstrip('.').upper(),
             "is_video":     is_video,
             "duration":     duration,
-            "duration_str": self._format_duration(duration)
+            "duration_str": self._format_duration(duration),
+            "cover_art":    cover_art,
         }
 
-    def _scan_media_folder(self, folder):
+    def _scan_media_folder_paths(self, folder):
+        """Recursively scan folder and return list of media file path strings."""
         extensions = {'.mp3', '.mp4', '.wav', '.flac', '.ogg', '.aac',
                       '.mkv', '.avi', '.webm', '.m4a', '.opus', '.mov', '.wmv'}
-        tracks = []
+        paths = []
         for root, dirs, files in os.walk(folder):
             dirs[:] = [d for d in dirs if not d.startswith('.')]
             for f in sorted(files):
                 if Path(f).suffix.lower() in extensions:
-                    tracks.append(self._build_track_meta(os.path.join(root, f)))
-        return tracks
+                    paths.append(os.path.join(root, f))
+        return paths
 
-    def _get_duration(self, path):
+    def _read_tags(self, path, ext, is_video):
+        """Read title, artist, album, duration from file tags."""
+        result = {}
+        if is_video:
+            return result
         try:
-            import mutagen
-            audio = mutagen.File(path)
-            if audio and audio.info:
-                return int(audio.info.length)
+            audio_file = mutagen.File(path, easy=True)
+            if audio_file is None:
+                return result
+            # EasyID3 / EasyMP4 use lowercase list values
+            def _get(key):
+                val = audio_file.get(key)
+                if val and isinstance(val, (list, tuple)) and val[0]:
+                    return str(val[0]).strip()
+                return None
+            result['title']    = _get('title')
+            result['artist']   = _get('artist')
+            result['album']    = _get('album')
+            if audio_file.info:
+                result['duration'] = int(audio_file.info.length)
+        except Exception as e:
+            print(f"[Tags] Could not read tags for {path}: {e}")
+        return result
+
+    # ─── ONLINE ART FALLBACK ──────────────────────────────────────────────────
+
+    def get_cover_art_with_online_fallback(self, path):
+        """Get cover art: embedded tags → local cache → iTunes API."""
+        # 1. Try embedded art first
+        embedded = self.get_cover_art(path)
+        if embedded:
+            return embedded
+
+        # 2. Need artist + title for online search
+        p = Path(path)
+        ext = p.suffix.lower()
+        meta = self._read_tags(str(p.resolve()), ext, False)
+        artist = meta.get('artist') or ''
+        title  = meta.get('title')  or p.stem
+
+        if not artist:
+            return None  # can't search without artist
+
+        # 3. Check local SQLite cache
+        cached = self._art_cache.get_cached(artist, title)
+        if cached:
+            return cached
+
+        # 4. Fetch from iTunes API in background thread (non-blocking) — 
+        #    return None now; JS will call this again or use polling
+        def _bg():
+            result = self._art_cache.fetch_online(artist, title)
+            if result and self._window:
+                # Push art update to frontend via JS eval
+                safe_path = path.replace('\\', '\\\\').replace("'", "\\'")
+                js = f"window.onOnlineArtReady && window.onOnlineArtReady('{safe_path}', `{result}`);"
+                try:
+                    self._window.evaluate_js(js)
+                except Exception:
+                    pass
+        threading.Thread(target=_bg, daemon=True).start()
+        return None
+
+    # ─── LYRICS ───────────────────────────────────────────────────────────────
+
+    def get_lyrics(self, path, artist, title, duration=None):
+        """Get lyrics for a track. Checks DB first, then fetches online.
+        Returns {content, is_synced} or None."""
+        # Normalise inputs — use tag data as fallback
+        if not artist or not title:
+            p = Path(path)
+            meta = self._read_tags(str(p.resolve()), p.suffix.lower(), False)
+            artist = artist or meta.get('artist') or ''
+            title  = title  or meta.get('title')  or p.stem
+
+        if not artist or not title:
+            return None
+
+        # 1. Local DB
+        cached = self._lyric_cache.get(artist, title)
+        if cached:
+            return cached
+
+        # 2. Online fetch (synchronous — called from JS, runs in thread)
+        result = self._lyric_cache.fetch_online(artist, title, duration)
+        return result
+
+
+
+        try:
+            audio_file = mutagen.File(path)
+            if audio_file and audio_file.info:
+                return int(audio_file.info.length)
         except Exception:
             pass
         return 0
