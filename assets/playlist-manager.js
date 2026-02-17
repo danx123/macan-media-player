@@ -9,8 +9,12 @@ class PlaylistManager {
     this.isOpen = false;
     this.container = null;
     this.onLoadCallback = null;
-    
+    this.onSaveCallback = null;
+
     this.createUI();
+    // Re-read from storage after UI built to ensure initial list is correct
+    this.playlists = this.loadPlaylists();
+    this.updatePlaylistList();
   }
   
   loadPlaylists() {
@@ -286,6 +290,8 @@ class PlaylistManager {
   open() {
     this.container.classList.add('active');
     this.isOpen = true;
+    // Always re-read from localStorage when opening to catch latest saves
+    this.playlists = this.loadPlaylists();
     this.updatePlaylistList();
   }
   
@@ -295,6 +301,10 @@ class PlaylistManager {
   }
   
   toggle() {
-    this.isOpen ? this.close() : this.open();
+    if (this.isOpen) {
+      this.close();
+    } else {
+      this.open(); // open() re-reads playlists from storage
+    }
   }
 }
