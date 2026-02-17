@@ -1,63 +1,17 @@
 /* ═══════════════════════════════════════════════════════════════
-   MACAN MEDIA PLAYER — script.js (FIXED: AUDIO & SEEKBAR)
-   Fixes:
-   1. Disables AudioContext source connection for local files (Fixes Mute)
-   2. Robust duration checking for Seekbar
-   3. Force Resume AudioContext on interaction
+   MACAN MEDIA PLAYER — script.js
+   Race Condition Fixes:
+   1. Correct initialization order: S → DOM → modules (PlaylistManager/EQ)
+   2. Event-driven state restore (no fragile setTimeout delay)
+   3. Idempotent seekbar restore via seekPending flag
+   4. Async-safe EQ band application with pendingEqBands guard
+   5. Debounced & lock-guarded state persistence (no concurrent writes)
+   6. pywebview readiness guard before restore
 ═══════════════════════════════════════════════════════════════ */
-// ═══════════════════════════════════════════════════════════════
-// AUDIO CONTEXT & EQUALIZER INITIALIZATION
-// ═══════════════════════════════════════════════════════════════
-
-let audioContext;
-let audioSource;
-let equalizer;
-let equalizerUI;
-let playlistManager;
-
-function initAudioContext() {
-  if (!audioContext) {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    equalizer = new Equalizer10Band(audioContext);
-    equalizerUI = new EqualizerUI(equalizer);
-    
-    // Connect audio element to equalizer
-    if (!audioSource) {
-      audioSource = audioContext.createMediaElementSource(audioPlayer);
-      audioSource.connect(equalizer.input);
-      equalizer.connect(audioContext.destination);
-    }
-  }
-}
-
-// Initialize Playlist Manager
-playlistManager = new PlaylistManager();
-
-// Setup callbacks
-playlistManager.onSave((name) => {
-  const tracks = playlist.map(item => ({
-    path: item.path,
-    name: item.name,
-    artist: item.artist || 'Unknown Artist',
-    duration: item.duration
-  }));
-  playlistManager.saveCurrentPlaylist(name, tracks);
-});
-
-playlistManager.onLoad((name) => {
-  const tracks = playlistManager.loadPlaylist(name);
-  if (tracks && tracks.length > 0) {
-    // Clear current playlist and load saved one
-    playlist = tracks;
-    currentIndex = 0;
-    renderPlaylist();
-    loadTrack(0);
-  }
-});
-
 'use strict';
 
 // ─── STATE ────────────────────────────────────────────────────
+// MUST be declared first — all modules below reference S directly.
 const S = {
   playlist:     [],
   currentIndex: -1,
@@ -77,7 +31,102 @@ const S = {
   lyricsOpen:   false,
   lyricsData:   null,     // { content, is_synced, lines }
   lyricsActiveLine: -1,
+  // Fade & Normalization
+  fadeEnabled:  true,
+  fadeDuration: 1200,     // ms
+  normEnabled:  false,    // ReplayGain normalization
+  targetLUFS:   -14,      // target normalization level (dB)
+  _fadeTimer:   null,
+  _fadeGain:    null,     // Web Audio GainNode for fading
+  _gainNode:    null,     // Web Audio GainNode for normalization
+  // State persistence — debounce + in-flight lock
+  _stateSaveTimer: null,
+  _saveLock:    false,    // FIX: prevent concurrent save_app_state calls
+  // Restore flags
+  _pendingEqBands:   null,   // EQ bands to apply once AudioContext is ready
+  _pendingEqPreset:  null,   // EQ preset name to restore in dropdown
+  _seekPending:      null,   // { position } to apply once loadedmetadata fires
+  _restoreComplete:  false,  // true after initial restore has finished
 };
+
+// ═══════════════════════════════════════════════════════════════
+// THUMBNAIL CACHE + PERSIST HELPER
+// ═══════════════════════════════════════════════════════════════
+// thumbCache / videoThumbCache: path → dataUrl
+// Survives clearPlaylist() + reload because it's in JS memory —
+// so if Python returns cover_art from SQLite on re-add, _seedThumbCache
+// warms the Map and renderPlaylist renders the img immediately.
+// _persistArtToServer writes art back to Python playlist.json so
+// it also survives full app restarts.
+// ═══════════════════════════════════════════════════════════════
+const thumbCache      = new Map();  // path → dataUrl
+const videoThumbCache = new Map();  // path → dataUrl
+
+// Debounced per-path persist — avoids hammering Python on rapid fetches
+const _persistDebounce = new Map();
+function _persistArtToServer(path, dataUrl, isVideo) {
+  if (!pw() || !dataUrl) return;
+  clearTimeout(_persistDebounce.get(path));
+  _persistDebounce.set(path, setTimeout(() => {
+    _persistDebounce.delete(path);
+    const fn = isVideo
+      ? pywebview.api.update_track_video_thumb(path, dataUrl)
+      : pywebview.api.update_track_art(path, dataUrl);
+    fn.catch(() => {});
+  }, 1000));
+}
+
+// Seed caches from track array — call before renderPlaylist() whenever
+// S.playlist is replaced so the first render is already cache-warm.
+function _seedThumbCache(tracks) {
+  for (const t of tracks) {
+    if (t.cover_art   && !thumbCache.has(t.path))      thumbCache.set(t.path, t.cover_art);
+    if (t.video_thumb && !videoThumbCache.has(t.path)) videoThumbCache.set(t.path, t.video_thumb);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AUDIO CONTEXT & EQUALIZER INITIALIZATION
+// ═══════════════════════════════════════════════════════════════
+
+let audioContext;
+let audioSource;
+let equalizer;
+let equalizerUI;
+let playlistManager;
+
+function initAudioContext() {
+  if (!audioContext) {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    equalizer = new Equalizer10Band(audioContext);
+    equalizerUI = new EqualizerUI(equalizer);
+
+    // GainNode for ReplayGain normalization
+    S._gainNode = audioContext.createGain();
+    S._gainNode.gain.value = 1.0;
+
+    // GainNode for fade in/out
+    S._fadeGain = audioContext.createGain();
+    S._fadeGain.gain.value = 1.0;
+
+    // Connect chain: source → EQ → normGain → fadeGain → destination
+    if (!audioSource) {
+      audioSource = audioContext.createMediaElementSource(audioPlayer);
+      audioSource.connect(equalizer.input);
+      equalizer.connect(S._gainNode);
+      S._gainNode.connect(S._fadeGain);
+      S._fadeGain.connect(audioContext.destination);
+    }
+
+    // FIX: Apply pending EQ bands that were restored before AudioContext existed
+    if (S._pendingEqBands) {
+      equalizer.setAllBands(S._pendingEqBands);
+      if (equalizerUI) equalizerUI.syncSlidersFromEq(S._pendingEqPreset);
+      S._pendingEqBands  = null;
+      S._pendingEqPreset = null;
+    }
+  }
+}
 
 // ─── DOM ──────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -138,6 +187,47 @@ const vcPreviewTime    = $('vc-preview-time');
 const btnEqualizer = document.getElementById('btn-equalizer');
 const btnPlaylistManager = document.getElementById('btn-playlist-manager');
 
+// ─────────────────────────────────────────────────────────────────
+// FIX: PlaylistManager and callbacks MUST be initialized AFTER S and
+// DOM are defined. Moved here from the top of the file to prevent:
+//   - ReferenceError: S is not defined
+//   - ReferenceError: renderPlaylist/loadTrack/updatePlaylistMeta not defined
+// ─────────────────────────────────────────────────────────────────
+playlistManager = new PlaylistManager();
+
+playlistManager.onSave((name) => {
+  const tracks = S.playlist.map(item => ({
+    path: item.path,
+    name: item.name,
+    artist: item.artist || 'Unknown Artist',
+    album: item.album || '',
+    duration: item.duration,
+    duration_str: item.duration_str || '--:--',
+    ext: item.ext || '',
+    is_video: item.is_video || false,
+    cover_art: item.cover_art || null
+  }));
+  playlistManager.saveCurrentPlaylist(name, tracks);
+});
+
+playlistManager.onLoad((name) => {
+  const tracks = playlistManager.loadPlaylist(name);
+  if (tracks && tracks.length > 0) {
+    // FIX: Stop playback cleanly before replacing playlist
+    const p = activePlayer();
+    p.pause();
+    p.src = '';
+    S.currentIndex = -1;
+    onPlayState(false);
+
+    S.playlist = tracks;
+    _seedThumbCache(S.playlist);
+    renderPlaylist();
+    updatePlaylistMeta();
+    loadTrack(0);
+  }
+});
+
 btnEqualizer.addEventListener('click', () => {
   initAudioContext();
   equalizerUI.toggle();
@@ -149,27 +239,28 @@ btnPlaylistManager.addEventListener('click', () => {
 
 // ─── ONLINE ART CALLBACK (called from Python via evaluate_js) ─────────────
 window.onOnlineArtReady = function(path, dataUrl) {
-  // Only apply if it matches the currently loaded track
-  if (S.currentIndex >= 0 && S.playlist[S.currentIndex]?.path === path) {
-    applyArt(dataUrl);
-  }
-  // Also update playlist item thumbnail regardless
+  if (!dataUrl) return;
+  thumbCache.set(path, dataUrl);
+
   const idx = S.playlist.findIndex(t => t.path === path);
   if (idx >= 0) {
+    const wasNew = !S.playlist[idx].cover_art;
     S.playlist[idx].cover_art = dataUrl;
+    // FIX: placeholder is a <div>, not <img>
     const item = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
     if (item) {
       const placeholder = item.querySelector('.pl-thumb-placeholder');
       if (placeholder) {
         const img = document.createElement('img');
         img.className = 'pl-thumb';
-        img.src = dataUrl;
-        img.alt = '';
-        img.draggable = false;
-        img.loading = 'lazy';
+        img.src = dataUrl; img.alt = ''; img.draggable = false; img.loading = 'lazy';
         placeholder.replaceWith(img);
       }
     }
+    if (wasNew) _persistArtToServer(path, dataUrl, false);
+  }
+  if (S.currentIndex >= 0 && S.playlist[S.currentIndex]?.path === path) {
+    applyArt(dataUrl);
   }
 };
 
@@ -397,6 +488,7 @@ window.addEventListener('load', () => {
   setupSeekbar();
   setupVcSeekbar();
   setupVideoControls();
+  setupVideoContextMenu();
 
   // Set default CORS settings just in case
   //audio.crossOrigin = "anonymous";
@@ -431,16 +523,135 @@ window.addEventListener('load', () => {
   $('vc-mute').onclick    = toggleMute;
   $('vc-fullscreen').onclick = () => pw() && pywebview.api.toggle_fullscreen();
 
-  // Load saved playlist
+  // ─── STATE RESTORE ──────────────────────────────────────────
+  // FIX: Use event-driven readiness instead of a fragile setTimeout.
+  // pywebview fires window.pywebviewready when the JS bridge is ready.
+  // We also check pw() synchronously in case it fired before this ran.
   if (pw()) {
-    setTimeout(async () => {
-      try {
-        const saved = await pywebview.api.get_playlist();
-        if (saved?.length) { S.playlist = saved; renderPlaylist(); updatePlaylistMeta(); }
-      } catch(e) { console.warn('Load playlist failed:', e); }
-    }, 500);
+    _doStateRestore();
+  } else {
+    window.addEventListener('pywebviewready', () => _doStateRestore(), { once: true });
   }
 });
+
+// ─── STATE RESTORE (event-driven, called once pywebview is ready) ──────────
+async function _doStateRestore() {
+  try {
+    setStatus('RESTORING SESSION...');
+
+    // FIX: Both calls in parallel — avoids sequential await waterfall latency
+    const [saved, state] = await Promise.all([
+      pywebview.api.get_playlist().catch(() => []),
+      pywebview.api.get_app_state().catch(() => ({}))
+    ]);
+
+    // ── 1. Restore playlist ──────────────────────────────────
+    if (Array.isArray(saved) && saved.length) {
+      S.playlist = saved;
+      _seedThumbCache(S.playlist);
+      renderPlaylist();
+      updatePlaylistMeta();
+    }
+
+    // ── 2. Restore settings ─────────────────────────────────
+    if (state && typeof state === 'object') {
+      if (state.volume !== undefined) {
+        S.volume = state.volume;
+        audio.volume = video.volume = S.volume / 100;
+        updateVolumeUI(S.volume);
+        syncVcVolume(S.volume);
+      }
+      if (state.isShuffle !== undefined) {
+        S.isShuffle = state.isShuffle;
+        btnShuffle.classList.toggle('active', S.isShuffle);
+      }
+      if (state.repeatMode !== undefined) {
+        S.repeatMode = state.repeatMode;
+        btnRepeat.classList.toggle('active', S.repeatMode !== 'none');
+        repeatBadge.style.display = S.repeatMode === 'one' ? 'flex' : 'none';
+      }
+      if (state.fadeEnabled  !== undefined) S.fadeEnabled  = state.fadeEnabled;
+      if (state.fadeDuration !== undefined) S.fadeDuration = state.fadeDuration;
+      if (state.normEnabled  !== undefined) S.normEnabled  = state.normEnabled;
+
+      // FIX: Store EQ bands as pending — AudioContext may not exist yet.
+      // If AudioContext is already initialized (e.g. user had interacted before
+      // this restore path runs), apply immediately so audio effect is live.
+      // Otherwise applied in initAudioContext() on first user interaction.
+      if (Array.isArray(state.eqBands) && state.eqBands.length === 10) {
+        if (equalizer && audioContext) {
+          // AudioContext already exists — apply right away
+          equalizer.setAllBands(state.eqBands);
+          if (equalizerUI) equalizerUI.syncSlidersFromEq(state.eqPreset || null);
+        } else {
+          // Defer until initAudioContext() is called
+          S._pendingEqBands  = state.eqBands;
+          S._pendingEqPreset = state.eqPreset || null;
+        }
+      }
+
+      // ── 3. Restore last track + seek position ──────────────
+      const savedIdx = typeof state.currentIndex === 'number' ? state.currentIndex : -1;
+      const savedPos = typeof state.seekPosition  === 'number' ? state.seekPosition : 0;
+
+      if (savedIdx >= 0 && savedIdx < S.playlist.length) {
+        S.currentIndex = savedIdx;
+        const track = S.playlist[savedIdx];
+
+        updateTrackInfo(track);
+        updatePlaylistHighlight(savedIdx);
+        applyNormalization(track);
+        setStatus(`PAUSED — ${track.name}`);
+
+        // Resolve the streamable http:// URL from Python media server
+        let srcUrl = '';
+        try {
+          const resolved = await pywebview.api.get_file_url(track.path);
+          if (resolved) { srcUrl = resolved; track.url = resolved; }
+        } catch(e) {
+          console.warn('[MACAN] URL resolve failed on restore:', e);
+          srcUrl = track.url || '';
+        }
+
+        if (!srcUrl) {
+          setStatus('READY (could not resolve last track URL)');
+          S._restoreComplete = true;
+          return;
+        }
+
+        const player = track.is_video ? video : audio;
+
+        if (track.is_video) {
+          videoLayer.classList.add('active');
+          $('main-layout').style.display = 'none';
+          $('vc-title-text').textContent = track.name.toUpperCase();
+        } else {
+          videoLayer.classList.remove('active');
+          $('main-layout').style.display = '';
+        }
+
+        // FIX: Store seek target BEFORE setting src so onMeta() (which fires
+        // on loadedmetadata) can consume it. This eliminates the race between
+        // addEventListener('loadedmetadata', fn) and player.load().
+        if (savedPos > 0) {
+          S._seekPending = { position: savedPos };
+        }
+
+        player.src = srcUrl;
+        player.load(); // triggers loadedmetadata → onMeta → seek applied there
+      } else {
+        setStatus('READY');
+      }
+    } else {
+      setStatus('READY');
+    }
+  } catch(e) {
+    console.warn('[MACAN] State restore failed:', e);
+    setStatus('READY');
+  } finally {
+    S._restoreComplete = true;
+  }
+}
 
 // ─── CLOCK ────────────────────────────────────────────────────
 function initClock() {
@@ -476,91 +687,253 @@ function initNoise() {
 }
 
 // ─── BG VISUALIZER ────────────────────────────────────────────
+// ─── BG VISUALIZER (Enhanced) ────────────────────────────────
+// Multi-layer: floating particles + spectrum bars + circular rings
 function initBgVis() {
   const ctx = visCanvas.getContext('2d');
   function resize() { visCanvas.width = innerWidth; visCanvas.height = innerHeight; }
-  resize(); window.addEventListener('resize', resize);
+  resize();
+  window.addEventListener('resize', resize);
+
+  // Particle system
+  const PARTICLE_COUNT = 55;
+  const particles = Array.from({ length: PARTICLE_COUNT }, () => ({
+    x: Math.random() * innerWidth,
+    y: Math.random() * innerHeight,
+    vx: (Math.random() - 0.5) * 0.4,
+    vy: (Math.random() - 0.5) * 0.4,
+    r: Math.random() * 1.8 + 0.5,
+    alpha: Math.random() * 0.4 + 0.1,
+    pulse: Math.random() * Math.PI * 2,
+    pulseSpeed: Math.random() * 0.02 + 0.005,
+    freq: Math.floor(Math.random() * 60),  // which freq bin drives this particle
+  }));
+
   let phase = 0;
-  function draw() {
-    ctx.clearRect(0, 0, visCanvas.width, visCanvas.height);
-    const bars = 80, bw = visCanvas.width / bars;
-    
-    // NOTE: Analyser data is intentionally disabled for local files to prevent muting
-    // We use a simulated wave here if music is playing but no analyser
-    const data = (S.analyser && S.isPlaying) ? (() => { const a = new Uint8Array(S.analyser.frequencyBinCount); S.analyser.getByteFrequencyData(a); return a; })() : null;
-    
-    for (let i = 0; i < bars; i++) {
-      let h;
-      if (data) {
-         h = (data[Math.floor(i/bars*data.length*0.6)]/255)*visCanvas.height*0.55+8;
-      } else if (S.isPlaying) {
-         // Fake simulation when playing local files
-         h = Math.abs(Math.sin(i/bars*Math.PI*5 + phase*2)) * 30 + 15 + (Math.random()*10);
-      } else {
-         // Idle animation
-         h = Math.abs(Math.sin(i/bars*Math.PI*3+phase))*45+15;
+  let smoothData = new Float32Array(128).fill(0);
+
+  function getFreqData() {
+    if (S.analyser && S.isPlaying) {
+      const raw = new Uint8Array(S.analyser.frequencyBinCount);
+      S.analyser.getByteFrequencyData(raw);
+      // Smooth with exponential moving average
+      for (let i = 0; i < smoothData.length; i++) {
+        const target = raw[i] / 255;
+        smoothData[i] += (target - smoothData[i]) * 0.18;
       }
-      
-      const g = ctx.createLinearGradient(0,visCanvas.height,0,visCanvas.height-h);
-      g.addColorStop(0,`rgba(232,255,0,${S.isPlaying?0.65:0.22})`);
-      g.addColorStop(1,'rgba(232,255,0,0)');
-      ctx.fillStyle = g;
-      ctx.fillRect(i*bw+1,visCanvas.height-h,bw-2,h);
+    } else if (S.isPlaying) {
+      // Simulated: sine waves per band
+      for (let i = 0; i < smoothData.length; i++) {
+        const target = Math.abs(Math.sin(i * 0.18 + phase * 1.8)) * 0.45 *
+                       Math.abs(Math.sin(i * 0.07 + phase * 0.7));
+        smoothData[i] += (target - smoothData[i]) * 0.12;
+      }
+    } else {
+      // Idle: gentle breathing
+      for (let i = 0; i < smoothData.length; i++) {
+        const target = Math.abs(Math.sin(i * 0.12 + phase * 0.5)) * 0.12;
+        smoothData[i] += (target - smoothData[i]) * 0.06;
+      }
     }
-    phase += 0.012;
+    return smoothData;
+  }
+
+  function draw() {
+    const W = visCanvas.width, H = visCanvas.height;
+    const data = getFreqData();
+    const bass = (data[1] + data[2] + data[3]) / 3;
+    const mid  = (data[10] + data[15] + data[20]) / 3;
+    const isActive = S.isPlaying;
+
+    ctx.clearRect(0, 0, W, H);
+
+    // ── Layer 1: bottom spectrum bars ──────────────────────────
+    const bars = 72, bw = W / bars;
+    for (let i = 0; i < bars; i++) {
+      const t = i / bars;
+      const di = Math.floor(t * data.length * 0.65);
+      const amp = data[di];
+      const h = isActive
+        ? amp * H * 0.42 + 4
+        : Math.abs(Math.sin(t * Math.PI * 2.5 + phase)) * 28 + 4;
+
+      // Multi-colour gradient: acid yellow → cyan tint at peaks
+      const g = ctx.createLinearGradient(0, H, 0, H - h);
+      g.addColorStop(0, `rgba(232,255,0,${isActive ? amp * 0.5 + 0.05 : 0.08})`);
+      g.addColorStop(0.6, `rgba(200,255,80,${isActive ? amp * 0.3 : 0.04})`);
+      g.addColorStop(1, `rgba(100,255,220,${isActive ? amp * 0.15 : 0.02})`);
+      ctx.fillStyle = g;
+
+      const x = i * bw;
+      const rr = 1;
+      ctx.beginPath();
+      ctx.moveTo(x + rr, H);
+      ctx.lineTo(x + bw - rr - 2, H);
+      ctx.lineTo(x + bw - rr - 2, H - h + rr);
+      ctx.arcTo(x + bw - rr - 2, H - h, x + bw - rr - 2 - rr, H - h, rr);
+      ctx.lineTo(x + rr, H - h);
+      ctx.arcTo(x, H - h, x, H - h + rr, rr);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // ── Layer 2: mid-screen waveform ribbon ───────────────────
+    if (isActive) {
+      ctx.beginPath();
+      const wy = H * 0.62;
+      const wamp = mid * H * 0.08 + 6;
+      for (let x = 0; x <= W; x += 3) {
+        const t = x / W;
+        const di = Math.floor(t * data.length * 0.8);
+        const y = wy + Math.sin(t * Math.PI * 8 + phase * 3) * wamp * (data[di] + 0.1) * 1.4;
+        x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = `rgba(232,255,0,${0.08 + mid * 0.18})`;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+
+    // ── Layer 3: floating particles ───────────────────────────
+    for (const p of particles) {
+      p.pulse += p.pulseSpeed * (1 + bass * 3);
+      const freqAmp = data[p.freq] || 0;
+      const boost = isActive ? freqAmp * 2.5 : 0;
+      const alpha = p.alpha * (0.5 + 0.5 * Math.sin(p.pulse)) + boost * 0.3;
+      const radius = p.r * (1 + boost * 1.2);
+
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(232,255,0,${Math.min(alpha, 0.85)})`;
+      ctx.fill();
+
+      // Particle connections (nearby only)
+      for (const q of particles) {
+        if (q === p) continue;
+        const dx = q.x - p.x, dy = q.y - p.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 90) {
+          ctx.beginPath();
+          ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y);
+          ctx.strokeStyle = `rgba(232,255,0,${(1 - dist / 90) * 0.06 * (1 + bass)})`;
+          ctx.lineWidth = 0.5;
+          ctx.stroke();
+        }
+      }
+
+      // Move + wrap
+      p.x += p.vx * (1 + bass * 2);
+      p.y += p.vy * (1 + bass * 2);
+      if (p.x < -10) p.x = W + 10;
+      if (p.x > W + 10) p.x = -10;
+      if (p.y < -10) p.y = H + 10;
+      if (p.y > H + 10) p.y = -10;
+    }
+
+    // ── Layer 4: top scanline / grid accent ───────────────────
+    if (isActive && bass > 0.3) {
+      ctx.strokeStyle = `rgba(232,255,0,${(bass - 0.3) * 0.12})`;
+      ctx.lineWidth = 1;
+      for (let y = 0; y < H; y += 40) {
+        ctx.beginPath();
+        ctx.moveTo(0, y); ctx.lineTo(W, y);
+        ctx.stroke();
+      }
+    }
+
+    phase += 0.008;
     requestAnimationFrame(draw);
   }
   draw();
 }
 
-// ─── MINI VISUALIZER ──────────────────────────────────────────
+// ─── MINI VISUALIZER (Enhanced) ──────────────────────────────
 let miniAnimId = null;
+
 function initIdleMiniVis() {
+  if (miniAnimId) cancelAnimationFrame(miniAnimId);
   const ctx = miniCanvas.getContext('2d');
   let ph = 0;
-  function idle() {
-    // If we have an active analyser, switch to live mode (rare for local files)
+  let smoothed = new Float32Array(48).fill(0);
+
+  function frame() {
     if (S.analyser) { initLiveMiniVis(); return; }
-    
-    miniAnimId = requestAnimationFrame(idle);
-    ctx.clearRect(0,0,miniCanvas.width,miniCanvas.height);
-    const bc = 48, bw = miniCanvas.width/bc;
-    for (let i=0;i<bc;i++) {
-      // Simulate activity if playing but no analyser
-      let mag = S.isPlaying ? 25 : 10;
-      let speed = S.isPlaying ? 0.2 : 0.04;
-      const h = Math.abs(Math.sin(i/bc*Math.PI*2 + ph))*mag+3;
-      
-      ctx.fillStyle = S.isPlaying ? 'rgba(232,255,0,0.6)' : 'rgba(232,255,0,0.14)';
-      ctx.fillRect(i*bw+1,miniCanvas.height-h,bw-2,h);
+    miniAnimId = requestAnimationFrame(frame);
+    const W = miniCanvas.width, H = miniCanvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    const bc = 48, bw = W / bc;
+    for (let i = 0; i < bc; i++) {
+      const target = S.isPlaying
+        ? (Math.abs(Math.sin(i / bc * Math.PI * 3 + ph)) * 0.65 +
+           Math.abs(Math.sin(i / bc * Math.PI * 7 + ph * 1.3)) * 0.35)
+        : Math.abs(Math.sin(i / bc * Math.PI * 2 + ph)) * 0.2;
+
+      smoothed[i] += (target - smoothed[i]) * (S.isPlaying ? 0.15 : 0.05);
+      const h = smoothed[i] * H;
+
+      // Gradient bar
+      const g = ctx.createLinearGradient(0, H, 0, H - h);
+      g.addColorStop(0, S.isPlaying ? 'rgba(232,255,0,0.8)' : 'rgba(232,255,0,0.15)');
+      g.addColorStop(1, S.isPlaying ? 'rgba(150,255,200,0.4)' : 'rgba(232,255,0,0.05)');
+      ctx.fillStyle = g;
+      ctx.fillRect(i * bw + 0.5, H - h, bw - 1.5, h);
+
+      // Peak dot
+      if (S.isPlaying && h > 3) {
+        ctx.fillStyle = 'rgba(255,255,255,0.6)';
+        ctx.fillRect(i * bw + 0.5, H - h - 1.5, bw - 1.5, 1.5);
+      }
     }
-    ph += (S.isPlaying ? 0.2 : 0.04);
+    ph += S.isPlaying ? 0.18 : 0.025;
   }
-  idle();
+  frame();
 }
 
 function initLiveMiniVis() {
   if (miniAnimId) cancelAnimationFrame(miniAnimId);
   const ctx = miniCanvas.getContext('2d');
-  function live() {
-    miniAnimId = requestAnimationFrame(live);
+  let smoothed = new Float32Array(48).fill(0);
+  let peaks = new Float32Array(48).fill(0);
+  let peakDecay = new Float32Array(48).fill(0);
+
+  function frame() {
+    miniAnimId = requestAnimationFrame(frame);
     if (!S.analyser) { initIdleMiniVis(); return; }
-    const data = new Uint8Array(S.analyser.frequencyBinCount);
-    S.analyser.getByteFrequencyData(data);
-    ctx.clearRect(0,0,miniCanvas.width,miniCanvas.height);
-    const bc = 48, bw = miniCanvas.width/bc;
-    for (let i=0;i<bc;i++) {
-      const idx = Math.floor(i/bc*data.length*0.7);
-      const h = (data[idx]/255)*miniCanvas.height;
-      const a = 0.35+(data[idx]/255)*0.65;
-      ctx.fillStyle = `rgba(232,255,0,${a})`;
-      ctx.fillRect(i*bw+1,miniCanvas.height-h,bw-2,h);
+    const W = miniCanvas.width, H = miniCanvas.height;
+    const raw = new Uint8Array(S.analyser.frequencyBinCount);
+    S.analyser.getByteFrequencyData(raw);
+    ctx.clearRect(0, 0, W, H);
+
+    const bc = 48, bw = W / bc;
+    for (let i = 0; i < bc; i++) {
+      const idx = Math.floor(i / bc * raw.length * 0.75);
+      const target = raw[idx] / 255;
+      smoothed[i] += (target - smoothed[i]) * 0.22;
+      const h = smoothed[i] * H;
+
+      // Update falling peak
+      if (h > peaks[i]) { peaks[i] = h; peakDecay[i] = 0; }
+      else { peakDecay[i] += 0.4; peaks[i] = Math.max(0, peaks[i] - peakDecay[i] * 0.012); }
+
+      // Bar gradient
+      const a = 0.4 + smoothed[i] * 0.6;
+      const g = ctx.createLinearGradient(0, H, 0, H - h);
+      g.addColorStop(0, `rgba(232,255,0,${a})`);
+      g.addColorStop(0.7, `rgba(180,255,120,${a * 0.7})`);
+      g.addColorStop(1, `rgba(80,255,200,${a * 0.4})`);
+      ctx.fillStyle = g;
+      ctx.fillRect(i * bw + 0.5, H - h, bw - 1.5, h);
+
+      // Falling peak indicator
+      if (peaks[i] > 2) {
+        ctx.fillStyle = `rgba(255,255,255,${0.5 + smoothed[i] * 0.5})`;
+        ctx.fillRect(i * bw + 0.5, H - peaks[i] - 1.5, bw - 1.5, 1.5);
+      }
     }
   }
-  live();
+  frame();
 }
 
-// ─── AUDIO CONTEXT ────────────────────────────────────────────
 // NOTE: AudioContext MediaElementSource is intentionally DISABLED for local file:// playback.
 // Connecting a MediaElementSource to a file:// URL triggers CORS errors in Chromium,
 // which silently mutes the audio. The visualizer uses a simulated animation instead.
@@ -791,10 +1164,16 @@ function setupVideoControls() {
     if (!S.vcSeekDragging) hideVcControls();
   });
 
-  // Double-click video to toggle play
-  video.addEventListener('dblclick', togglePlayPause);
-  // Single click toggles play
-  video.addEventListener('click', togglePlayPause);
+  // FIX: Guard both click handlers — if a context menu is open, clicks
+  // on its items should not also trigger play/pause via event bubbling.
+  video.addEventListener('dblclick', e => {
+    if (document.getElementById('macan-ctx-menu')) return;
+    togglePlayPause();
+  });
+  video.addEventListener('click', e => {
+    if (document.getElementById('macan-ctx-menu')) return;
+    togglePlayPause();
+  });
 }
 
 function hideVcControls() {
@@ -814,6 +1193,14 @@ function pinVcControls(on) {
 // ─── LOAD & PLAY ──────────────────────────────────────────────
 async function loadTrack(index, autoplay = true) {
   if (index < 0 || index >= S.playlist.length) return;
+
+  // Fade out current track before switching
+  if (S.fadeEnabled && S.isPlaying && S._fadeGain && audioContext) {
+    await new Promise(resolve => {
+      doFadeOut(resolve);
+    });
+  }
+
   S.currentIndex = index;
   const track = S.playlist[index];
   const isVid  = track.is_video;
@@ -821,7 +1208,7 @@ async function loadTrack(index, autoplay = true) {
   // Stop both players first
   audio.pause(); video.pause();
 
-  // Reset src cleanly (empty string, not removeAttribute, avoids HTMLMediaElement errors)
+  // Reset src cleanly
   audio.src = '';
   video.src = '';
 
@@ -829,17 +1216,17 @@ async function loadTrack(index, autoplay = true) {
   updatePlaylistHighlight(index);
   setStatus(`LOADING — ${track.name}`);
 
+  // Apply ReplayGain normalization gain
+  applyNormalization(track);
+
   // Start with whatever URL was stored in the playlist
   let srcUrl = track.url || '';
 
-  // If running inside pywebview, verify the URL via Python API
-  // Python returns a proper file:// URI via Path.as_uri() with correct encoding
   if (pw() && track.path) {
     try {
       const resolvedUrl = await pywebview.api.get_file_url(track.path);
       if (resolvedUrl) {
         srcUrl = resolvedUrl;
-        // Also update stored url so next play doesn't need another round-trip
         track.url = resolvedUrl;
       }
     } catch(e) {
@@ -852,7 +1239,6 @@ async function loadTrack(index, autoplay = true) {
     return;
   }
 
-  // Show/hide video layer and assign src
   if (isVid) {
     videoLayer.classList.add('active');
     $('main-layout').style.display = 'none';
@@ -867,12 +1253,17 @@ async function loadTrack(index, autoplay = true) {
     audio.load();
     if (autoplay) doPlay(audio);
   }
+
+  scheduleStateSave();
 }
 
 function doPlay(player) {
   // Always try to resume AudioContext (browser policy)
   if (S.audioCtx && S.audioCtx.state === 'suspended') {
     S.audioCtx.resume().catch(e => console.warn('[MACAN] AudioCtx resume:', e));
+  }
+  if (audioContext && audioContext.state === 'suspended') {
+    audioContext.resume().catch(() => {});
   }
 
   // Guard: don't try to play if src is empty
@@ -885,8 +1276,11 @@ function doPlay(player) {
   if (playPromise !== undefined) {
     playPromise.then(() => {
       setStatus(`PLAYING — ${S.playlist[S.currentIndex]?.name || ''}`);
+      // Fade in after playback starts
+      if (S.fadeEnabled && S._fadeGain && audioContext && !player.isVideo) {
+        doFadeIn();
+      }
     }).catch(err => {
-      // AbortError = play() was interrupted by a new load/src change — not a real error
       if (err.name === 'AbortError') {
         console.log('[MACAN] Play aborted (track changed), ignoring.');
         return;
@@ -901,6 +1295,49 @@ function doPlay(player) {
       }
       onPlayState(false);
     });
+  }
+}
+
+// ─── FADE IN/OUT ──────────────────────────────────────────────
+function doFadeIn() {
+  if (!S._fadeGain || !audioContext) return;
+  const now = audioContext.currentTime;
+  const dur = S.fadeDuration / 1000;
+  S._fadeGain.gain.cancelScheduledValues(now);
+  S._fadeGain.gain.setValueAtTime(0.0001, now);
+  S._fadeGain.gain.exponentialRampToValueAtTime(1.0, now + dur);
+}
+
+function doFadeOut(callback) {
+  if (!S._fadeGain || !audioContext) { if (callback) callback(); return; }
+  const now = audioContext.currentTime;
+  const dur = S.fadeDuration / 1000;
+  S._fadeGain.gain.cancelScheduledValues(now);
+  S._fadeGain.gain.setValueAtTime(S._fadeGain.gain.value || 1.0, now);
+  S._fadeGain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+  setTimeout(() => {
+    if (callback) callback();
+    // Reset gain so next fade-in works
+    if (S._fadeGain) S._fadeGain.gain.setValueAtTime(1.0, audioContext.currentTime);
+  }, S.fadeDuration + 50);
+}
+
+// ─── REPLAY GAIN / NORMALIZATION ──────────────────────────────
+function applyNormalization(track) {
+  if (!S._gainNode || !audioContext) return;
+  if (!S.normEnabled || track.is_video) {
+    S._gainNode.gain.setValueAtTime(1.0, audioContext.currentTime);
+    return;
+  }
+  const rgDb = (track.replaygain_db !== undefined && track.replaygain_db !== null)
+    ? parseFloat(track.replaygain_db) : 0;
+  // Convert dB gain to linear multiplier
+  const linearGain = Math.pow(10, rgDb / 20);
+  // Clamp to prevent clipping (max 4x = +12dB)
+  const clamped = Math.min(Math.max(linearGain, 0.1), 4.0);
+  S._gainNode.gain.setValueAtTime(clamped, audioContext.currentTime);
+  if (rgDb !== 0) {
+    setStatus(`NORMALIZATION: ${rgDb > 0 ? '+' : ''}${rgDb.toFixed(1)} dB`);
   }
 }
 
@@ -934,18 +1371,23 @@ function updateTrackInfo(track) {
   artPlaceholder.classList.remove('hidden');
   artBlurBg.style.opacity = '0';
 
-  // Try to get cover art: embedded first, then online fallback
+  // Try to get cover art: use already-fetched art first, then embedded, then online
   if (pw() && !track.is_video) {
-    pywebview.api.get_cover_art(track.path).then(data => {
-      if (data) {
-        applyArt(data);
-      } else {
-        // Try online fallback (fires async; onOnlineArtReady callback handles result)
-        pywebview.api.get_cover_art_with_online_fallback(track.path).then(online => {
-          if (online) applyArt(online);
-        }).catch(() => {});
-      }
-    }).catch(() => {});
+    if (track.cover_art) {
+      // Art already available (from Python _build_track_meta or previous session)
+      applyArt(track.cover_art);
+    } else {
+      pywebview.api.get_cover_art(track.path).then(data => {
+        if (data) {
+          applyArt(data);
+        } else {
+          // Try online fallback (fires async; onOnlineArtReady callback handles result)
+          pywebview.api.get_cover_art_with_online_fallback(track.path).then(online => {
+            if (online) applyArt(online);
+          }).catch(() => {});
+        }
+      }).catch(() => {});
+    }
   }
 
   // Auto-fetch lyrics if panel is open
@@ -965,21 +1407,23 @@ function applyArt(src) {
 
   // Cache art into track object so playlist thumbnails stay updated
   if (S.currentIndex >= 0 && S.playlist[S.currentIndex]) {
-    S.playlist[S.currentIndex].cover_art = src;
-    // Update just the thumbnail in the active playlist item (no full re-render)
+    const track = S.playlist[S.currentIndex];
+    const wasNew = !track.cover_art;
+    track.cover_art = src;
+    thumbCache.set(track.path, src);
+    // FIX: placeholder is a <div class="pl-thumb-placeholder">, not an img
     const activeItem = playlistList.querySelector(`.pl-item[data-index="${S.currentIndex}"]`);
     if (activeItem) {
-      const existingThumb = activeItem.querySelector('.pl-thumb');
-      if (existingThumb && existingThumb.classList.contains('pl-thumb-placeholder')) {
+      const placeholder = activeItem.querySelector('.pl-thumb-placeholder');
+      if (placeholder) {
         const img = document.createElement('img');
         img.className = 'pl-thumb';
-        img.src = src;
-        img.alt = '';
-        img.draggable = false;
-        img.loading = 'lazy';
-        existingThumb.replaceWith(img);
+        img.src = src; img.alt = ''; img.draggable = false; img.loading = 'lazy';
+        placeholder.replaceWith(img);
       }
     }
+    // Persist newly-fetched art to Python so clear+reload and restarts keep it
+    if (wasNew) _persistArtToServer(track.path, src, false);
   }
 }
 
@@ -1000,17 +1444,32 @@ function onPlayState(playing) {
 function onMeta() {
   const p = activePlayer();
   S.duration = p.duration;
-  
+
   // Fix for Infinity/NaN durations (streams or corrupt files)
   if (!Number.isFinite(S.duration)) S.duration = 0;
 
   const str = formatTime(S.duration);
-  timeTotal.textContent    = str;
-  vcTimeTotal.textContent  = str;
+  timeTotal.textContent   = str;
+  vcTimeTotal.textContent = str;
   if (S.currentIndex >= 0 && S.playlist[S.currentIndex]) {
     S.playlist[S.currentIndex].duration     = Math.floor(S.duration);
     S.playlist[S.currentIndex].duration_str = str;
     updatePlaylistMeta();
+  }
+
+  // FIX: Consume the pending seek that was stored in _doStateRestore().
+  // By handling it here (inside loadedmetadata) we guarantee the duration
+  // is known and avoid the race between addEventListener+load order.
+  if (S._seekPending) {
+    const { position } = S._seekPending;
+    S._seekPending = null;
+    if (S.duration > 0 && position > 0 && position < S.duration) {
+      p.currentTime = position;
+      const pct = position / S.duration;
+      progressFill.style.width = (pct * 100) + '%';
+      progressThumb.style.left = (pct * 100) + '%';
+      timeCurrent.textContent  = formatTime(position);
+    }
   }
 }
 
@@ -1033,6 +1492,17 @@ function onTimeUpdate() {
   // Sync lyrics highlight if panel is open
   if (S.lyricsOpen && S.lyricsData?.is_synced) {
     highlightCurrentLyricLine();
+  }
+
+  // FIX: Periodic state save every ~10s using wall-clock time (not
+  // currentTime which can be 0 after a track change) to prevent
+  // triggering a save while a previous one is still in-flight.
+  const now = Date.now();
+  if (!S._lastStateSaveWallMs || now - S._lastStateSaveWallMs > 10000) {
+    if (!S._saveLock) {
+      S._lastStateSaveWallMs = now;
+      scheduleStateSave();
+    }
   }
 }
 
@@ -1084,6 +1554,7 @@ function toggleShuffle() {
   S.isShuffle = !S.isShuffle;
   $('btn-shuffle').classList.toggle('active', S.isShuffle);
   setStatus(S.isShuffle ? 'SHUFFLE ON' : 'SHUFFLE OFF');
+  scheduleStateSave();
 }
 
 function cycleRepeat() {
@@ -1092,6 +1563,50 @@ function cycleRepeat() {
   $('btn-repeat').classList.toggle('active', S.repeatMode !== 'none');
   repeatBadge.style.display = S.repeatMode==='one' ? 'flex' : 'none';
   setStatus({none:'REPEAT OFF',all:'REPEAT ALL',one:'REPEAT ONE'}[S.repeatMode]);
+  scheduleStateSave();
+}
+
+// ─── STATE PERSISTENCE ────────────────────────────────────────
+// FIX: Two-level guard against race conditions in state saving:
+//   1. Debounce: collapse rapid successive changes into one write.
+//   2. _saveLock: if a save is already in-flight (awaiting Python),
+//      the next debounce fires after it completes, never in parallel.
+function scheduleStateSave() {
+  clearTimeout(S._stateSaveTimer);
+  S._stateSaveTimer = setTimeout(persistAppState, 800);
+}
+
+async function persistAppState() {
+  if (!pw()) return;
+  // FIX: Skip if a save is already in-flight — reschedule for after it lands.
+  if (S._saveLock) {
+    clearTimeout(S._stateSaveTimer);
+    S._stateSaveTimer = setTimeout(persistAppState, 400);
+    return;
+  }
+  S._saveLock = true;
+  try {
+    const state = {
+      currentIndex:  S.currentIndex,
+      seekPosition:  S.currentIndex >= 0 ? (activePlayer().currentTime || 0) : 0,
+      volume:        S.volume,
+      isShuffle:     S.isShuffle,
+      repeatMode:    S.repeatMode,
+      fadeEnabled:   S.fadeEnabled,
+      fadeDuration:  S.fadeDuration,
+      normEnabled:   S.normEnabled,
+      // FIX: If AudioContext/equalizer hasn't been initialized yet (user hasn't
+      // interacted with EQ), fall back to the pending values from restore so we
+      // don't overwrite a valid saved EQ state with null.
+      eqBands:  equalizer ? equalizer.getCurrentValues() : (S._pendingEqBands || null),
+      eqPreset: equalizerUI ? equalizerUI.currentPreset  : (S._pendingEqPreset || null),
+    };
+    await pywebview.api.save_app_state(state);
+  } catch(e) {
+    console.warn('[MACAN] State save failed:', e);
+  } finally {
+    S._saveLock = false;
+  }
 }
 
 function setVolume(val) {
@@ -1100,6 +1615,7 @@ function setVolume(val) {
   if (S.volume > 0) S.isMuted = false;
   updateVolumeUI(S.volume);
   syncVcVolume(S.volume);
+  scheduleStateSave();
 }
 
 function updateVolumeUI(val) {
@@ -1143,6 +1659,7 @@ async function openFiles() {
       // add_tracks() accepts raw paths, builds metadata, returns updated playlist
       const playlist = await pywebview.api.add_tracks(paths);
       S.playlist = playlist;
+      _seedThumbCache(S.playlist);
       renderPlaylist(); updatePlaylistMeta();
       setStatus(`ADDED ${paths.length} TRACK(S)`);
       if (S.currentIndex < 0) loadTrack(0);
@@ -1160,6 +1677,7 @@ async function openFolder() {
       // add_tracks() accepts raw paths, builds metadata, returns updated playlist
       const playlist = await pywebview.api.add_tracks(paths);
       S.playlist = playlist;
+      _seedThumbCache(S.playlist);
       renderPlaylist(); updatePlaylistMeta();
       setStatus(`LOADED ${paths.length} TRACK(S)`);
       if (S.currentIndex < 0) loadTrack(0);
@@ -1207,6 +1725,13 @@ async function clearPlaylist() {
 let filterQ = '';
 function filterPlaylist(q) { filterQ = q.trim().toLowerCase(); renderPlaylist(); }
 
+// ─── DRAG-AND-DROP STATE ──────────────────────────────────────
+const DND = {
+  dragIndex:  -1,
+  overIndex:  -1,
+  indicator:  null,
+};
+
 function renderPlaylist() {
   playlistList.innerHTML = '';
   const list = filterQ
@@ -1221,30 +1746,75 @@ function renderPlaylist() {
     const div = document.createElement('div');
     div.className = 'pl-item' + (isActive ? ' active' : '');
     div.dataset.index = realIdx;
+    div.draggable = !filterQ;
 
-    // Determine thumbnail source: cover_art for audio, video icon placeholder for video
+    // ── thumbnail ──────────────────────────────────────────────
     let thumbHtml = '';
     if (track.is_video) {
-      thumbHtml = `
-        <div class="pl-thumb pl-thumb-placeholder pl-thumb-video" title="Video">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.6">
-            <polygon points="23,7 16,12 23,17"/>
-            <rect x="1" y="5" width="15" height="14" rx="2"/>
-          </svg>
-        </div>`;
-    } else if (track.cover_art) {
-      thumbHtml = `<img class="pl-thumb" src="${track.cover_art}" alt="" loading="lazy" draggable="false">`;
+      // Merge cache → track object so render is instant on re-add after clear
+      if (!track.video_thumb && videoThumbCache.has(track.path))
+        track.video_thumb = videoThumbCache.get(track.path);
+
+      if (track.video_thumb) {
+        thumbHtml = `<img class="pl-thumb pl-thumb-video-img" src="${track.video_thumb}" alt="" loading="lazy" draggable="false">`;
+      } else {
+        thumbHtml = `
+          <div class="pl-thumb pl-thumb-placeholder pl-thumb-video" title="Video">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.6">
+              <polygon points="23,7 16,12 23,17"/>
+              <rect x="1" y="5" width="15" height="14" rx="2"/>
+            </svg>
+          </div>`;
+        if (pw()) {
+          (async (t, idx) => {
+            try {
+              const thumb = await pywebview.api.get_video_thumbnail(t.path);
+              if (thumb) {
+                const wasNew = !t.video_thumb;
+                t.video_thumb = thumb;
+                videoThumbCache.set(t.path, thumb);
+                // FIX: placeholder is a <div>, not <img>
+                const el = playlistList.querySelector(`.pl-item[data-index="${idx}"] .pl-thumb-placeholder`);
+                if (el) {
+                  const img = document.createElement('img');
+                  img.className = 'pl-thumb pl-thumb-video-img';
+                  img.src = thumb; img.alt = ''; img.draggable = false; img.loading = 'lazy';
+                  el.replaceWith(img);
+                }
+                if (wasNew) _persistArtToServer(t.path, thumb, true);
+              }
+            } catch(e) {}
+          })(track, realIdx);
+        }
+      }
     } else {
-      thumbHtml = `
-        <div class="pl-thumb pl-thumb-placeholder" title="No art">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.35">
-            <circle cx="12" cy="12" r="10"/>
-            <circle cx="12" cy="12" r="3"/>
-          </svg>
-        </div>`;
+      // Merge cache → track object so render is instant on re-add after clear
+      if (!track.cover_art && thumbCache.has(track.path))
+        track.cover_art = thumbCache.get(track.path);
+      // Merge track object → cache (seed from Python-fetched embedded art)
+      if (track.cover_art && !thumbCache.has(track.path))
+        thumbCache.set(track.path, track.cover_art);
+
+      if (track.cover_art) {
+        thumbHtml = `<img class="pl-thumb" src="${track.cover_art}" alt="" loading="lazy" draggable="false">`;
+      } else {
+        thumbHtml = `
+          <div class="pl-thumb pl-thumb-placeholder" title="No art">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.35">
+              <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/>
+            </svg>
+          </div>`;
+      }
     }
 
     div.innerHTML = `
+      <div class="pl-drag-handle" title="Drag to reorder">
+        <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor">
+          <circle cx="3" cy="2.5" r="1.5"/><circle cx="7" cy="2.5" r="1.5"/>
+          <circle cx="3" cy="7"   r="1.5"/><circle cx="7" cy="7"   r="1.5"/>
+          <circle cx="3" cy="11.5" r="1.5"/><circle cx="7" cy="11.5" r="1.5"/>
+        </svg>
+      </div>
       <div class="pl-idx">${realIdx+1}</div>
       <div class="pl-playing-indicator"><div class="bar"></div><div class="bar"></div><div class="bar"></div></div>
       ${thumbHtml}
@@ -1254,15 +1824,273 @@ function renderPlaylist() {
         <span class="pl-item-ext">${track.ext||''}</span>
       </div>
       <span class="pl-item-duration">${track.duration_str||'--:--'}</span>
-      <span class="pl-item-type ${track.is_video?'video':''}">${track.is_video?'VIDEO':'AUDIO'}</span>
+      <span class="pl-item-type ${track.is_video?'video':''}">
+        ${track.is_video
+          ? '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" style="margin-right:3px;opacity:.7"><polygon points="23,7 16,12 23,17"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>VIDEO'
+          : 'AUDIO'}
+      </span>
       <button class="pl-remove-btn" title="Remove">✕</button>`;
+
     div.querySelector('.pl-remove-btn').addEventListener('click', e => removeTrack(track.path, e));
     div.addEventListener('click', () => loadTrack(realIdx));
     div.addEventListener('dblclick', () => loadTrack(realIdx, true));
+    div.addEventListener('contextmenu', e => {
+      e.preventDefault(); e.stopPropagation();
+      showContextMenu(e.clientX, e.clientY, track);
+    });
+
+    if (!filterQ) {
+      div.addEventListener('dragstart', e => {
+        DND.dragIndex = realIdx;
+        div.classList.add('pl-dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', String(realIdx));
+        const ghost = div.cloneNode(true);
+        ghost.style.cssText = 'position:fixed;top:-200px;left:0;width:300px;opacity:.8;pointer-events:none;';
+        document.body.appendChild(ghost);
+        e.dataTransfer.setDragImage(ghost, 20, 20);
+        setTimeout(() => ghost.remove(), 0);
+      });
+      div.addEventListener('dragend', () => {
+        div.classList.remove('pl-dragging');
+        _dndCleanup();
+      });
+      div.addEventListener('dragover', e => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        if (DND.dragIndex === realIdx) return;
+        const rect = div.getBoundingClientRect();
+        const after = e.clientY > rect.top + rect.height / 2;
+        const targetIdx = after ? realIdx + 1 : realIdx;
+        if (DND.overIndex !== targetIdx) {
+          DND.overIndex = targetIdx;
+          _dndShowIndicator(div, after);
+        }
+      });
+      div.addEventListener('dragleave', e => {
+        if (!playlistList.contains(e.relatedTarget)) _dndCleanup(false);
+      });
+      div.addEventListener('drop', e => {
+        e.preventDefault();
+        if (DND.dragIndex < 0 || DND.dragIndex === DND.overIndex) { _dndCleanup(); return; }
+        _doPlaylistReorder(DND.dragIndex, DND.overIndex);
+        _dndCleanup();
+      });
+    }
+
     playlistList.appendChild(div);
   });
 
   plCount.textContent = `${S.playlist.length} TRACK${S.playlist.length!==1?'S':''}`;
+}
+
+function _dndShowIndicator(refEl, insertAfter) {
+  if (!DND.indicator) {
+    DND.indicator = document.createElement('div');
+    DND.indicator.className = 'pl-drop-indicator';
+  }
+  if (insertAfter) refEl.after(DND.indicator);
+  else refEl.before(DND.indicator);
+}
+
+function _dndCleanup(resetOver = true) {
+  if (DND.indicator) DND.indicator.remove();
+  if (resetOver) { DND.dragIndex = -1; DND.overIndex = -1; }
+  document.querySelectorAll('.pl-dragging').forEach(el => el.classList.remove('pl-dragging'));
+}
+
+function _doPlaylistReorder(fromIdx, toIdx) {
+  if (fromIdx === toIdx || fromIdx < 0) return;
+  let insertAt = toIdx;
+  if (fromIdx < toIdx) insertAt--;
+  if (insertAt === fromIdx) return;
+
+  const item = S.playlist.splice(fromIdx, 1)[0];
+  S.playlist.splice(insertAt, 0, item);
+
+  if (S.currentIndex === fromIdx) {
+    S.currentIndex = insertAt;
+  } else if (fromIdx < S.currentIndex && insertAt >= S.currentIndex) {
+    S.currentIndex--;
+  } else if (fromIdx > S.currentIndex && insertAt <= S.currentIndex) {
+    S.currentIndex++;
+  }
+
+  renderPlaylist();
+  updatePlaylistMeta();
+  if (pw()) pywebview.api.reorder_playlist(fromIdx, insertAt).catch(() => {});
+  scheduleStateSave();
+}
+
+
+// ─── CONTEXT MENU ─────────────────────────────────────────────
+function showContextMenu(x, y, track) {
+  // Remove existing context menus
+  closeContextMenu();
+
+  const menu = document.createElement('div');
+  menu.id = 'macan-ctx-menu';
+  menu.className = 'macan-ctx-menu';
+  menu.innerHTML = `
+    <div class="ctx-item ctx-properties" data-action="properties">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+      </svg>
+      File Properties
+    </div>
+    <div class="ctx-item ctx-play" data-action="play">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+        <polygon points="5,3 19,12 5,21"/>
+      </svg>
+      Play Now
+    </div>
+    <div class="ctx-separator"></div>
+    <div class="ctx-item ctx-remove" data-action="remove">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+      </svg>
+      Remove from Queue
+    </div>`;
+
+  document.body.appendChild(menu);
+
+  // Position — keep within viewport
+  const menuW = 200, menuH = 130;
+  const left = Math.min(x, window.innerWidth - menuW - 8);
+  const top  = Math.min(y, window.innerHeight - menuH - 8);
+  menu.style.left = left + 'px';
+  menu.style.top  = top  + 'px';
+
+  menu.querySelector('[data-action="properties"]').addEventListener('click', () => {
+    showFileProperties(track);
+    closeContextMenu();
+  });
+  menu.querySelector('[data-action="play"]').addEventListener('click', () => {
+    const idx = S.playlist.indexOf(track);
+    if (idx >= 0) loadTrack(idx, true);
+    closeContextMenu();
+  });
+  menu.querySelector('[data-action="remove"]').addEventListener('click', () => {
+    const fakeEvent = { stopPropagation: () => {} };
+    removeTrack(track.path, fakeEvent);
+    closeContextMenu();
+  });
+
+  // FIX: Prevent right-click context menu from closing itself immediately.
+  // In pywebview/Chromium the contextmenu event can still be bubbling when
+  // setTimeout(0) fires, causing the "close on outside contextmenu" listener
+  // to catch the same event that opened the menu.
+  // Solution: block all contextmenu events on the menu element itself,
+  // and attach the document-level close listeners after a reliable delay.
+  menu.addEventListener('contextmenu', e => e.preventDefault());
+
+  // Close on click outside — setTimeout(0) is safe for click events
+  setTimeout(() => {
+    document.addEventListener('click', closeContextMenu, { once: true });
+  }, 0);
+
+  // Close on right-click outside — use longer delay so the originating
+  // contextmenu event has fully finished bubbling before we listen.
+  setTimeout(() => {
+    document.addEventListener('contextmenu', e => {
+      // Don't close if the right-click was inside the menu itself
+      if (!menu.contains(e.target)) {
+        closeContextMenu();
+      }
+    }, { once: true });
+  }, 150);
+}
+
+function closeContextMenu() {
+  const m = document.getElementById('macan-ctx-menu');
+  if (m) m.remove();
+}
+
+// Context menu for video layer
+function setupVideoContextMenu() {
+  videoLayer.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    // FIX: stopPropagation prevents this contextmenu event from bubbling up
+    // to the document-level "close on outside contextmenu" listener that
+    // showContextMenu attaches with a 150ms delay. Without this, the same
+    // event that opens the menu immediately triggers closeContextMenu.
+    e.stopPropagation();
+    const track = S.currentIndex >= 0 ? S.playlist[S.currentIndex] : null;
+    if (!track) return;
+    showContextMenu(e.clientX, e.clientY, track);
+  });
+}
+
+// ─── FILE PROPERTIES MODAL ────────────────────────────────────
+async function showFileProperties(track) {
+  let info = null;
+  if (pw() && track.path) {
+    try {
+      info = await pywebview.api.get_file_info(track.path);
+    } catch(e) {
+      console.error('[MACAN] get_file_info error:', e);
+    }
+  }
+
+  // Fallback: use track object data
+  if (!info) {
+    info = {
+      name:      track.name || '—',
+      path:      track.path || '—',
+      size:      '—',
+      duration_str: track.duration_str || '—',
+      is_video:  track.is_video,
+      ext:       track.ext || '—',
+      artist:    track.artist || '',
+      album:     track.album || '',
+      resolution: track.video_resolution || null,
+    };
+  }
+
+  // Remove existing modal
+  const existing = document.getElementById('macan-file-props');
+  if (existing) existing.remove();
+
+  const modDate = info.modified ? new Date(info.modified * 1000).toLocaleString() : '—';
+
+  let rows = '';
+  rows += `<tr><td>File Name</td><td>${esc(info.name)}</td></tr>`;
+  rows += `<tr><td>Path</td><td class="fp-path" title="${esc(info.path)}">${esc(info.path)}</td></tr>`;
+  rows += `<tr><td>Size</td><td>${info.size || '—'}</td></tr>`;
+  rows += `<tr><td>Format</td><td>${info.ext || '—'}</td></tr>`;
+  rows += `<tr><td>Duration</td><td>${info.duration_str || track.duration_str || '—'}</td></tr>`;
+  rows += `<tr><td>Modified</td><td>${modDate}</td></tr>`;
+
+  if (info.is_video) {
+    rows += `<tr><td>Resolution</td><td>${info.resolution || track.video_resolution || '—'}</td></tr>`;
+    if (info.fps) rows += `<tr><td>Frame Rate</td><td>${info.fps} fps</td></tr>`;
+  } else {
+    if (info.artist || track.artist) rows += `<tr><td>Artist</td><td>${esc(info.artist || track.artist || '—')}</td></tr>`;
+    if (info.album  || track.album)  rows += `<tr><td>Album</td><td>${esc(info.album  || track.album  || '—')}</td></tr>`;
+    if (info.replaygain_db !== undefined && info.replaygain_db !== null) {
+      const rg = parseFloat(info.replaygain_db);
+      rows += `<tr><td>ReplayGain</td><td>${rg > 0 ? '+' : ''}${rg.toFixed(2)} dB</td></tr>`;
+    }
+  }
+
+  const modal = document.createElement('div');
+  modal.id = 'macan-file-props';
+  modal.className = 'macan-file-props-overlay';
+  modal.innerHTML = `
+    <div class="fp-panel">
+      <div class="fp-header">
+        <span class="fp-icon">${info.is_video ? '🎬' : '🎵'}</span>
+        <h3>FILE PROPERTIES</h3>
+        <button class="fp-close" id="fp-close-btn">✕</button>
+      </div>
+      <table class="fp-table">
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  document.body.appendChild(modal);
+
+  modal.querySelector('#fp-close-btn').addEventListener('click', () => modal.remove());
+  modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
 }
 
 function updatePlaylistHighlight(idx) {
@@ -1320,21 +2148,20 @@ document.addEventListener('drop', async e => {
         const art = await pywebview.api.get_cover_art(track.path);
         if (art) {
           track.cover_art = art;
-          // Update thumbnail in the playlist DOM without full re-render
+          thumbCache.set(track.path, art);
           const idx = S.playlist.indexOf(track);
           const item = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
           if (item) {
+            // FIX: placeholder is a <div>, not <img>
             const placeholder = item.querySelector('.pl-thumb-placeholder');
             if (placeholder) {
               const img = document.createElement('img');
               img.className = 'pl-thumb';
-              img.src = art;
-              img.alt = '';
-              img.draggable = false;
-              img.loading = 'lazy';
+              img.src = art; img.alt = ''; img.draggable = false; img.loading = 'lazy';
               placeholder.replaceWith(img);
             }
           }
+          _persistArtToServer(track.path, art, false);
         }
       } catch(e) { /* no art available */ }
     });
