@@ -204,6 +204,22 @@
           </svg>
           LYRICS
         </button>
+        <button class="pl-tool-btn" id="btn-radio" title="Radio Online">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="10" width="18" height="11" rx="2"/>
+            <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
+            <circle cx="12" cy="16" r="2"/>
+            <line x1="19" y1="10" x2="19" y2="10"/>
+          </svg>
+          RADIO
+        </button>
+        <button class="pl-tool-btn" id="btn-tv" title="TV Online">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="7" width="20" height="15" rx="2"/>
+            <polyline points="17 2 12 7 7 2"/>
+          </svg>
+          TV
+        </button>
         <div id="search-wrap">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -341,9 +357,193 @@
   </div>
 </div>
 
+
+<!-- ═══════════ RADIO OVERLAY ══════════════════════════════════ -->
+<div id="radio-overlay" class="radio-tv-overlay">
+  <div class="rtv-panel">
+    <div class="rtv-header">
+      <div class="rtv-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="10" width="18" height="11" rx="2"/>
+          <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
+          <circle cx="12" cy="16" r="2"/>
+        </svg>
+        <h2>RADIO ONLINE</h2>
+        <span id="radio-live-badge" class="rtv-live-badge" style="display:none">&#9679; LIVE</span>
+      </div>
+      <button class="rtv-close-btn" id="radio-close">&#x2715;</button>
+    </div>
+
+    <div class="rtv-now-playing" id="radio-now-playing" style="display:none">
+      <div class="rtv-np-icon">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="16" r="2"/><path d="M7 10V7a5 5 0 0 1 10 0v3"/>
+          <rect x="3" y="10" width="18" height="11" rx="2"/>
+        </svg>
+      </div>
+      <div class="rtv-np-info">
+        <div class="rtv-np-name" id="radio-now-name">&#8212;</div>
+        <div class="rtv-np-meta" id="radio-now-meta">&#8212;</div>
+      </div>
+      <div class="rtv-np-vis" id="radio-vis-bars">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <button class="rtv-stop-btn" id="radio-stop">&#9632; STOP</button>
+    </div>
+
+    <div class="rtv-controls-row">
+      <div class="rtv-search-wrap">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input type="text" id="radio-search" placeholder="SEARCH STATIONS..." class="rtv-search"/>
+      </div>
+      <button class="rtv-action-btn" id="radio-refresh" title="Refresh from internet">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"/>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+        REFRESH
+      </button>
+      <button class="rtv-action-btn" id="radio-add-custom">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        ADD URL
+      </button>
+    </div>
+
+    <div class="rtv-custom-url-row" id="radio-custom-url-row" style="display:none">
+      <input type="text" id="radio-custom-name" placeholder="Station name..." class="rtv-url-input"/>
+      <input type="text" id="radio-custom-url" placeholder="Stream URL (http://...)..." class="rtv-url-input"/>
+      <button class="rtv-action-btn accent" id="radio-custom-save">SAVE &amp; PLAY</button>
+      <button class="rtv-action-btn" id="radio-custom-cancel">CANCEL</button>
+    </div>
+
+    <div class="rtv-list-header">
+      <span>STATIONS</span>
+      <span class="rtv-count" id="radio-count">&#8212; stations</span>
+    </div>
+
+    <div class="rtv-list" id="radio-list">
+      <div class="rtv-empty-state">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
+          <rect x="3" y="10" width="18" height="11" rx="2"/>
+          <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
+          <circle cx="12" cy="16" r="2"/>
+        </svg>
+        <p>PRESS REFRESH TO LOAD STATIONS</p>
+      </div>
+    </div>
+
+    <div class="rtv-footer">
+      <span id="radio-status">IDLE</span>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ TV OVERLAY ═══════════════════════════════════════ -->
+<div id="tv-overlay" class="radio-tv-overlay">
+  <div class="rtv-panel">
+    <div class="rtv-header">
+      <div class="rtv-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="7" width="20" height="15" rx="2"/>
+          <polyline points="17 2 12 7 7 2"/>
+        </svg>
+        <h2>TV ONLINE</h2>
+        <span id="tv-live-badge" class="rtv-live-badge" style="display:none">&#9679; LIVE</span>
+      </div>
+      <button class="rtv-close-btn" id="tv-close">&#x2715;</button>
+    </div>
+
+    <div class="rtv-now-playing" id="tv-now-playing" style="display:none">
+      <div class="rtv-np-icon">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/>
+        </svg>
+      </div>
+      <div class="rtv-np-info">
+        <div class="rtv-np-name" id="tv-now-name">&#8212;</div>
+        <div class="rtv-np-meta" id="tv-now-meta">&#8212;</div>
+      </div>
+      <div class="rtv-np-vis" id="tv-vis-bars">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <button class="rtv-stop-btn" id="tv-stop">&#9632; STOP</button>
+    </div>
+
+    <div class="rtv-controls-row">
+      <div class="rtv-search-wrap">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input type="text" id="tv-search" placeholder="SEARCH CHANNELS..." class="rtv-search"/>
+      </div>
+      <select id="tv-source-select" class="rtv-select">
+        <option value="https://iptv-org.github.io/iptv/countries/id.m3u">Github (ID)</option>
+        <option value="https://iptv-org.github.io/iptv/index.m3u">Github (Global)</option>
+        <option value="https://www.apsattv.com/vizio.m3u">Vizio TV</option>
+        <option value="https://www.apsattv.com/localnow.m3u">Local Now</option>
+        <option value="https://www.apsattv.com/lg.m3u">LG Channels</option>
+        <option value="https://www.apsattv.com/tablo.m3u">Tablo</option>
+        <option value="https://www.apsattv.com/xiaomi.m3u">Xiaomi</option>
+        <option value="https://www.apsattv.com/firetv.m3u">Fire TV</option>
+        <option value="https://www.apsattv.com/xumo.m3u">Xumo</option>
+        <option value="https://www.apsattv.com/rok.m3u">The Roku Channel</option>
+        <option value="https://www.apsattv.com/distro.m3u">Distro</option>
+        <option value="https://www.apsattv.com/tclplus.m3u">TCL TV Plus</option>
+      </select>
+      <button class="rtv-action-btn" id="tv-load-m3u" title="Load local M3U file">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+        </svg>
+        M3U
+      </button>
+      <button class="rtv-action-btn" id="tv-refresh">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"/>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+        RELOAD
+      </button>
+    </div>
+
+    <div class="rtv-custom-url-row" id="tv-custom-url-row" style="display:none">
+      <input type="text" id="tv-custom-url" placeholder="Stream URL or .m3u URL..." class="rtv-url-input" style="flex:2"/>
+      <button class="rtv-action-btn accent" id="tv-custom-play">PLAY URL</button>
+      <button class="rtv-action-btn" id="tv-custom-cancel">CANCEL</button>
+    </div>
+
+    <div class="rtv-list-header">
+      <span>CHANNELS</span>
+      <span class="rtv-count" id="tv-count">&#8212; channels</span>
+    </div>
+
+    <div class="rtv-list" id="tv-list">
+      <div class="rtv-empty-state">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
+          <rect x="2" y="7" width="20" height="15" rx="2"/>
+          <polyline points="17 2 12 7 7 2"/>
+        </svg>
+        <p>SELECT A SOURCE AND PRESS RELOAD</p>
+      </div>
+    </div>
+
+    <div class="rtv-footer">
+      <span id="tv-status">IDLE</span>
+    </div>
+  </div>
+</div>
+
+<!-- hidden file input for M3U -->
+<input type="file" id="tv-m3u-file-input" accept=".m3u,.m3u8" style="display:none">
+
 <!-- ═══════════ SCRIPTS ═══════════════════════════════════ -->
 <script src="equalizer.js"></script>
 <script src="playlist-manager.js"></script>
+<script src="radio-tv.js"></script>
 <script src="script.js"></script>
 </body>
 </html>
