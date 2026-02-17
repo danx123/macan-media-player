@@ -26,6 +26,7 @@ A sleek, fullscreen desktop media player built with Python and pywebview. Macan 
 - 🖼️ Embedded Cover Art — extract and display album artwork from ID3/FLAC/OGG tags via mutagen
 - 🎛️ Full Playback Controls — play/pause, previous, next, seek, volume, mute
 - 📺 Video Overlay Controls — YouTube-style autohide controls with fullscreen support
+- 📺 TV & Radio Online
 - 🖼️ Video Seek Thumbnail Preview — thumbnail preview on video seekbar hover, generated server-side via cv2 (OpenCV) in core/video_utils.py
 - 🕐 Live Clock — real-time time and date in header
 - 💾 Persistent Playlist & Settings — automatically saved to %LOCALAPPDATA%\MacanMediaPlayer on Windows
@@ -152,6 +153,7 @@ macan-media-player/
     ├── index.html           # App shell and HTML structure
     ├── equalizer.js         # Engine for equalizer
     ├── playlist-manager.js  # For manage playlist with .json
+    ├── radio-tv.js          # For manage radio & tv online
     ├── style.css            # Dark theme, animations, layout
     └── script.js            # Playback engine, playlist, UI logic
 ```
