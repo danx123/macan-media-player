@@ -5,6 +5,56 @@
    2. Robust duration checking for Seekbar
    3. Force Resume AudioContext on interaction
 ═══════════════════════════════════════════════════════════════ */
+// ═══════════════════════════════════════════════════════════════
+// AUDIO CONTEXT & EQUALIZER INITIALIZATION
+// ═══════════════════════════════════════════════════════════════
+
+let audioContext;
+let audioSource;
+let equalizer;
+let equalizerUI;
+let playlistManager;
+
+function initAudioContext() {
+  if (!audioContext) {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    equalizer = new Equalizer10Band(audioContext);
+    equalizerUI = new EqualizerUI(equalizer);
+    
+    // Connect audio element to equalizer
+    if (!audioSource) {
+      audioSource = audioContext.createMediaElementSource(audioPlayer);
+      audioSource.connect(equalizer.input);
+      equalizer.connect(audioContext.destination);
+    }
+  }
+}
+
+// Initialize Playlist Manager
+playlistManager = new PlaylistManager();
+
+// Setup callbacks
+playlistManager.onSave((name) => {
+  const tracks = playlist.map(item => ({
+    path: item.path,
+    name: item.name,
+    artist: item.artist || 'Unknown Artist',
+    duration: item.duration
+  }));
+  playlistManager.saveCurrentPlaylist(name, tracks);
+});
+
+playlistManager.onLoad((name) => {
+  const tracks = playlistManager.loadPlaylist(name);
+  if (tracks && tracks.length > 0) {
+    // Clear current playlist and load saved one
+    playlist = tracks;
+    currentIndex = 0;
+    renderPlaylist();
+    loadTrack(0);
+  }
+});
+
 'use strict';
 
 // ─── STATE ────────────────────────────────────────────────────
@@ -23,6 +73,10 @@ const S = {
   seekDragging: false,
   vcSeekDragging: false,
   vcHideTimer:  null,
+  previewThrottle: null,
+  lyricsOpen:   false,
+  lyricsData:   null,     // { content, is_synced, lines }
+  lyricsActiveLine: -1,
 };
 
 // ─── DOM ──────────────────────────────────────────────────────
@@ -72,6 +126,258 @@ const vcTimeTotal   = $('vc-time-total');
 const vcIconPlay    = $('vc-icon-play');
 const vcIconPause   = $('vc-icon-pause');
 const vcVolSlider   = $('vc-vol-slider');
+
+const vcPreviewTooltip = $('vc-preview-tooltip');
+const vcPreviewImg     = $('vc-preview-img');
+const vcPreviewTime    = $('vc-preview-time');
+
+// ═══════════════════════════════════════════════════════════════
+// EQUALIZER & PLAYLIST MANAGER BUTTONS
+// ═══════════════════════════════════════════════════════════════
+
+const btnEqualizer = document.getElementById('btn-equalizer');
+const btnPlaylistManager = document.getElementById('btn-playlist-manager');
+
+btnEqualizer.addEventListener('click', () => {
+  initAudioContext();
+  equalizerUI.toggle();
+});
+
+btnPlaylistManager.addEventListener('click', () => {
+  playlistManager.toggle();
+});
+
+// ─── ONLINE ART CALLBACK (called from Python via evaluate_js) ─────────────
+window.onOnlineArtReady = function(path, dataUrl) {
+  // Only apply if it matches the currently loaded track
+  if (S.currentIndex >= 0 && S.playlist[S.currentIndex]?.path === path) {
+    applyArt(dataUrl);
+  }
+  // Also update playlist item thumbnail regardless
+  const idx = S.playlist.findIndex(t => t.path === path);
+  if (idx >= 0) {
+    S.playlist[idx].cover_art = dataUrl;
+    const item = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
+    if (item) {
+      const placeholder = item.querySelector('.pl-thumb-placeholder');
+      if (placeholder) {
+        const img = document.createElement('img');
+        img.className = 'pl-thumb';
+        img.src = dataUrl;
+        img.alt = '';
+        img.draggable = false;
+        img.loading = 'lazy';
+        placeholder.replaceWith(img);
+      }
+    }
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
+// LYRICS MANAGER
+// ═══════════════════════════════════════════════════════════════
+
+const lyricsOverlay  = document.getElementById('lyrics-overlay');
+const lyricsBody     = document.getElementById('lyrics-body');
+const lyricsSyncBadge= document.getElementById('lyrics-sync-badge');
+const lyricsTrackName= document.getElementById('lyrics-track-name');
+const lyricsArtistName=document.getElementById('lyrics-artist-name');
+const lyricsStatus   = document.getElementById('lyrics-status');
+const lyricsRefetch  = document.getElementById('lyrics-refetch');
+const btnLyrics      = document.getElementById('btn-lyrics');
+
+btnLyrics.addEventListener('click', () => toggleLyrics());
+document.getElementById('lyrics-close').addEventListener('click', () => closeLyrics());
+
+// Close on overlay background click
+lyricsOverlay.addEventListener('click', e => {
+  if (e.target === lyricsOverlay) closeLyrics();
+});
+
+// Refetch button
+lyricsRefetch.addEventListener('click', () => {
+  if (S.currentIndex >= 0) {
+    fetchLyrics(S.playlist[S.currentIndex], true);
+  }
+});
+
+function toggleLyrics() {
+  if (S.lyricsOpen) {
+    closeLyrics();
+  } else {
+    openLyrics();
+  }
+}
+
+function openLyrics() {
+  lyricsOverlay.classList.add('active');
+  S.lyricsOpen = true;
+  btnLyrics.classList.add('active');
+
+  const track = S.currentIndex >= 0 ? S.playlist[S.currentIndex] : null;
+  if (track && !track.is_video) {
+    fetchLyrics(track);
+  } else {
+    showLyricsIdle();
+  }
+}
+
+function closeLyrics() {
+  lyricsOverlay.classList.remove('active');
+  S.lyricsOpen = false;
+  btnLyrics.classList.remove('active');
+}
+
+function showLyricsIdle() {
+  lyricsTrackName.textContent = '—';
+  lyricsArtistName.textContent = '—';
+  lyricsSyncBadge.style.display = 'none';
+  lyricsRefetch.style.display = 'none';
+  lyricsStatus.textContent = 'IDLE';
+  lyricsBody.innerHTML = `
+    <div class="lyrics-idle">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+      </svg>
+      <p>PLAY A TRACK TO LOAD LYRICS</p>
+    </div>`;
+}
+
+function showLyricsLoading(track) {
+  lyricsTrackName.textContent  = track.name;
+  lyricsArtistName.textContent = track.artist ? track.artist.toUpperCase() : '—';
+  lyricsSyncBadge.style.display = 'none';
+  lyricsRefetch.style.display   = 'none';
+  lyricsStatus.textContent      = 'SEARCHING...';
+  lyricsBody.innerHTML = `
+    <div class="lyrics-loading">
+      <div class="lyrics-spinner"></div>
+      <span>FETCHING LYRICS</span>
+    </div>`;
+}
+
+function showLyricsNotFound(track) {
+  lyricsStatus.textContent    = 'NOT FOUND';
+  lyricsRefetch.style.display = 'inline-block';
+  lyricsBody.innerHTML = `
+    <div class="lyrics-not-found">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+      </svg>
+      <p>NO LYRICS FOUND</p>
+      <small style="font-size:9px;color:var(--text-lo);">TRY REFETCH OR CHECK ARTIST/TITLE TAGS</small>
+    </div>`;
+}
+
+function renderLyrics(data, track) {
+  S.lyricsData = data;
+  S.lyricsActiveLine = -1;
+  lyricsSyncBadge.style.display = data.is_synced ? 'inline-block' : 'none';
+  lyricsRefetch.style.display   = 'inline-block';
+  lyricsStatus.textContent      = data.is_synced ? 'SYNCED (LRC)' : 'PLAIN TEXT';
+
+  if (data.is_synced) {
+    // Parse LRC lines: [mm:ss.xx] text
+    const lrcLines = parseLRC(data.content);
+    S.lyricsData.lines = lrcLines;
+    let html = '<div class="lyrics-synced">';
+    lrcLines.forEach((line, i) => {
+      const txt = esc(line.text) || '&nbsp;';
+      html += `<div class="lyric-line" data-index="${i}" data-time="${line.time}">${txt}</div>`;
+    });
+    html += '</div>';
+    lyricsBody.innerHTML = html;
+
+    // Click on line to seek
+    lyricsBody.querySelectorAll('.lyric-line').forEach(el => {
+      el.addEventListener('click', () => {
+        const t = parseFloat(el.dataset.time);
+        if (!isNaN(t)) {
+          activePlayer().currentTime = t;
+          if (activePlayer().paused) doPlay(activePlayer());
+        }
+      });
+    });
+
+    // Highlight current line
+    highlightCurrentLyricLine();
+  } else {
+    lyricsBody.innerHTML = `<pre class="lyrics-plain">${esc(data.content)}</pre>`;
+  }
+}
+
+function parseLRC(lrc) {
+  const lines = [];
+  const re = /\[(\d{1,3}):(\d{2})(?:[.:,](\d+))?\]\s*(.*)/;
+  lrc.split('\n').forEach(rawLine => {
+    const m = rawLine.match(re);
+    if (m) {
+      const min = parseInt(m[1]);
+      const sec = parseInt(m[2]);
+      const ms  = m[3] ? parseFloat('0.' + m[3]) : 0;
+      lines.push({ time: min * 60 + sec + ms, text: (m[4] || '').trim() });
+    }
+  });
+  return lines.sort((a, b) => a.time - b.time);
+}
+
+function highlightCurrentLyricLine() {
+  if (!S.lyricsData?.is_synced || !S.lyricsData.lines) return;
+  const cur = activePlayer().currentTime;
+  const lines = S.lyricsData.lines;
+
+  let activeIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (cur >= lines[i].time) { activeIdx = i; break; }
+  }
+
+  if (activeIdx === S.lyricsActiveLine) return;
+  S.lyricsActiveLine = activeIdx;
+
+  lyricsBody.querySelectorAll('.lyric-line').forEach((el, i) => {
+    el.classList.toggle('active', i === activeIdx);
+  });
+
+  // Auto-scroll to active line
+  if (activeIdx >= 0) {
+    const el = lyricsBody.querySelector(`.lyric-line[data-index="${activeIdx}"]`);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+}
+
+async function fetchLyrics(track, forceRefetch = false) {
+  if (!track || track.is_video) { showLyricsIdle(); return; }
+  showLyricsLoading(track);
+
+  if (!pw()) {
+    showLyricsNotFound(track);
+    return;
+  }
+
+  try {
+    const result = await pywebview.api.get_lyrics(
+      track.path,
+      track.artist || '',
+      track.name,
+      track.duration || 0
+    );
+    if (result && result.content) {
+      renderLyrics(result, track);
+    } else {
+      showLyricsNotFound(track);
+    }
+  } catch(e) {
+    console.error('[Lyrics] Error:', e);
+    showLyricsNotFound(track);
+  }
+}
+
+// Initialize audio context on first user interaction
+btnPlay.addEventListener('click', () => {
+  initAudioContext();
+}, { once: true });
 
 // ─── ACTIVE PLAYER helper ─────────────────────────────────────
 function activePlayer() {
@@ -369,17 +675,42 @@ function setupVcSeekbar() {
   function getPercent(e) {
     const track = vcSeekbar.querySelector('.vc-seek-track');
     const r = track.getBoundingClientRect();
-    return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+    let x = e.clientX - r.left;
+    return Math.max(0, Math.min(1, x / r.width));
   }
+
   function applySeek(pct) {
     if (!S.duration || isNaN(S.duration)) return;
     video.currentTime = pct * S.duration;
   }
+  
   function setFill(pct) {
     const p = (pct * 100) + '%';
     vcSeekFill.style.width = p;
     vcSeekThumb.style.left = p;
   }
+
+  // Mouse Move untuk Hover Preview + Dragging
+  vcSeekbar.addEventListener('mousemove', e => {
+    const pct = getPercent(e);
+    
+    // 1. Logic Dragging (Bawaan lama)
+    if (S.vcSeekDragging) {
+       setFill(pct);
+       if(S.duration) vcTimeCur.textContent = formatTime(pct * S.duration);
+    }
+
+    // 2. Logic Preview Tooltip (BARU)
+    if (S.duration && S.currentIndex >= 0 && S.playlist[S.currentIndex].is_video) {
+        showVideoPreview(e, pct);
+    }
+  });
+
+  // Mouse Leave untuk sembunyikan preview
+  vcSeekbar.addEventListener('mouseleave', () => {
+     vcPreviewTooltip.style.display = 'none';
+     if (!S.vcSeekDragging) hideVcControls();
+  });
 
   vcSeekbar.addEventListener('mousedown', e => {
     e.preventDefault();
@@ -388,21 +719,62 @@ function setupVcSeekbar() {
     pinVcControls(true);
   });
 
-  window.addEventListener('mousemove', e => {
-    if (!S.vcSeekDragging) return;
-    const pct = getPercent(e);
-    setFill(pct);
-    if(S.duration) vcTimeCur.textContent = formatTime(pct * S.duration);
-  });
-
   window.addEventListener('mouseup', e => {
     if (!S.vcSeekDragging) return;
     S.vcSeekDragging = false;
     applySeek(getPercent(e));
     pinVcControls(false);
   });
+  
+  window.addEventListener('mousemove', e => {
+     // Global mouse move khusus untuk dragging (bila cursor keluar bar)
+     if (S.vcSeekDragging) {
+        const pct = getPercent(e); // Note: getPercent perlu disesuaikan jika mouse keluar elemen, tapi versi simple ok
+        setFill(pct);
+     }
+  });
 
   vcSeekbar.addEventListener('click', e => { applySeek(getPercent(e)); });
+}
+
+// ─── HELPER BARU: VIDEO PREVIEW ───
+function showVideoPreview(e, pct) {
+    // Tampilkan tooltip
+    vcPreviewTooltip.style.display = 'flex';
+    
+    // Posisikan tooltip mengikuti mouse X
+    // Kita butuh posisi relatif terhadap seekbar
+    const trackRect = vcSeekbar.getBoundingClientRect();
+    const tooltipX = e.clientX - trackRect.left;
+    vcPreviewTooltip.style.left = tooltipX + 'px';
+
+    const targetTime = pct * S.duration;
+    vcPreviewTime.textContent = formatTime(targetTime);
+
+    // Throttle request ke Python (max 1 request per 150ms agar tidak lag)
+    const now = Date.now();
+    if (S.previewThrottle && now - S.previewThrottle < 150) {
+        return; 
+    }
+    S.previewThrottle = now;
+
+    // Panggil Python API
+    if (window.pywebview) {
+        // Ambil path asli file video saat ini
+        const currentTrack = S.playlist[S.currentIndex];
+        
+        pywebview.api.get_video_preview(currentTrack.path, targetTime)
+            .then(base64Img => {
+                if (base64Img) {
+                    vcPreviewImg.style.display = 'block';
+                    vcPreviewImg.src = base64Img;
+                } else {
+                    // Jika gagal (misal file tidak support), sembunyikan gambar, tampilkan jam saja
+                    vcPreviewImg.style.display = 'none';
+                }
+            })
+            .catch(err => console.error(err));
+    }
 }
 
 // ─── VIDEO CONTROLS AUTOHIDE ──────────────────────────────────
@@ -542,14 +914,19 @@ function updateTrackInfo(track) {
     trackTitle.classList.add('scrolling');
   }
 
+  // Artist (from metadata — if empty fall back to 'UNKNOWN ARTIST')
+  trackArtist.textContent = track.artist ? track.artist.toUpperCase() : 'UNKNOWN ARTIST';
+
   trackFormat.textContent = track.ext || '—';
   trackType.textContent   = track.is_video ? 'VIDEO' : 'AUDIO';
   trackType.style.color   = track.is_video ? 'var(--red)' : '';
 
-  const marqueeStr = `▶  ${track.name.toUpperCase()}  `;
+  const marqueeStr = track.artist
+    ? `▶  ${track.artist.toUpperCase()} — ${track.name.toUpperCase()}  `
+    : `▶  ${track.name.toUpperCase()}  `;
   marqueeText.textContent  = marqueeStr;
   marqueeClone.textContent = marqueeStr;
-  marqueeTrack.style.animationDuration = Math.max(10, track.name.length*0.38)+'s';
+  marqueeTrack.style.animationDuration = Math.max(10, marqueeStr.length*0.30)+'s';
 
   // Clear old art
   albumArt.src = '';
@@ -557,11 +934,23 @@ function updateTrackInfo(track) {
   artPlaceholder.classList.remove('hidden');
   artBlurBg.style.opacity = '0';
 
-  // Try to get cover art
+  // Try to get cover art: embedded first, then online fallback
   if (pw() && !track.is_video) {
     pywebview.api.get_cover_art(track.path).then(data => {
-      if (data) applyArt(data);
+      if (data) {
+        applyArt(data);
+      } else {
+        // Try online fallback (fires async; onOnlineArtReady callback handles result)
+        pywebview.api.get_cover_art_with_online_fallback(track.path).then(online => {
+          if (online) applyArt(online);
+        }).catch(() => {});
+      }
     }).catch(() => {});
+  }
+
+  // Auto-fetch lyrics if panel is open
+  if (S.lyricsOpen && !track.is_video) {
+    fetchLyrics(track);
   }
 }
 
@@ -573,6 +962,25 @@ function applyArt(src) {
     artBlurBg.style.backgroundImage = `url(${src})`;
     artBlurBg.style.opacity = '0.38';
   };
+
+  // Cache art into track object so playlist thumbnails stay updated
+  if (S.currentIndex >= 0 && S.playlist[S.currentIndex]) {
+    S.playlist[S.currentIndex].cover_art = src;
+    // Update just the thumbnail in the active playlist item (no full re-render)
+    const activeItem = playlistList.querySelector(`.pl-item[data-index="${S.currentIndex}"]`);
+    if (activeItem) {
+      const existingThumb = activeItem.querySelector('.pl-thumb');
+      if (existingThumb && existingThumb.classList.contains('pl-thumb-placeholder')) {
+        const img = document.createElement('img');
+        img.className = 'pl-thumb';
+        img.src = src;
+        img.alt = '';
+        img.draggable = false;
+        img.loading = 'lazy';
+        existingThumb.replaceWith(img);
+      }
+    }
+  }
 }
 
 // ─── PLAY STATE ───────────────────────────────────────────────
@@ -621,6 +1029,11 @@ function onTimeUpdate() {
   vcSeekFill.style.width    = (pct*100)+'%';
   vcSeekThumb.style.left    = (pct*100)+'%';
   vcTimeCur.textContent     = str;
+
+  // Sync lyrics highlight if panel is open
+  if (S.lyricsOpen && S.lyricsData?.is_synced) {
+    highlightCurrentLyricLine();
+  }
 }
 
 // ─── TRACK END ────────────────────────────────────────────────
@@ -724,12 +1137,14 @@ async function openFiles() {
   if (!pw()) { setStatus('pywebview required'); return; }
   setStatus('OPENING FILE DIALOG...');
   try {
-    const files = await pywebview.api.browse_files();
-    if (files?.length) {
-      const added = await pywebview.api.add_tracks(files);
-      S.playlist = added;
+    // browse_files() returns raw file path strings
+    const paths = await pywebview.api.browse_files();
+    if (paths?.length) {
+      // add_tracks() accepts raw paths, builds metadata, returns updated playlist
+      const playlist = await pywebview.api.add_tracks(paths);
+      S.playlist = playlist;
       renderPlaylist(); updatePlaylistMeta();
-      setStatus(`ADDED ${files.length} TRACK(S)`);
+      setStatus(`ADDED ${paths.length} TRACK(S)`);
       if (S.currentIndex < 0) loadTrack(0);
     } else { setStatus('NO FILES SELECTED'); }
   } catch(e) { console.error(e); setStatus('ERROR — SEE CONSOLE'); }
@@ -739,12 +1154,14 @@ async function openFolder() {
   if (!pw()) { setStatus('pywebview required'); return; }
   setStatus('SCANNING FOLDER...');
   try {
-    const files = await pywebview.api.browse_folder();
-    if (files?.length) {
-      const added = await pywebview.api.add_tracks(files);
-      S.playlist = added;
+    // browse_folder() returns raw file path strings
+    const paths = await pywebview.api.browse_folder();
+    if (paths?.length) {
+      // add_tracks() accepts raw paths, builds metadata, returns updated playlist
+      const playlist = await pywebview.api.add_tracks(paths);
+      S.playlist = playlist;
       renderPlaylist(); updatePlaylistMeta();
-      setStatus(`LOADED ${files.length} TRACK(S)`);
+      setStatus(`LOADED ${paths.length} TRACK(S)`);
       if (S.currentIndex < 0) loadTrack(0);
     } else { setStatus('NO MEDIA FOUND'); }
   } catch(e) { console.error(e); setStatus('ERROR — SEE CONSOLE'); }
@@ -772,6 +1189,7 @@ async function clearPlaylist() {
   renderPlaylist(); updatePlaylistMeta();
 
   trackTitle.textContent = '—';
+  trackArtist.textContent = 'UNKNOWN ARTIST';
   trackFormat.textContent = '—';
   trackType.textContent = 'AUDIO';
   progressFill.style.width = '0%';
@@ -781,6 +1199,8 @@ async function clearPlaylist() {
   artPlaceholder.classList.remove('hidden');
   artBlurBg.style.opacity = '0';
   marqueeText.textContent = marqueeClone.textContent = '— SELECT A TRACK TO BEGIN PLAYBACK —';
+  S.lyricsData = null;
+  if (S.lyricsOpen) showLyricsIdle();
   setStatus('QUEUE CLEARED');
 }
 
@@ -801,11 +1221,36 @@ function renderPlaylist() {
     const div = document.createElement('div');
     div.className = 'pl-item' + (isActive ? ' active' : '');
     div.dataset.index = realIdx;
+
+    // Determine thumbnail source: cover_art for audio, video icon placeholder for video
+    let thumbHtml = '';
+    if (track.is_video) {
+      thumbHtml = `
+        <div class="pl-thumb pl-thumb-placeholder pl-thumb-video" title="Video">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.6">
+            <polygon points="23,7 16,12 23,17"/>
+            <rect x="1" y="5" width="15" height="14" rx="2"/>
+          </svg>
+        </div>`;
+    } else if (track.cover_art) {
+      thumbHtml = `<img class="pl-thumb" src="${track.cover_art}" alt="" loading="lazy" draggable="false">`;
+    } else {
+      thumbHtml = `
+        <div class="pl-thumb pl-thumb-placeholder" title="No art">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.35">
+            <circle cx="12" cy="12" r="10"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </div>`;
+    }
+
     div.innerHTML = `
       <div class="pl-idx">${realIdx+1}</div>
       <div class="pl-playing-indicator"><div class="bar"></div><div class="bar"></div><div class="bar"></div></div>
+      ${thumbHtml}
       <div class="pl-item-info">
         <span class="pl-item-name">${esc(track.name)}</span>
+        <span class="pl-item-artist">${track.artist ? esc(track.artist) : ''}</span>
         <span class="pl-item-ext">${track.ext||''}</span>
       </div>
       <span class="pl-item-duration">${track.duration_str||'--:--'}</span>
@@ -860,12 +1305,40 @@ document.addEventListener('drop', async e => {
   const tracks = files.map(f => {
     const ext = f.name.split('.').pop().toUpperCase();
     const isV = ['MP4','MKV','AVI','WEBM','MOV'].includes(ext);
-    return { name:f.name.replace(/\.[^/.]+$/,''), path:f.path||f.name, url:URL.createObjectURL(f), ext, is_video:isV, duration:0, duration_str:'--:--' };
+    return { name:f.name.replace(/\.[^/.]+$/,''), path:f.path||f.name, url:URL.createObjectURL(f), ext, is_video:isV, duration:0, duration_str:'--:--', cover_art: null };
   });
   S.playlist.push(...tracks);
   renderPlaylist(); updatePlaylistMeta();
   if (S.currentIndex < 0) loadTrack(0);
   setStatus(`DROPPED ${tracks.length} FILE(S)`);
+
+  // Async fetch cover art for dropped audio tracks (pywebview only)
+  if (pw()) {
+    tracks.forEach(async (track, i) => {
+      if (track.is_video) return;
+      try {
+        const art = await pywebview.api.get_cover_art(track.path);
+        if (art) {
+          track.cover_art = art;
+          // Update thumbnail in the playlist DOM without full re-render
+          const idx = S.playlist.indexOf(track);
+          const item = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
+          if (item) {
+            const placeholder = item.querySelector('.pl-thumb-placeholder');
+            if (placeholder) {
+              const img = document.createElement('img');
+              img.className = 'pl-thumb';
+              img.src = art;
+              img.alt = '';
+              img.draggable = false;
+              img.loading = 'lazy';
+              placeholder.replaceWith(img);
+            }
+          }
+        }
+      } catch(e) { /* no art available */ }
+    });
+  }
 });
 
 // ─── UTILS ────────────────────────────────────────────────────
