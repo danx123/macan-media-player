@@ -144,8 +144,11 @@ macan-media-player/
 ├── main.py          # Python backend — pywebview window, API bridge, media server
 ├── core/
 │   └── __init__.py  # Core package placeholder
+│   └── video_utils.py  # Core OpenCV generate hover thumbnail seekbar
 └── assets/
     ├── index.html   # App shell and HTML structure
+    ├── equalizer.js # Engine for equalizer
+    ├── playlist-manager.js # For manage playlist with .json
     ├── style.css    # Dark theme, animations, layout
     └── script.js    # Playback engine, playlist, UI logic
 ```
