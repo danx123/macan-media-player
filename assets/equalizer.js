@@ -165,6 +165,33 @@ class EqualizerUI {
         <div class="eq-bands-container">
           ${this.eq.bandNames.map((name, i) => this.createBandHTML(name, i)).join('')}
         </div>
+
+        <div class="eq-dsp-section">
+          <div class="eq-dsp-row">
+            <label class="eq-dsp-label">FADE IN/OUT</label>
+            <label class="eq-toggle-switch">
+              <input type="checkbox" id="eq-fade-toggle" checked>
+              <span class="eq-toggle-slider"></span>
+            </label>
+            <label class="eq-dsp-label" style="margin-left:16px;">DURATION</label>
+            <select id="eq-fade-duration" class="eq-select eq-select-sm">
+              <option value="500">0.5s</option>
+              <option value="1000">1s</option>
+              <option value="1200" selected>1.2s</option>
+              <option value="1500">1.5s</option>
+              <option value="2000">2s</option>
+              <option value="3000">3s</option>
+            </select>
+          </div>
+          <div class="eq-dsp-row">
+            <label class="eq-dsp-label">REPLAY GAIN</label>
+            <label class="eq-toggle-switch">
+              <input type="checkbox" id="eq-norm-toggle">
+              <span class="eq-toggle-slider"></span>
+            </label>
+            <span class="eq-dsp-hint">Auto volume from ReplayGain tags</span>
+          </div>
+        </div>
         
         <div class="eq-footer">
           <button class="eq-reset-btn" id="eq-reset">RESET TO FLAT</button>
@@ -217,8 +244,51 @@ class EqualizerUI {
         this.eq.setBandGain(index, value);
         this.updateValueLabel(index, value);
         this.checkPresetMatch();
+        // Persist EQ changes to state
+        if (typeof scheduleStateSave === 'function') scheduleStateSave();
       });
     });
+
+    // DSP: Fade toggle
+    const fadeToggle = this.container.querySelector('#eq-fade-toggle');
+    if (fadeToggle) {
+      // Init from S state if available
+      if (typeof S !== 'undefined') fadeToggle.checked = S.fadeEnabled !== false;
+      fadeToggle.addEventListener('change', () => {
+        if (typeof S !== 'undefined') {
+          S.fadeEnabled = fadeToggle.checked;
+          if (typeof scheduleStateSave === 'function') scheduleStateSave();
+        }
+      });
+    }
+
+    // DSP: Fade duration
+    const fadeDur = this.container.querySelector('#eq-fade-duration');
+    if (fadeDur) {
+      if (typeof S !== 'undefined') fadeDur.value = String(S.fadeDuration || 1200);
+      fadeDur.addEventListener('change', () => {
+        if (typeof S !== 'undefined') {
+          S.fadeDuration = parseInt(fadeDur.value);
+          if (typeof scheduleStateSave === 'function') scheduleStateSave();
+        }
+      });
+    }
+
+    // DSP: Normalization toggle
+    const normToggle = this.container.querySelector('#eq-norm-toggle');
+    if (normToggle) {
+      if (typeof S !== 'undefined') normToggle.checked = S.normEnabled === true;
+      normToggle.addEventListener('change', () => {
+        if (typeof S !== 'undefined') {
+          S.normEnabled = normToggle.checked;
+          // Re-apply normalization for current track
+          if (S.currentIndex >= 0 && S.playlist[S.currentIndex] && typeof applyNormalization === 'function') {
+            applyNormalization(S.playlist[S.currentIndex]);
+          }
+          if (typeof scheduleStateSave === 'function') scheduleStateSave();
+        }
+      });
+    }
   }
   
   updateValueLabel(index, value) {
@@ -238,6 +308,8 @@ class EqualizerUI {
       });
       this.currentPreset = presetName;
       this.container.querySelector('#eq-preset-select').value = presetName;
+      // FIX: persist preset change immediately
+      if (typeof scheduleStateSave === 'function') scheduleStateSave();
     }
   }
   
@@ -277,15 +349,30 @@ class EqualizerUI {
     
     this.currentPreset = 'Custom';
     this.container.querySelector('#eq-preset-select').value = 'Custom';
+    // FIX: persist custom preset save
+    if (typeof scheduleStateSave === 'function') scheduleStateSave();
   }
   
   reset() {
     this.applyPreset('Flat');
+    // applyPreset already calls scheduleStateSave
   }
   
   open() {
     this.container.classList.add('active');
     this.isOpen = true;
+    // Sync DSP toggle states from S (global state)
+    this.syncDspToggles();
+  }
+
+  syncDspToggles() {
+    if (typeof S === 'undefined') return;
+    const fadeToggle = this.container.querySelector('#eq-fade-toggle');
+    const fadeDur    = this.container.querySelector('#eq-fade-duration');
+    const normToggle = this.container.querySelector('#eq-norm-toggle');
+    if (fadeToggle) fadeToggle.checked = S.fadeEnabled !== false;
+    if (fadeDur)    fadeDur.value = String(S.fadeDuration || 1200);
+    if (normToggle) normToggle.checked = S.normEnabled === true;
   }
   
   close() {
@@ -295,5 +382,29 @@ class EqualizerUI {
   
   toggle() {
     this.isOpen ? this.close() : this.open();
+  }
+
+  // FIX: Called by initAudioContext() after applying _pendingEqBands
+  // so the slider positions and dropdown both match the restored EQ state.
+  // presetName is optional — if provided and valid, set the dropdown directly
+  // instead of doing a fuzzy match (which can fail for "Custom" or close values).
+  syncSlidersFromEq(presetName = null) {
+    const values = this.eq.getCurrentValues();
+    values.forEach((value, index) => {
+      if (this.sliders[index]) {
+        this.sliders[index].value = value * 10;
+        this.updateValueLabel(index, value);
+      }
+    });
+
+    const select = this.container.querySelector('#eq-preset-select');
+    if (presetName && (this.eq.presets[presetName] !== undefined)) {
+      // Preset name is known — set directly, no fuzzy match needed
+      this.currentPreset = presetName;
+      if (select) select.value = presetName;
+    } else {
+      // Fallback: detect by value comparison (handles legacy saves without eqPreset)
+      this.checkPresetMatch();
+    }
   }
 }
