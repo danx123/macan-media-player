@@ -44,7 +44,7 @@ class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
     registry: dict = {}  # token -> Path
 
     def log_message(self, fmt, *args):
-        pass  # suppress logs
+        pass  # suppress request logs
 
     def _resolve(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -108,8 +108,21 @@ class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
                         chunk = f.read(65536)
                         if not chunk: break
                         self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # client disconnected mid-stream (normal during seeks)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass  # client disconnected mid-stream (normal during seeks/track changes on Windows)
+
+
+class _SilentTCPServer(socketserver.ThreadingTCPServer):
+    """ThreadingTCPServer that silences client-disconnect errors (WinError 10053/10054)."""
+    def handle_error(self, request, client_address):
+        import sys
+        exc = sys.exc_info()[1]
+        # Silently ignore normal client-abort / connection-reset errors
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError,
+                            BrokenPipeError, OSError)):
+            return
+        # Let anything unexpected propagate to stderr
+        super().handle_error(request, client_address)
 
 
 class _MediaServer:
@@ -119,7 +132,7 @@ class _MediaServer:
 
     def start(self):
         _MediaRequestHandler.registry = {}
-        server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), _MediaRequestHandler)
+        server = _SilentTCPServer(('127.0.0.1', 0), _MediaRequestHandler)
         server.daemon_threads = True
         self.port = server.server_address[1]
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -311,6 +324,10 @@ class MacanMediaAPI:
         self._window = None
         self.playlist = []
         self.settings = {}
+        # FIX: Lock to prevent concurrent save_app_state / _save_settings calls
+        # from multiple JS threads (pywebview calls each JS→Python bridge on its
+        # own thread, so parallel invocations are possible).
+        self._settings_lock = threading.Lock()
         self._load_settings()
         app_data = self._get_app_data()
         self._art_cache   = AlbumArtCache(app_data)
@@ -389,6 +406,32 @@ class MacanMediaAPI:
         self._save_playlist()
         return self.playlist
 
+    def update_track_art(self, path, cover_art):
+        """Called from JS when cover art is fetched asynchronously (online fallback
+        or first-time fetch). Persists art back into playlist.json so restarts
+        and clear+reload cycles don't lose it."""
+        updated = False
+        for track in self.playlist:
+            if track.get('path') == path:
+                track['cover_art'] = cover_art
+                updated = True
+                break
+        if updated:
+            self._save_playlist()
+        return updated
+
+    def update_track_video_thumb(self, path, video_thumb):
+        """Same as update_track_art but for video thumbnails."""
+        updated = False
+        for track in self.playlist:
+            if track.get('path') == path:
+                track['video_thumb'] = video_thumb
+                updated = True
+                break
+        if updated:
+            self._save_playlist()
+        return updated
+
     def remove_track(self, path):
         self.playlist = [t for t in self.playlist if t['path'] != path]
         self._save_playlist()
@@ -454,13 +497,157 @@ class MacanMediaAPI:
             return None  # can't grab frames from localhost stream via OpenCV
         return VideoThumbnailer.get_thumbnail_at_time(path, float(time_sec))
 
+    def get_video_thumbnail(self, path):
+        """Return a base64 thumbnail for a video file, extracted at ~10% of duration.
+        Result is cached in memory keyed by path so repeat calls are instant.
+        Returns data URI string or None on failure."""
+        if not hasattr(self, '_video_thumb_cache'):
+            self._video_thumb_cache = {}
+        if path in self._video_thumb_cache:
+            return self._video_thumb_cache[path]
+        try:
+            import cv2
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                self._video_thumb_cache[path] = None
+                return None
+            total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            fps   = cap.get(cv2.CAP_PROP_FPS) or 24
+            # Seek to ~10% of duration, minimum 1 second in
+            seek_frame = max(int(fps), int(total * 0.10))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, seek_frame)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret or frame is None:
+                self._video_thumb_cache[path] = None
+                return None
+            # Resize to 160×90 (16:9) keeping aspect ratio
+            h, w = frame.shape[:2]
+            target_w, target_h = 160, 90
+            scale = min(target_w / w, target_h / h)
+            nw, nh = int(w * scale), int(h * scale)
+            frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+            # Pad to exact size
+            canvas = __import__('numpy').zeros((target_h, target_w, 3), dtype='uint8')
+            x_off = (target_w - nw) // 2
+            y_off = (target_h - nh) // 2
+            canvas[y_off:y_off+nh, x_off:x_off+nw] = frame
+            ret2, buf = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            if not ret2:
+                self._video_thumb_cache[path] = None
+                return None
+            data_uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.tobytes()).decode()
+            self._video_thumb_cache[path] = data_uri
+            return data_uri
+        except Exception as e:
+            print(f'[VideoThumb] Error for {path}: {e}')
+            self._video_thumb_cache[path] = None
+            return None
+
+    def reorder_playlist(self, from_index, to_index):
+        """Move a track in the server-side playlist from from_index to to_index.
+        Called after the JS drag-and-drop completes so playlist.json stays in sync."""
+        with self._settings_lock:
+            pl = self.settings.get('playlist', [])
+            if (0 <= from_index < len(pl)) and (0 <= to_index < len(pl)):
+                item = pl.pop(from_index)
+                pl.insert(to_index, item)
+                self.settings['playlist'] = pl
+                self._save_settings_locked()
+        return True
+
+    def get_file_info(self, path):
+        """Return detailed file information for context menu File Properties."""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return None
+            ext = p.suffix.lower()
+            is_video = ext in {'.mp4', '.mkv', '.avi', '.webm', '.mov', '.wmv'}
+            stat = p.stat()
+            file_size = stat.st_size
+
+            def fmt_size(b):
+                for u in ['B', 'KB', 'MB', 'GB']:
+                    if b < 1024:
+                        return f"{b:.1f} {u}"
+                    b /= 1024
+                return f"{b:.1f} TB"
+
+            info = {
+                "name":       p.name,
+                "path":       str(p.resolve()),
+                "size":       fmt_size(file_size),
+                "size_bytes": file_size,
+                "ext":        ext.lstrip('.').upper(),
+                "is_video":   is_video,
+                "modified":   os.path.getmtime(str(p)),
+            }
+
+            if is_video:
+                try:
+                    import cv2
+                    cap = cv2.VideoCapture(str(p))
+                    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    dur = int(frames / fps) if fps and fps > 0 else 0
+                    cap.release()
+                    info["resolution"]   = f"{w}x{h}" if w and h else "Unknown"
+                    info["duration"]     = dur
+                    info["duration_str"] = self._format_duration(dur)
+                    info["fps"]          = round(fps, 2) if fps else 0
+                except Exception:
+                    info["resolution"]   = "Unknown"
+                    info["duration"]     = 0
+                    info["duration_str"] = "--:--"
+                    info["fps"]          = 0
+                    try:
+                        af = mutagen.File(str(p))
+                        if af and af.info:
+                            info["duration"]     = int(af.info.length)
+                            info["duration_str"] = self._format_duration(info["duration"])
+                    except Exception:
+                        pass
+            else:
+                meta = self._read_tags(str(p.resolve()), ext, False)
+                info["duration"]     = meta.get('duration', 0)
+                info["duration_str"] = self._format_duration(info["duration"])
+                info["title"]        = meta.get('title') or p.stem
+                info["artist"]       = meta.get('artist') or ''
+                info["album"]        = meta.get('album')  or ''
+                rg = self._read_replaygain(str(p.resolve()), ext)
+                info["replaygain_db"] = rg if rg is not None else None
+
+            return info
+        except Exception as e:
+            print(f"[MACAN] get_file_info error: {e}")
+            return None
+
     def save_settings(self, settings_dict):
-        self.settings.update(settings_dict)
-        self._save_settings()
+        with self._settings_lock:
+            self.settings.update(settings_dict)
+            self._save_settings_locked()
         return True
 
     def get_settings(self):
-        return self.settings
+        with self._settings_lock:
+            return dict(self.settings)
+
+    def save_app_state(self, state_dict):
+        """Save full application state: current index, position, volume, EQ bands, etc.
+        FIX: Wrapped in _settings_lock to prevent concurrent writes from parallel
+        JS→Python bridge calls (e.g. periodic 10s saves overlapping with user actions)."""
+        with self._settings_lock:
+            self.settings['app_state'] = state_dict
+            self._save_settings_locked()
+        return True
+
+    def get_app_state(self):
+        """Retrieve last saved application state."""
+        with self._settings_lock:
+            return dict(self.settings.get('app_state', {}))
 
     # ─── PRIVATE: DIALOG WRAPPERS ─────────────────────────────────────────────
 
@@ -514,26 +701,112 @@ class MacanMediaAPI:
         artist       = meta.get('artist') or ''
         album        = meta.get('album')  or ''
 
+        # File size
+        try:
+            file_size = p.stat().st_size
+        except Exception:
+            file_size = 0
+
         # Pre-fetch cover art for audio files
+        # Priority: 1) embedded tags  2) SQLite online art cache (from previous sessions)
         cover_art = None
         if not is_video:
             try:
                 cover_art = self.get_cover_art(abs_path)
             except Exception:
                 cover_art = None
+            # If no embedded art, check the local SQLite art cache populated by
+            # previous online fetches — this survives clear+reload cycles
+            if not cover_art:
+                try:
+                    meta_for_cache = meta  # already read above
+                    artist = meta_for_cache.get('artist') or ''
+                    title  = meta_for_cache.get('title')  or p.stem
+                    if artist:
+                        cover_art = self._art_cache.get_cached(artist, title)
+                except Exception:
+                    cover_art = None
+
+        # Pre-generate thumbnail for video files (cached in memory)
+        video_thumb = None
+        if is_video:
+            try:
+                video_thumb = self.get_video_thumbnail(abs_path)
+            except Exception:
+                video_thumb = None
+
+        # Video resolution (width x height)
+        video_resolution = None
+        if is_video:
+            try:
+                import cv2
+                cap = cv2.VideoCapture(abs_path)
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
+                if w and h:
+                    video_resolution = f"{w}x{h}"
+            except Exception:
+                video_resolution = None
+
+        # ReplayGain tag reading for audio normalization
+        replaygain_db = 0.0
+        if not is_video:
+            try:
+                rg = self._read_replaygain(abs_path, ext)
+                if rg is not None:
+                    replaygain_db = rg
+            except Exception:
+                pass
 
         return {
-            "name":         display_name,
-            "artist":       artist,
-            "album":        album,
-            "path":         abs_path,
-            "url":          p.resolve().as_uri(),
-            "ext":          ext.lstrip('.').upper(),
-            "is_video":     is_video,
-            "duration":     duration,
-            "duration_str": self._format_duration(duration),
-            "cover_art":    cover_art,
+            "name":             display_name,
+            "artist":           artist,
+            "album":            album,
+            "path":             abs_path,
+            "url":              p.resolve().as_uri(),
+            "ext":              ext.lstrip('.').upper(),
+            "is_video":         is_video,
+            "duration":         duration,
+            "duration_str":     self._format_duration(duration),
+            "cover_art":        cover_art,
+            "video_thumb":      video_thumb,
+            "file_size":        file_size,
+            "video_resolution": video_resolution,
+            "replaygain_db":    replaygain_db,
         }
+
+    def _read_replaygain(self, path, ext):
+        """Read ReplayGain track gain tag from audio file. Returns dB float or None."""
+        try:
+            if ext == '.mp3':
+                audio = ID3(path)
+                # Standard TXXX:REPLAYGAIN_TRACK_GAIN
+                for tag in audio.values():
+                    if hasattr(tag, 'desc') and 'REPLAYGAIN_TRACK_GAIN' in tag.desc.upper():
+                        val = str(tag.text[0]) if tag.text else ''
+                        return float(val.split()[0])
+            elif ext == '.flac':
+                audio = FLAC(path)
+                gain = audio.get('REPLAYGAIN_TRACK_GAIN', [None])[0]
+                if gain:
+                    return float(gain.split()[0])
+            elif ext in ('.m4a', '.mp4'):
+                audio = mutagen.File(path)
+                if audio and audio.tags:
+                    gain_bytes = audio.tags.get('----:com.apple.iTunes:REPLAYGAIN_TRACK_GAIN', [None])[0]
+                    if gain_bytes:
+                        return float(gain_bytes.decode('utf-8').split()[0])
+            else:
+                audio = mutagen.File(path)
+                if audio and audio.tags:
+                    for k, v in audio.tags.items():
+                        if 'REPLAYGAIN_TRACK_GAIN' in k.upper():
+                            val = str(v[0]) if isinstance(v, list) else str(v)
+                            return float(val.split()[0])
+        except Exception:
+            pass
+        return None
 
     def _scan_media_folder_paths(self, folder):
         """Recursively scan folder and return list of media file path strings."""
@@ -634,12 +907,23 @@ class MacanMediaAPI:
         result = self._lyric_cache.fetch_online(artist, title, duration)
         return result
 
-
-
+    def _get_duration(self, path):
+        """Fallback duration reader using mutagen for any file type."""
         try:
             audio_file = mutagen.File(path)
             if audio_file and audio_file.info:
                 return int(audio_file.info.length)
+        except Exception:
+            pass
+        # For video files, try cv2
+        try:
+            import cv2
+            cap = cv2.VideoCapture(path)
+            fps    = cap.get(cv2.CAP_PROP_FPS)
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            cap.release()
+            if fps and fps > 0 and frames > 0:
+                return int(frames / fps)
         except Exception:
             pass
         return 0
@@ -663,22 +947,65 @@ class MacanMediaAPI:
         os.makedirs(app_data, exist_ok=True)
         for attr, fname in [('settings', 'settings.json'), ('playlist', 'playlist.json')]:
             fpath = os.path.join(app_data, fname)
-            if os.path.exists(fpath):
+            loaded = None
+            # FIX: Try main file first; fall back to .tmp if main is corrupt/missing
+            # (handles crash-during-rename edge case)
+            for candidate in [fpath, fpath + '.tmp']:
+                if not os.path.exists(candidate):
+                    continue
                 try:
-                    with open(fpath, 'r', encoding='utf-8') as f:
-                        setattr(self, attr, json.load(f))
-                except Exception:
-                    setattr(self, attr, {} if attr == 'settings' else [])
+                    with open(candidate, 'r', encoding='utf-8') as f:
+                        loaded = json.load(f)
+                    break  # success
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"[MACAN] Could not load {candidate}: {e}")
+            if loaded is not None:
+                setattr(self, attr, loaded)
+            else:
+                setattr(self, attr, {} if attr == 'settings' else [])
 
     def _save_settings(self):
-        fpath = os.path.join(self._get_app_data(), 'settings.json')
-        with open(fpath, 'w', encoding='utf-8') as f:
-            json.dump(self.settings, f, indent=2)
+        """Public-safe wrapper — acquires lock then saves."""
+        with self._settings_lock:
+            self._save_settings_locked()
+
+    def _save_settings_locked(self):
+        """Must only be called while _settings_lock is held.
+        FIX: Writes to a temp file then renames atomically to prevent
+        truncated/corrupt settings.json if the process is killed mid-write."""
+        try:
+            fpath = os.path.join(self._get_app_data(), 'settings.json')
+            os.makedirs(os.path.dirname(fpath), exist_ok=True)
+            tmp_path = fpath + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(self.settings, f, indent=2)
+            # Atomic rename — on POSIX this is guaranteed; on Windows it may
+            # raise FileExistsError on older Python, so we remove first.
+            try:
+                os.replace(tmp_path, fpath)
+            except OSError:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+        except Exception as e:
+            print(f"[MACAN] Save settings error: {e}")
 
     def _save_playlist(self):
-        fpath = os.path.join(self._get_app_data(), 'playlist.json')
-        with open(fpath, 'w', encoding='utf-8') as f:
-            json.dump(self.playlist, f, indent=2)
+        """FIX: Atomic write via temp file to prevent corruption on crash."""
+        try:
+            fpath = os.path.join(self._get_app_data(), 'playlist.json')
+            os.makedirs(os.path.dirname(fpath), exist_ok=True)
+            tmp_path = fpath + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(self.playlist, f, indent=2)
+            try:
+                os.replace(tmp_path, fpath)
+            except OSError:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+        except Exception as e:
+            print(f"[MACAN] Save playlist error: {e}")
 
 
 def main():
