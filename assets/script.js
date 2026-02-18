@@ -27,6 +27,7 @@ const S = {
   seekDragging: false,
   vcSeekDragging: false,
   vcHideTimer:  null,
+  vcCursorTimer: null,  // auto-hide cursor timer in video fullscreen
   previewThrottle: null,
   lyricsOpen:   false,
   lyricsData:   null,     // { content, is_synced, lines }
@@ -118,13 +119,32 @@ function initAudioContext() {
       S._fadeGain.connect(audioContext.destination);
     }
 
-    // FIX: Apply pending EQ bands that were restored before AudioContext existed
+    // Apply saved EQ bands SYNCHRONOUSLY before any async work.
+    // JS is single-threaded so no periodic save can interleave here.
+    // By the time initAudioContext() returns, equalizer has the correct bands.
     if (S._pendingEqBands) {
       equalizer.setAllBands(S._pendingEqBands);
       if (equalizerUI) equalizerUI.syncSlidersFromEq(S._pendingEqPreset);
       S._pendingEqBands  = null;
       S._pendingEqPreset = null;
     }
+
+    // Load Custom preset values from Python (async).
+    // _pendingEqBands already applied above, so this gap is safe.
+    // If no pending bands (first run / no saved state), fall back to
+    // last-used preset name stored in the dedicated kv key.
+    equalizer.initFromPython().then(() => {
+      // Fallback 1: only a preset name was stored (no band values) — apply by name
+      if (S._pendingEqPreset && equalizerUI) {
+        equalizerUI.applyPreset(S._pendingEqPreset);
+        S._pendingEqPreset = null;
+        return;
+      }
+      // Fallback 2: no state at all — use dedicated kv key (first run / migration)
+      if (equalizer._lastSavedPreset && equalizerUI && equalizerUI.currentPreset === 'Flat') {
+        equalizerUI.applyPreset(equalizer._lastSavedPreset);
+      }
+    });
   }
 }
 
@@ -446,6 +466,9 @@ const MiniPlayer = (() => {
     document.getElementById('main-layout').style.display = '';
     onPlayState(false);
     setStatus('VIDEO CLOSED');
+    // Restore cursor when exiting video
+    if (S._showCursor) S._showCursor();
+    clearTimeout(S.vcCursorTimer);
   }
 
   function updateMiniInfo() {
@@ -545,36 +568,65 @@ const btnPlaylistManager = document.getElementById('btn-playlist-manager');
 // ─────────────────────────────────────────────────────────────────
 playlistManager = new PlaylistManager();
 
-playlistManager.onSave((name) => {
+playlistManager.onSave(async (name) => {
   const tracks = S.playlist.map(item => ({
-    path: item.path,
-    name: item.name,
-    artist: item.artist || 'Unknown Artist',
-    album: item.album || '',
-    duration: item.duration,
-    duration_str: item.duration_str || '--:--',
-    ext: item.ext || '',
+    path:     item.path,
+    name:     item.name,
+    artist:   item.artist   || '',
+    album:    item.album    || '',
+    duration: item.duration || 0,
+    ext:      item.ext      || '',
     is_video: item.is_video || false,
-    cover_art: item.cover_art || null
   }));
-  playlistManager.saveCurrentPlaylist(name, tracks);
+  const ok = await playlistManager.saveCurrentPlaylist(name, tracks);
+  if (ok !== false) setStatus(`PLAYLIST "${name}" SAVED`);
+  return ok;
 });
 
-playlistManager.onLoad((name) => {
-  const tracks = playlistManager.loadPlaylist(name);
-  if (tracks && tracks.length > 0) {
-    // FIX: Stop playback cleanly before replacing playlist
-    const p = activePlayer();
-    p.pause();
-    p.src = '';
-    S.currentIndex = -1;
-    onPlayState(false);
+playlistManager.onLoad(async (name) => {
+  if (!pw()) return;
 
-    S.playlist = tracks;
+  setStatus(`LOADING "${name}"…`);
+
+  // Step 1: get file paths from the .m3u8 (fast Python call, no metadata)
+  let paths;
+  try {
+    paths = await pywebview.api.get_playlist_paths(name);
+  } catch (e) {
+    console.error('[MACAN] get_playlist_paths error:', e);
+    setStatus('ERROR READING PLAYLIST');
+    return;
+  }
+
+  if (!paths || paths.length === 0) {
+    setStatus('PLAYLIST IS EMPTY OR NOT FOUND');
+    return;
+  }
+
+  // Step 2: stop current playback
+  const p = activePlayer();
+  p.pause();
+  p.src = '';
+  S.currentIndex = -1;
+  onPlayState(false);
+
+  // Step 3: clear Python queue, then add_tracks — identical to openFiles() flow
+  try {
+    await pywebview.api.clear_playlist();
+    const playlist = await pywebview.api.add_tracks(paths);
+    if (!playlist || playlist.length === 0) {
+      setStatus('NO VALID TRACKS IN PLAYLIST');
+      return;
+    }
+    S.playlist = playlist;
     _seedThumbCache(S.playlist);
     renderPlaylist();
     updatePlaylistMeta();
+    setStatus(`LOADED "${name}" — ${playlist.length} TRACK(S)`);
     loadTrack(0);
+  } catch (e) {
+    console.error('[MACAN] onLoad error:', e);
+    setStatus('ERROR LOADING PLAYLIST');
   }
 });
 
@@ -986,20 +1038,21 @@ async function _doStateRestore() {
       if (state.fadeDuration !== undefined) S.fadeDuration = state.fadeDuration;
       if (state.normEnabled  !== undefined) S.normEnabled  = state.normEnabled;
 
-      // FIX: Store EQ bands as pending — AudioContext may not exist yet.
-      // If AudioContext is already initialized (e.g. user had interacted before
-      // this restore path runs), apply immediately so audio effect is live.
-      // Otherwise applied in initAudioContext() on first user interaction.
+      // Store EQ bands as pending — AudioContext may not exist yet.
+      // Applied synchronously in initAudioContext() on first user interaction.
       if (Array.isArray(state.eqBands) && state.eqBands.length === 10) {
+        S._pendingEqBands  = state.eqBands;
+        S._pendingEqPreset = state.eqPreset || null;
+        // If AudioContext already initialized (rare), apply immediately
         if (equalizer && audioContext) {
-          // AudioContext already exists — apply right away
           equalizer.setAllBands(state.eqBands);
+          S._pendingEqBands  = null;
           if (equalizerUI) equalizerUI.syncSlidersFromEq(state.eqPreset || null);
-        } else {
-          // Defer until initAudioContext() is called
-          S._pendingEqBands  = state.eqBands;
-          S._pendingEqPreset = state.eqPreset || null;
+          S._pendingEqPreset = null;
         }
+      } else if (state.eqPreset) {
+        // Only preset name saved (no bands) — store name; initFromPython fallback will apply
+        S._pendingEqPreset = state.eqPreset;
       }
 
       // ── 3. Restore last track + seek position ──────────────
@@ -1730,6 +1783,48 @@ function setupVideoControls() {
   const vcenterOverlay = document.getElementById('video-center-overlay');
   const vcenterBtn     = document.getElementById('video-center-btn');
 
+  // ── Cursor auto-hide (CSS class based, affects all children) ──
+  // Using a CSS class with !important on #video-layer and all descendants
+  // is the only reliable way — inline style on the container is overridden
+  // by child elements (video, overlays) that have their own cursor rules.
+  const CURSOR_HIDE_DELAY = 3000; // ms — same as controls autohide
+
+  function _showCursor() {
+    videoLayer.classList.remove('cursor-hidden');
+  }
+
+  function _hideCursor() {
+    // Only hide cursor when video layer is actually in fullscreen (active)
+    if (videoLayer.classList.contains('active')) {
+      videoLayer.classList.add('cursor-hidden');
+    }
+  }
+
+  function _scheduleCursorHide() {
+    clearTimeout(S.vcCursorTimer);
+    S.vcCursorTimer = setTimeout(_hideCursor, CURSOR_HIDE_DELAY);
+  }
+
+  // Attach mousemove to videoLayer — show cursor + restart hide timer.
+  // This listener is SEPARATE from showAllVcControls so cursor logic
+  // does NOT interfere with the click handler below.
+  videoLayer.addEventListener('mousemove', () => {
+    _showCursor();
+    _scheduleCursorHide();
+  });
+
+  // Restore cursor immediately when mouse leaves video area
+  videoLayer.addEventListener('mouseleave', () => {
+    _showCursor();
+    clearTimeout(S.vcCursorTimer);
+  });
+
+  // Store helpers on S so hideVcControls / pinVcControls / closeVideo
+  // can also control cursor state from outside this function's scope.
+  S._showCursor       = _showCursor;
+  S._hideCursor       = _hideCursor;
+  S._scheduleCursorHide = _scheduleCursorHide;
+
   // ── Unified show/hide helpers ──────────────────────────────────
   // Both #video-controls AND #video-center-overlay are shown/hidden together.
   function showAllVcControls() {
@@ -1740,7 +1835,9 @@ function setupVideoControls() {
     S.vcHideTimer = setTimeout(hideVcControls, 3000);
   }
 
-  // Show controls on mouse move inside video layer, hide after 3s idle
+  // Controls autohide: mousemove on videoLayer triggers BOTH cursor show
+  // (via the listener above) AND controls show (via this separate listener).
+  // Two listeners on the same element is fine — they don't conflict.
   videoLayer.addEventListener('mousemove', showAllVcControls);
 
   videoLayer.addEventListener('mouseleave', () => {
@@ -1788,6 +1885,8 @@ function hideVcControls() {
   // Hide center overlay together with controls
   const vcenterOverlay = document.getElementById('video-center-overlay');
   if (vcenterOverlay) vcenterOverlay.classList.remove('vc-visible');
+  // Hide cursor together with controls
+  if (S._hideCursor) S._hideCursor();
 }
 
 function pinVcControls(on) {
@@ -1796,8 +1895,13 @@ function pinVcControls(on) {
     // Keep center overlay visible while seekbar is being dragged
     const vcenterOverlay = document.getElementById('video-center-overlay');
     if (vcenterOverlay) vcenterOverlay.classList.add('vc-visible');
+    // Show cursor and freeze hide timer during drag
+    if (S._showCursor) S._showCursor();
+    clearTimeout(S.vcCursorTimer);
   } else {
     videoControls.classList.remove('pinned');
+    // Restart hide timer after drag ends
+    if (S._scheduleCursorHide) S._scheduleCursorHide();
   }
 }
 
@@ -2235,7 +2339,6 @@ function scheduleStateSave() {
 
 async function persistAppState() {
   if (!pw()) return;
-  // FIX: Skip if a save is already in-flight — reschedule for after it lands.
   if (S._saveLock) {
     clearTimeout(S._stateSaveTimer);
     S._stateSaveTimer = setTimeout(persistAppState, 400);
@@ -2243,6 +2346,17 @@ async function persistAppState() {
   }
   S._saveLock = true;
   try {
+    // EQ state: if equalizer is initialized, always read live values — it's safe because
+    // initAudioContext() applies _pendingEqBands SYNCHRONOUSLY before returning, so by the
+    // time any async code (like this) can run, the equalizer already has the correct bands.
+    // If equalizer not yet initialized, preserve pending values so we don't lose saved preset.
+    const eqBands  = equalizer
+      ? equalizer.getCurrentValues()
+      : (S._pendingEqBands || null);
+    const eqPreset = equalizerUI
+      ? equalizerUI.currentPreset
+      : (S._pendingEqPreset || null);
+
     const state = {
       currentIndex:  S.currentIndex,
       seekPosition:  S.currentIndex >= 0 ? (activePlayer().currentTime || 0) : 0,
@@ -2252,13 +2366,13 @@ async function persistAppState() {
       fadeEnabled:   S.fadeEnabled,
       fadeDuration:  S.fadeDuration,
       normEnabled:   S.normEnabled,
-      // FIX: If AudioContext/equalizer hasn't been initialized yet (user hasn't
-      // interacted with EQ), fall back to the pending values from restore so we
-      // don't overwrite a valid saved EQ state with null.
-      eqBands:  equalizer ? equalizer.getCurrentValues() : (S._pendingEqBands || null),
-      eqPreset: equalizerUI ? equalizerUI.currentPreset  : (S._pendingEqPreset || null),
+      eqBands,
+      eqPreset,
     };
     await pywebview.api.save_app_state(state);
+    if (eqPreset) {
+      pywebview.api.save_eq_preset_name(eqPreset).catch(() => {});
+    }
   } catch(e) {
     console.warn('[MACAN] State save failed:', e);
   } finally {
@@ -2311,6 +2425,9 @@ function closeVideo() {
   $('main-layout').style.display = '';
   onPlayState(false);
   setStatus('VIDEO CLOSED');
+  // Always restore cursor when leaving fullscreen video
+  if (S._showCursor) S._showCursor();
+  clearTimeout(S.vcCursorTimer);
 }
 
 // ─── PLAYLIST ─────────────────────────────────────────────────
