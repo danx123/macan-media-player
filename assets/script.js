@@ -630,9 +630,62 @@ const btnLyrics      = document.getElementById('btn-lyrics');
 btnLyrics.addEventListener('click', () => toggleLyrics());
 document.getElementById('lyrics-close').addEventListener('click', () => closeLyrics());
 
+// Lyrics fullscreen toggle
+let _lyricsFullscreen = false;
+let _lyricsEscHintTimer = null;
+
+function _showLyricsEscHint() {
+  let hint = document.getElementById('lyrics-esc-hint');
+  if (!hint) {
+    hint = document.createElement('div');
+    hint.id = 'lyrics-esc-hint';
+    hint.className = 'lyrics-esc-hint';
+    hint.textContent = 'ESC — EXIT FULLSCREEN';
+    document.body.appendChild(hint);
+  }
+  hint.classList.remove('hidden');
+  clearTimeout(_lyricsEscHintTimer);
+  // Auto-fade after 3s
+  _lyricsEscHintTimer = setTimeout(() => hint.classList.add('hidden'), 3000);
+}
+
+function _hideLyricsEscHint() {
+  const hint = document.getElementById('lyrics-esc-hint');
+  if (hint) { hint.classList.add('hidden'); clearTimeout(_lyricsEscHintTimer); }
+}
+
+function _enterLyricsFullscreen() {
+  _lyricsFullscreen = true;
+  lyricsOverlay.classList.add('lyrics-fullscreen');
+  const fsBtn = document.getElementById('lyrics-fullscreen');
+  if (fsBtn) { fsBtn.classList.add('active'); fsBtn.textContent = 'EXIT FULLSCREEN'; }
+  _showLyricsEscHint();
+}
+
+function _exitLyricsFullscreen() {
+  _lyricsFullscreen = false;
+  lyricsOverlay.classList.remove('lyrics-fullscreen');
+  const fsBtn = document.getElementById('lyrics-fullscreen');
+  if (fsBtn) { fsBtn.classList.remove('active'); fsBtn.textContent = 'FULLSCREEN MODE'; }
+  _hideLyricsEscHint();
+}
+
+document.getElementById('lyrics-fullscreen').addEventListener('click', () => {
+  _lyricsFullscreen ? _exitLyricsFullscreen() : _enterLyricsFullscreen();
+});
+
 // Close on overlay background click
 lyricsOverlay.addEventListener('click', e => {
-  if (e.target === lyricsOverlay) closeLyrics();
+  if (e.target === lyricsOverlay) {
+    // In fullscreen, background click exits fullscreen (not close)
+    if (_lyricsFullscreen) { _exitLyricsFullscreen(); return; }
+    closeLyrics();
+  }
+});
+
+// Re-show ESC hint on mouse move while in lyrics fullscreen
+lyricsOverlay.addEventListener('mousemove', () => {
+  if (_lyricsFullscreen) _showLyricsEscHint();
 });
 
 // Refetch button
@@ -667,6 +720,8 @@ function closeLyrics() {
   lyricsOverlay.classList.remove('active');
   S.lyricsOpen = false;
   btnLyrics.classList.remove('active');
+  // Exit fullscreen if active
+  if (_lyricsFullscreen) _exitLyricsFullscreen();
 }
 
 function showLyricsIdle() {
@@ -1203,8 +1258,42 @@ function initBgVis() {
   draw();
 }
 
-// ─── MINI VISUALIZER (Enhanced) ──────────────────────────────
+// ─── MINI VISUALIZER (Multi-mode) ──────────────────────────────
+// Modes: bars | wave | scope | mirror | dots
 let miniAnimId = null;
+const VIS_MODES = ['bars', 'wave', 'scope', 'mirror', 'dots'];
+const VIS_MODE_LABELS = {
+  bars:   'BAR SPECTRUM',
+  wave:   'WAVEFORM',
+  scope:  'OSCILLOSCOPE',
+  mirror: 'MIRROR BARS',
+  dots:   'DOT STORM',
+};
+let currentVisMode = 0; // index into VIS_MODES
+
+function cycleVisMode() {
+  currentVisMode = (currentVisMode + 1) % VIS_MODES.length;
+  const label = document.getElementById('vis-mode-label');
+  if (label) {
+    label.textContent = VIS_MODE_LABELS[VIS_MODES[currentVisMode]];
+    label.classList.add('show');
+    clearTimeout(label._hideTimer);
+    label._hideTimer = setTimeout(() => label.classList.remove('show'), 1800);
+  }
+  if (S.analyser) initLiveMiniVis();
+  else initIdleMiniVis();
+}
+
+// Attach click handler to mini-vis div
+document.addEventListener('DOMContentLoaded', () => {
+  const mv = document.getElementById('mini-vis');
+  if (mv) mv.addEventListener('click', cycleVisMode);
+});
+// Also attach immediately if DOM already ready
+(function attachMiniVisClick() {
+  const mv = document.getElementById('mini-vis');
+  if (mv) mv.addEventListener('click', cycleVisMode);
+})();
 
 function initIdleMiniVis() {
   if (miniAnimId) cancelAnimationFrame(miniAnimId);
@@ -1217,28 +1306,60 @@ function initIdleMiniVis() {
     miniAnimId = requestAnimationFrame(frame);
     const W = miniCanvas.width, H = miniCanvas.height;
     ctx.clearRect(0, 0, W, H);
+    const mode = VIS_MODES[currentVisMode];
 
-    const bc = 48, bw = W / bc;
-    for (let i = 0; i < bc; i++) {
-      const target = S.isPlaying
-        ? (Math.abs(Math.sin(i / bc * Math.PI * 3 + ph)) * 0.65 +
-           Math.abs(Math.sin(i / bc * Math.PI * 7 + ph * 1.3)) * 0.35)
-        : Math.abs(Math.sin(i / bc * Math.PI * 2 + ph)) * 0.2;
-
-      smoothed[i] += (target - smoothed[i]) * (S.isPlaying ? 0.15 : 0.05);
-      const h = smoothed[i] * H;
-
-      // Gradient bar
-      const g = ctx.createLinearGradient(0, H, 0, H - h);
-      g.addColorStop(0, S.isPlaying ? 'rgba(232,255,0,0.8)' : 'rgba(232,255,0,0.15)');
-      g.addColorStop(1, S.isPlaying ? 'rgba(150,255,200,0.4)' : 'rgba(232,255,0,0.05)');
-      ctx.fillStyle = g;
-      ctx.fillRect(i * bw + 0.5, H - h, bw - 1.5, h);
-
-      // Peak dot
-      if (S.isPlaying && h > 3) {
-        ctx.fillStyle = 'rgba(255,255,255,0.6)';
-        ctx.fillRect(i * bw + 0.5, H - h - 1.5, bw - 1.5, 1.5);
+    if (mode === 'wave' || mode === 'scope') {
+      // Idle wave
+      ctx.beginPath();
+      ctx.strokeStyle = S.isPlaying ? 'rgba(232,255,0,0.5)' : 'rgba(232,255,0,0.15)';
+      ctx.lineWidth = 1.5;
+      for (let x = 0; x < W; x++) {
+        const t = x / W;
+        const y = H/2 + Math.sin(t * Math.PI * 4 + ph) * (S.isPlaying ? H * 0.28 : H * 0.06);
+        x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    } else if (mode === 'dots') {
+      const bc = 48;
+      for (let i = 0; i < bc; i++) {
+        const target = S.isPlaying
+          ? Math.abs(Math.sin(i / bc * Math.PI * 3 + ph)) * 0.65
+          : Math.abs(Math.sin(i / bc * Math.PI * 2 + ph)) * 0.15;
+        smoothed[i] += (target - smoothed[i]) * 0.1;
+        const x = (i / bc) * W + W / bc / 2;
+        const y = H/2 - smoothed[i] * H * 0.4;
+        const r = 2 + smoothed[i] * 3;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(232,255,0,${0.2 + smoothed[i] * 0.5})`;
+        ctx.fill();
+      }
+    } else {
+      // bars / mirror — idle bars
+      const bc = 48, bw = W / bc;
+      for (let i = 0; i < bc; i++) {
+        const target = S.isPlaying
+          ? (Math.abs(Math.sin(i / bc * Math.PI * 3 + ph)) * 0.65 +
+             Math.abs(Math.sin(i / bc * Math.PI * 7 + ph * 1.3)) * 0.35)
+          : Math.abs(Math.sin(i / bc * Math.PI * 2 + ph)) * 0.2;
+        smoothed[i] += (target - smoothed[i]) * (S.isPlaying ? 0.15 : 0.05);
+        const h = smoothed[i] * H;
+        const g = ctx.createLinearGradient(0, H, 0, H - h);
+        g.addColorStop(0, S.isPlaying ? 'rgba(232,255,0,0.8)' : 'rgba(232,255,0,0.15)');
+        g.addColorStop(1, S.isPlaying ? 'rgba(150,255,200,0.4)' : 'rgba(232,255,0,0.05)');
+        ctx.fillStyle = g;
+        if (mode === 'mirror') {
+          // mirror: draw from center up and down
+          const hh = h / 2;
+          ctx.fillRect(i * bw + 0.5, H/2 - hh, bw - 1.5, hh);
+          ctx.fillRect(i * bw + 0.5, H/2, bw - 1.5, hh);
+        } else {
+          ctx.fillRect(i * bw + 0.5, H - h, bw - 1.5, h);
+          if (S.isPlaying && h > 3) {
+            ctx.fillStyle = 'rgba(255,255,255,0.6)';
+            ctx.fillRect(i * bw + 0.5, H - h - 1.5, bw - 1.5, 1.5);
+          }
+        }
       }
     }
     ph += S.isPlaying ? 0.18 : 0.025;
@@ -1249,42 +1370,105 @@ function initIdleMiniVis() {
 function initLiveMiniVis() {
   if (miniAnimId) cancelAnimationFrame(miniAnimId);
   const ctx = miniCanvas.getContext('2d');
-  let smoothed = new Float32Array(48).fill(0);
-  let peaks = new Float32Array(48).fill(0);
+  let smoothed  = new Float32Array(48).fill(0);
+  let peaks     = new Float32Array(48).fill(0);
   let peakDecay = new Float32Array(48).fill(0);
+  let waveSm    = new Float32Array(256).fill(128);
 
   function frame() {
     miniAnimId = requestAnimationFrame(frame);
     if (!S.analyser) { initIdleMiniVis(); return; }
     const W = miniCanvas.width, H = miniCanvas.height;
-    const raw = new Uint8Array(S.analyser.frequencyBinCount);
-    S.analyser.getByteFrequencyData(raw);
+    const mode = VIS_MODES[currentVisMode];
     ctx.clearRect(0, 0, W, H);
 
-    const bc = 48, bw = W / bc;
-    for (let i = 0; i < bc; i++) {
-      const idx = Math.floor(i / bc * raw.length * 0.75);
-      const target = raw[idx] / 255;
-      smoothed[i] += (target - smoothed[i]) * 0.22;
-      const h = smoothed[i] * H;
+    if (mode === 'scope' || mode === 'wave') {
+      // Time-domain waveform
+      const timeDomain = new Uint8Array(S.analyser.fftSize);
+      S.analyser.getByteTimeDomainData(timeDomain);
+      ctx.beginPath();
+      const accent = mode === 'scope' ? 'rgba(80,255,200,0.85)' : 'rgba(232,255,0,0.75)';
+      ctx.strokeStyle = accent;
+      ctx.lineWidth = mode === 'scope' ? 1 : 1.5;
+      const step = timeDomain.length / W;
+      for (let x = 0; x < W; x++) {
+        const idx  = Math.floor(x * step);
+        const v    = (timeDomain[idx] / 128.0) - 1.0;
+        const y    = (v * H * 0.42) + H / 2;
+        x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      if (mode === 'scope') {
+        // center line
+        ctx.strokeStyle = 'rgba(80,255,200,0.15)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, H/2); ctx.lineTo(W, H/2); ctx.stroke();
+      }
+    } else if (mode === 'dots') {
+      const raw = new Uint8Array(S.analyser.frequencyBinCount);
+      S.analyser.getByteFrequencyData(raw);
+      const bc = 48;
+      for (let i = 0; i < bc; i++) {
+        const idx = Math.floor(i / bc * raw.length * 0.75);
+        const target = raw[idx] / 255;
+        smoothed[i] += (target - smoothed[i]) * 0.22;
+        const x = (i / bc) * W + W / bc / 2;
+        const y = H/2 - smoothed[i] * H * 0.4;
+        const r = 1.5 + smoothed[i] * 4;
+        const a = 0.3 + smoothed[i] * 0.7;
+        const g = ctx.createRadialGradient(x, y, 0, x, y, r * 2);
+        g.addColorStop(0, `rgba(232,255,0,${a})`);
+        g.addColorStop(1, `rgba(80,255,200,0)`);
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fillStyle = g;
+        ctx.fill();
+        // mirror dot below center
+        const y2 = H/2 + smoothed[i] * H * 0.4;
+        const g2 = ctx.createRadialGradient(x, y2, 0, x, y2, r * 2);
+        g2.addColorStop(0, `rgba(150,255,200,${a * 0.6})`);
+        g2.addColorStop(1, `rgba(80,255,200,0)`);
+        ctx.beginPath();
+        ctx.arc(x, y2, r * 0.7, 0, Math.PI * 2);
+        ctx.fillStyle = g2;
+        ctx.fill();
+      }
+    } else {
+      // bars / mirror
+      const raw = new Uint8Array(S.analyser.frequencyBinCount);
+      S.analyser.getByteFrequencyData(raw);
+      const bc = 48, bw = W / bc;
 
-      // Update falling peak
-      if (h > peaks[i]) { peaks[i] = h; peakDecay[i] = 0; }
-      else { peakDecay[i] += 0.4; peaks[i] = Math.max(0, peaks[i] - peakDecay[i] * 0.012); }
+      for (let i = 0; i < bc; i++) {
+        const idx = Math.floor(i / bc * raw.length * 0.75);
+        const target = raw[idx] / 255;
+        smoothed[i] += (target - smoothed[i]) * 0.22;
+        const h = smoothed[i] * H;
+        if (peaks[i] < h) { peaks[i] = h; peakDecay[i] = 0; }
+        else { peakDecay[i] += 0.4; peaks[i] = Math.max(0, peaks[i] - peakDecay[i] * 0.012); }
 
-      // Bar gradient
-      const a = 0.4 + smoothed[i] * 0.6;
-      const g = ctx.createLinearGradient(0, H, 0, H - h);
-      g.addColorStop(0, `rgba(232,255,0,${a})`);
-      g.addColorStop(0.7, `rgba(180,255,120,${a * 0.7})`);
-      g.addColorStop(1, `rgba(80,255,200,${a * 0.4})`);
-      ctx.fillStyle = g;
-      ctx.fillRect(i * bw + 0.5, H - h, bw - 1.5, h);
+        const a = 0.4 + smoothed[i] * 0.6;
+        const g = ctx.createLinearGradient(0, H, 0, H - h);
+        g.addColorStop(0, `rgba(232,255,0,${a})`);
+        g.addColorStop(0.7, `rgba(180,255,120,${a * 0.7})`);
+        g.addColorStop(1, `rgba(80,255,200,${a * 0.4})`);
+        ctx.fillStyle = g;
 
-      // Falling peak indicator
-      if (peaks[i] > 2) {
-        ctx.fillStyle = `rgba(255,255,255,${0.5 + smoothed[i] * 0.5})`;
-        ctx.fillRect(i * bw + 0.5, H - peaks[i] - 1.5, bw - 1.5, 1.5);
+        if (mode === 'mirror') {
+          const hh = h / 2;
+          ctx.fillRect(i * bw + 0.5, H/2 - hh, bw - 1.5, hh);
+          ctx.fillRect(i * bw + 0.5, H/2, bw - 1.5, hh);
+          if (peaks[i] > 2) {
+            ctx.fillStyle = `rgba(255,255,255,${0.4 + smoothed[i] * 0.5})`;
+            ctx.fillRect(i * bw + 0.5, H/2 - peaks[i]/2 - 1, bw - 1.5, 1.5);
+          }
+        } else {
+          ctx.fillRect(i * bw + 0.5, H - h, bw - 1.5, h);
+          if (peaks[i] > 2) {
+            ctx.fillStyle = `rgba(255,255,255,${0.5 + smoothed[i] * 0.5})`;
+            ctx.fillRect(i * bw + 0.5, H - peaks[i] - 1.5, bw - 1.5, 1.5);
+          }
+        }
       }
     }
   }
@@ -1543,46 +1727,75 @@ function showVideoPreview(e, pct) {
 
 // ─── VIDEO CONTROLS AUTOHIDE ──────────────────────────────────
 function setupVideoControls() {
-  // Show controls on mouse move, hide after 3s idle
-  videoLayer.addEventListener('mousemove', () => {
+  const vcenterOverlay = document.getElementById('video-center-overlay');
+  const vcenterBtn     = document.getElementById('video-center-btn');
+
+  // ── Unified show/hide helpers ──────────────────────────────────
+  // Both #video-controls AND #video-center-overlay are shown/hidden together.
+  function showAllVcControls() {
     videoControls.style.opacity = '1';
     videoControls.style.pointerEvents = 'all';
+    if (vcenterOverlay) vcenterOverlay.classList.add('vc-visible');
     clearTimeout(S.vcHideTimer);
     S.vcHideTimer = setTimeout(hideVcControls, 3000);
-  });
+  }
+
+  // Show controls on mouse move inside video layer, hide after 3s idle
+  videoLayer.addEventListener('mousemove', showAllVcControls);
 
   videoLayer.addEventListener('mouseleave', () => {
     if (!S.vcSeekDragging) hideVcControls();
   });
 
-  // Click on video area → play/pause with visual feedback.
-  // Use a short timer to distinguish single-click from double-click,
-  // so double-clicking doesn't accidentally trigger play/pause twice.
+  // ── Click anywhere on video area → play/pause ────────────────
+  // Listen on videoLayer (always receives events regardless of overlay visibility).
+  // Guard against clicks on #video-controls buttons so they don't double-fire.
   let _clickTimer = null;
-  video.addEventListener('click', e => {
+
+  videoLayer.addEventListener('click', e => {
+    // Ignore clicks on the controls bar (prev/play/next/seek/etc.)
+    if (videoControls && videoControls.contains(e.target)) return;
     if (document.getElementById('macan-ctx-menu')) return;
+
     clearTimeout(_clickTimer);
     const wasPaused = video.paused;
+
     _clickTimer = setTimeout(() => {
       togglePlayPause();
       showVideoClickFeedback(wasPaused ? 'play' : 'pause');
-    }, 200);
+
+      // Flash the center button for visual feedback
+      if (vcenterBtn) {
+        vcenterBtn.classList.remove('flash');
+        void vcenterBtn.offsetWidth;
+        vcenterBtn.classList.add('flash');
+        setTimeout(() => vcenterBtn.classList.remove('flash'), 500);
+      }
+
+      // Reset autohide timer so controls stay briefly after click
+      showAllVcControls();
+    }, 180);
   });
-  video.addEventListener('dblclick', e => {
-    // Cancel the single-click timer so play/pause isn't triggered on dblclick
-    clearTimeout(_clickTimer);
-  });
+
+  // Double-click cancels the single-click timer (prevent accidental play/pause on dblclick)
+  videoLayer.addEventListener('dblclick', () => clearTimeout(_clickTimer));
 }
 
 function hideVcControls() {
   if (S.vcSeekDragging) return;
   videoControls.style.opacity = '0';
   videoControls.style.pointerEvents = 'none';
+  // Hide center overlay together with controls
+  const vcenterOverlay = document.getElementById('video-center-overlay');
+  if (vcenterOverlay) vcenterOverlay.classList.remove('vc-visible');
 }
 
 function pinVcControls(on) {
   if (on) {
     videoControls.classList.add('pinned');
+    // Keep center overlay visible while seekbar is being dragged
+    const vcenterOverlay = document.getElementById('video-center-overlay');
+    if (vcenterOverlay) vcenterOverlay.classList.add('vc-visible');
   } else {
     videoControls.classList.remove('pinned');
   }
@@ -1789,6 +2002,24 @@ function updateTrackInfo(track) {
         }
       }).catch(() => {});
     }
+  } else if (track.is_video) {
+    // For video tracks: use cached thumbnail as cover art
+    const cachedThumb = track.cover_art || track.video_thumb || videoThumbCache.get(track.path) || thumbCache.get(track.path);
+    if (cachedThumb) {
+      applyArt(cachedThumb);
+    } else if (pw()) {
+      // Fetch thumbnail async and use as cover art
+      pywebview.api.get_video_thumbnail(track.path).then(thumb => {
+        if (thumb) {
+          track.video_thumb = thumb;
+          track.cover_art   = thumb;
+          videoThumbCache.set(track.path, thumb);
+          thumbCache.set(track.path, thumb);
+          applyArt(thumb);
+          _persistArtToServer(track.path, thumb, true);
+        }
+      }).catch(() => {});
+    }
   }
 
   // Auto-fetch lyrics if panel is open
@@ -1845,6 +2076,13 @@ function onPlayState(playing) {
   const npp = document.getElementById('now-playing-panel');
   if (playing) npp.classList.add('playing');
   else         npp.classList.remove('playing');
+
+  // Sync center overlay icon (shows the action that WILL happen on click:
+  // pause icon when playing, play icon when paused)
+  const cpPlay  = document.getElementById('vcenter-icon-play');
+  const cpPause = document.getElementById('vcenter-icon-pause');
+  if (cpPlay)  cpPlay.style.display  = playing ? 'none'  : 'block';
+  if (cpPause) cpPause.style.display = playing ? 'block' : 'none';
 
   // Sync SMTC play state
   syncMediaSessionState();
@@ -2200,6 +2438,17 @@ function renderPlaylist() {
                 const wasNew = !t.video_thumb;
                 t.video_thumb = thumb;
                 videoThumbCache.set(t.path, thumb);
+                // ── NEW: Use video thumbnail as cover art so it shows in the player
+                // and is cached in thumbCache for persistence across sessions.
+                if (!t.cover_art) {
+                  t.cover_art = thumb;
+                  thumbCache.set(t.path, thumb);
+                  // If this is the currently playing track, apply as album art
+                  if (idx === S.currentIndex) applyArt(thumb);
+                  // Persist to Python so it survives restarts
+                  if (wasNew) _persistArtToServer(t.path, thumb, true);
+                }
+                // ──────────────────────────────────────────────────────────────
                 // FIX: placeholder is a <div>, not <img>
                 const el = playlistList.querySelector(`.pl-item[data-index="${idx}"] .pl-thumb-placeholder`);
                 if (el) {
@@ -2355,6 +2604,8 @@ function showContextMenu(x, y, track) {
   // Remove existing context menus
   closeContextMenu();
 
+  const isAudio = !track.is_video;
+
   const menu = document.createElement('div');
   menu.id = 'macan-ctx-menu';
   menu.className = 'macan-ctx-menu';
@@ -2371,6 +2622,15 @@ function showContextMenu(x, y, track) {
       </svg>
       Play Now
     </div>
+    ${isAudio ? `
+    <div class="ctx-separator"></div>
+    <div class="ctx-item ctx-edittags" data-action="edittags">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+      </svg>
+      Edit Tags / Metadata
+    </div>` : ''}
     <div class="ctx-separator"></div>
     <div class="ctx-item ctx-remove" data-action="remove">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -2382,7 +2642,7 @@ function showContextMenu(x, y, track) {
   document.body.appendChild(menu);
 
   // Position — keep within viewport
-  const menuW = 200, menuH = 130;
+  const menuW = 200, menuH = isAudio ? 160 : 110;
   const left = Math.min(x, window.innerWidth - menuW - 8);
   const top  = Math.min(y, window.innerHeight - menuH - 8);
   menu.style.left = left + 'px';
@@ -2397,6 +2657,12 @@ function showContextMenu(x, y, track) {
     if (idx >= 0) loadTrack(idx, true);
     closeContextMenu();
   });
+  if (isAudio) {
+    menu.querySelector('[data-action="edittags"]').addEventListener('click', () => {
+      showTagEditor(track);
+      closeContextMenu();
+    });
+  }
   menu.querySelector('[data-action="remove"]').addEventListener('click', () => {
     const fakeEvent = { stopPropagation: () => {} };
     removeTrack(track.path, fakeEvent);
@@ -2520,6 +2786,162 @@ async function showFileProperties(track) {
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
 }
 
+// ─── TAG EDITOR ───────────────────────────────────────────────
+async function showTagEditor(track) {
+  if (!pw()) { setStatus('pywebview required for tag editing'); return; }
+
+  // Remove any existing tag editor
+  const existing = document.getElementById('macan-tag-editor');
+  if (existing) existing.remove();
+
+  // Create modal skeleton with loading state
+  const modal = document.createElement('div');
+  modal.id = 'macan-tag-editor';
+  modal.className = 'tag-editor-overlay';
+  modal.innerHTML = `
+    <div class="te-panel">
+      <div class="te-header">
+        <div class="te-header-left">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+          <h2>TAG EDITOR</h2>
+        </div>
+        <button class="te-close-btn" id="te-close">✕</button>
+      </div>
+      <div class="te-filename" id="te-filename">${esc(track.name)}</div>
+      <div class="te-body" id="te-body">
+        <div class="te-loading">
+          <div class="te-spinner"></div>
+          <span>READING TAGS...</span>
+        </div>
+      </div>
+      <div class="te-footer">
+        <span class="te-status" id="te-status"></span>
+        <div class="te-footer-btns">
+          <button class="te-btn te-btn-cancel" id="te-cancel">CANCEL</button>
+          <button class="te-btn te-btn-save" id="te-save" disabled>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+              <polyline points="17 21 17 13 7 13 7 21"/>
+              <polyline points="7 3 7 8 15 8"/>
+            </svg>
+            SAVE TAGS
+          </button>
+        </div>
+      </div>
+    </div>`;
+
+  document.body.appendChild(modal);
+
+  const teClose  = modal.querySelector('#te-close');
+  const teCancel = modal.querySelector('#te-cancel');
+  const teSave   = modal.querySelector('#te-save');
+  const teStatus = modal.querySelector('#te-status');
+  const teBody   = modal.querySelector('#te-body');
+
+  function closeModal() { modal.remove(); }
+  teClose.addEventListener('click', closeModal);
+  teCancel.addEventListener('click', closeModal);
+  modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+
+  // ── Fetch tags from Python ──────────────────────────────────────
+  let tags = null;
+  try {
+    tags = await pywebview.api.get_tags(track.path);
+  } catch(e) {
+    tags = null;
+  }
+
+  if (!tags) {
+    teBody.innerHTML = `
+      <div class="te-error">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--red)" stroke-width="1.5">
+          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <p>CANNOT READ TAGS</p>
+        <small>Format may not be supported or file is inaccessible.</small>
+      </div>`;
+    return;
+  }
+
+  // ── Build form ──────────────────────────────────────────────────
+  const FIELDS = [
+    { key: 'title',       label: 'TITLE',        type: 'text',     col: 'full' },
+    { key: 'artist',      label: 'ARTIST',        type: 'text',     col: 'half' },
+    { key: 'albumartist', label: 'ALBUM ARTIST',  type: 'text',     col: 'half' },
+    { key: 'album',       label: 'ALBUM',         type: 'text',     col: 'half' },
+    { key: 'date',        label: 'YEAR',          type: 'text',     col: 'quarter', placeholder: '2024' },
+    { key: 'genre',       label: 'GENRE',         type: 'text',     col: 'quarter' },
+    { key: 'tracknumber', label: 'TRACK #',       type: 'text',     col: 'quarter', placeholder: '1/12' },
+    { key: 'discnumber',  label: 'DISC #',        type: 'text',     col: 'quarter', placeholder: '1/1' },
+    { key: 'composer',    label: 'COMPOSER',      type: 'text',     col: 'half' },
+    { key: 'comment',     label: 'COMMENT',       type: 'text',     col: 'half' },
+    { key: 'lyrics',      label: 'LYRICS',        type: 'textarea', col: 'full' },
+  ];
+
+  const formHtml = `
+    <div class="te-form">
+      ${FIELDS.map(f => `
+        <div class="te-field te-col-${f.col}">
+          <label class="te-label">${f.label}</label>
+          ${f.type === 'textarea'
+            ? `<textarea class="te-input te-textarea" data-key="${f.key}" rows="5">${esc(tags[f.key] || '')}</textarea>`
+            : `<input  class="te-input" type="text" data-key="${f.key}" value="${esc(tags[f.key] || '')}" placeholder="${f.placeholder || ''}">`
+          }
+        </div>`).join('')}
+    </div>`;
+
+  teBody.innerHTML = formHtml;
+  teSave.disabled = false;
+
+  // ── Save handler ────────────────────────────────────────────────
+  teSave.addEventListener('click', async () => {
+    teSave.disabled = true;
+    teStatus.textContent = 'SAVING...';
+    teStatus.style.color = 'var(--text-lo)';
+
+    // Collect form values
+    const newTags = {};
+    modal.querySelectorAll('[data-key]').forEach(el => {
+      newTags[el.dataset.key] = el.value.trim();
+    });
+
+    try {
+      const result = await pywebview.api.save_tags(track.path, newTags);
+      if (result.ok) {
+        teStatus.textContent = '✓ SAVED SUCCESSFULLY';
+        teStatus.style.color = 'var(--accent)';
+
+        // Update track in playlist and refresh UI
+        if (result.updated_track) {
+          const idx = S.playlist.findIndex(t => t.path === track.path);
+          if (idx >= 0) {
+            S.playlist[idx].name   = result.updated_track.name   || S.playlist[idx].name;
+            S.playlist[idx].artist = result.updated_track.artist || S.playlist[idx].artist;
+            S.playlist[idx].album  = result.updated_track.album  || S.playlist[idx].album;
+            renderPlaylist();
+            // If currently playing, refresh track info display
+            if (idx === S.currentIndex) updateTrackInfo(S.playlist[idx]);
+          }
+        }
+        setStatus(`TAGS SAVED — ${newTags.title || track.name}`);
+
+        setTimeout(() => closeModal(), 1200);
+      } else {
+        teStatus.textContent = `ERROR: ${result.error || 'Unknown error'}`;
+        teStatus.style.color = 'var(--red)';
+        teSave.disabled = false;
+      }
+    } catch(e) {
+      teStatus.textContent = `ERROR: ${e.message || e}`;
+      teStatus.style.color = 'var(--red)';
+      teSave.disabled = false;
+    }
+  });
+}
+
 function updatePlaylistHighlight(idx) {
   document.querySelectorAll('.pl-item').forEach(el => {
     el.classList.toggle('active', +el.dataset.index === idx);
@@ -2536,10 +2958,14 @@ function updatePlaylistMeta() {
 document.addEventListener('keydown', e => {
   if (document.activeElement === $('search-input')) return;
 
-  // ESC: exit video fullscreen (or mini player)
+  // ESC priority: 1) exit lyrics fullscreen  2) close lyrics  3) close video
   if (e.code === 'Escape') {
-    if (videoLayer.classList.contains('active')) {
-      e.preventDefault();
+    e.preventDefault();
+    if (_lyricsFullscreen) {
+      _exitLyricsFullscreen();
+    } else if (S.lyricsOpen) {
+      closeLyrics();
+    } else if (videoLayer.classList.contains('active')) {
       closeVideo();
     }
     return;
