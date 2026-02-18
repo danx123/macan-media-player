@@ -562,14 +562,12 @@ class MacanMediaAPI:
 
     def reorder_playlist(self, from_index, to_index):
         """Move a track in the server-side playlist from from_index to to_index.
-        Called after the JS drag-and-drop completes so playlist.json stays in sync."""
+        Called after the JS drag-and-drop completes so the DB stays in sync."""
         with self._settings_lock:
-            pl = self.settings.get('playlist', [])
-            if (0 <= from_index < len(pl)) and (0 <= to_index < len(pl)):
-                item = pl.pop(from_index)
-                pl.insert(to_index, item)
-                self.settings['playlist'] = pl
-                self._save_settings_locked()
+            if (0 <= from_index < len(self.playlist)) and (0 <= to_index < len(self.playlist)):
+                item = self.playlist.pop(from_index)
+                self.playlist.insert(to_index, item)
+                self._save_playlist()
         return True
 
     def get_file_info(self, path):
@@ -907,13 +905,301 @@ class MacanMediaAPI:
         JS→Python bridge calls (e.g. periodic 10s saves overlapping with user actions)."""
         with self._settings_lock:
             self.settings['app_state'] = state_dict
+            # FIX: Also sync eq_preset_name as a dedicated key so EQ preset
+            # survives even if app_state is partially corrupt or missing eqBands.
+            if isinstance(state_dict, dict):
+                eq_preset = state_dict.get('eqPreset')
+                if eq_preset and isinstance(eq_preset, str):
+                    self.settings['eq_preset_name'] = eq_preset
+                eq_bands = state_dict.get('eqBands')
+                if isinstance(eq_bands, list) and len(eq_bands) == 10:
+                    self.settings['eq_bands_backup'] = eq_bands
             self._save_settings_locked()
         return True
 
     def get_app_state(self):
-        """Retrieve last saved application state."""
+        """Retrieve last saved application state.
+        FIX: Also restores eqBands/eqPreset from dedicated backup keys if missing
+        from app_state (handles upgrades from older versions)."""
         with self._settings_lock:
-            return dict(self.settings.get('app_state', {}))
+            state = dict(self.settings.get('app_state', {}))
+            # Restore EQ from backup keys if app_state doesn't have them
+            if not state.get('eqBands'):
+                backup_bands = self.settings.get('eq_bands_backup')
+                if isinstance(backup_bands, list) and len(backup_bands) == 10:
+                    state['eqBands'] = backup_bands
+            if not state.get('eqPreset'):
+                backup_preset = self.settings.get('eq_preset_name')
+                if backup_preset:
+                    state['eqPreset'] = backup_preset
+            return state
+
+    # ─── NAMED PLAYLISTS — M3U8 files + SQLite registry ───────────────────────────
+    # Each named playlist is stored as a .m3u8 file (Extended M3U, UTF-8).
+    # SQLite kv only holds the lightweight registry:
+    #   { name → { filename, count, created, modified } }
+    # — never the full track payloads. DB stays tiny regardless of playlist count.
+    #
+    # M3U8 format:
+    #   #EXTM3U
+    #   #PLAYLIST:<name>
+    #   #EXTINF:<duration>,<artist> - <title>
+    #   #EXTMACAN:{"ext":"MP3","is_video":false,"album":"..."}
+    #   /absolute/path/to/file.mp3
+    #   ...
+
+    def _get_playlists_dir(self):
+        """Directory where .m3u8 files live."""
+        d = os.path.join(self._get_app_data(), 'Playlists')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _safe_filename(self, name):
+        """Sanitise playlist name to a safe filename (strips path chars)."""
+        safe = ''.join(c if c.isalnum() or c in ' _-.' else '_' for c in name).strip()
+        return (safe[:80] or 'playlist') + '.m3u8'
+
+    def _write_m3u8(self, name, tracks, existing_filename=None):
+        """Serialise tracks to .m3u8 and return the filename used.
+        Pass existing_filename to reuse a stable filename (avoids DB read inside lock)."""
+        pl_dir   = self._get_playlists_dir()
+        filename = existing_filename or self._safe_filename(name)
+        fpath    = os.path.join(pl_dir, filename)
+
+        lines = ['#EXTM3U', f'#PLAYLIST:{name}', '']
+        for t in tracks:
+            dur    = int(t.get('duration') or 0)
+            artist = (t.get('artist') or '').replace(',', ' ')
+            title  = t.get('name') or os.path.basename(t.get('path', ''))
+            meta   = json.dumps({
+                'ext':      t.get('ext', ''),
+                'is_video': t.get('is_video', False),
+                'album':    t.get('album', ''),
+            }, ensure_ascii=False)
+            lines.append(f'#EXTINF:{dur},{artist} - {title}')
+            lines.append(f'#EXTMACAN:{meta}')
+            lines.append(t.get('path', ''))
+            lines.append('')
+
+        with open(fpath, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        return filename
+
+    def _read_m3u8(self, filename):
+        """Parse a .m3u8 file, return list of track dicts."""
+        fpath = os.path.join(self._get_playlists_dir(), filename)
+        if not os.path.exists(fpath):
+            return []
+        tracks, extinf, extmacan = [], {}, {}
+        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line in ('#EXTM3U',) or line.startswith('#PLAYLIST:'):
+                    continue
+                if line.startswith('#EXTINF:'):
+                    rest  = line[8:]
+                    comma = rest.find(',')
+                    try:    dur = int(rest[:comma]) if comma >= 0 else 0
+                    except: dur = 0
+                    display = rest[comma+1:].strip() if comma >= 0 else rest
+                    if ' - ' in display:
+                        artist, title = display.split(' - ', 1)
+                    else:
+                        artist, title = '', display
+                    extinf = {'duration': dur, 'artist': artist.strip(),
+                              'name': title.strip()}
+                elif line.startswith('#EXTMACAN:'):
+                    try:    extmacan = json.loads(line[10:])
+                    except: extmacan = {}
+                elif not line.startswith('#') and line:
+                    path = line
+                    name = extinf.get('name') or os.path.splitext(
+                               os.path.basename(path))[0]
+                    dur  = extinf.get('duration', 0)
+                    tracks.append({
+                        'path':         path,
+                        'name':         name,
+                        'artist':       extinf.get('artist', ''),
+                        'album':        extmacan.get('album', ''),
+                        'ext':          extmacan.get('ext', '')
+                                        or os.path.splitext(path)[1].lstrip('.').upper(),
+                        'is_video':     extmacan.get('is_video', False),
+                        'duration':     dur,
+                        'duration_str': self._format_duration(dur),
+                        'cover_art':    None,
+                        'url':          '',
+                    })
+                    extinf, extmacan = {}, {}
+        return tracks
+
+    def save_named_playlist(self, name, tracks):
+        """Save one playlist as .m3u8 and update the SQLite registry."""
+        import datetime
+        ts = datetime.datetime.now().isoformat()
+        with self._settings_lock:
+            # Read registry from self.settings (in-memory) to stay consistent —
+            # using _kv_get here would read DB but self.settings may be stale
+            registry = dict(self.settings.get('pl_registry', {}))
+            existing = registry.get(name, {})
+            existing_filename = existing.get('filename')
+            # Write the .m3u8 file
+            filename = self._write_m3u8(name, tracks, existing_filename)
+            # Update registry entry
+            registry[name] = {
+                'name':     name,
+                'filename': filename,
+                'count':    len(tracks),
+                'created':  existing.get('created', ts),
+                'modified': ts,
+            }
+            # FIX: MUST update self.settings so _save_settings_locked() doesn't
+            # overwrite this with stale data the next time save_app_state is called.
+            self.settings['pl_registry'] = registry
+            self._kv_set('pl_registry', registry)
+            print(f'[MACAN] Saved playlist "{name}" → {filename} ({len(tracks)} tracks)')
+        return True
+
+    def get_playlist_registry(self):
+        """Return lightweight registry {name → {name,filename,count,created,modified}}.
+        No track payloads — fast for populating the playlist list UI."""
+        with self._settings_lock:
+            # FIX: Read from self.settings (in-memory) which is always up-to-date
+            # after save_named_playlist updates it. Fallback to DB if not in memory.
+            reg = self.settings.get('pl_registry')
+            if reg is None:
+                reg = self._kv_get('pl_registry', {})
+                self.settings['pl_registry'] = reg
+            return dict(reg)
+
+    def load_named_playlist(self, name):
+        """Return list of lightweight track dicts (path + M3U metadata) for `name`.
+        No heavy metadata rebuild — JS uses paths to call add_tracks() directly."""
+        with self._settings_lock:
+            registry = self.settings.get('pl_registry') or self._kv_get('pl_registry', {})
+            entry    = registry.get(name)
+        if not entry:
+            return []
+        return self._read_m3u8(entry['filename'])
+
+    def get_playlist_paths(self, name):
+        """Return plain list of file path strings for a named playlist.
+        This is the minimal fast call — JS feeds paths straight to add_tracks()."""
+        with self._settings_lock:
+            registry = self.settings.get('pl_registry') or self._kv_get('pl_registry', {})
+            entry    = registry.get(name)
+        if not entry:
+            return []
+        tracks = self._read_m3u8(entry['filename'])
+        return [t['path'] for t in tracks if t.get('path')]
+
+    def replace_playlist(self, file_paths):
+        """Clear the current queue then rebuild via add_tracks pipeline."""
+        self.playlist = []
+        return self.add_tracks(file_paths)
+
+    def delete_named_playlist(self, name):
+        """Remove .m3u8 file and registry entry for a named playlist."""
+        with self._settings_lock:
+            # FIX: Read from self.settings (in-memory) to stay consistent
+            registry = dict(self.settings.get('pl_registry', {}))
+            entry    = registry.pop(name, None)
+            if entry:
+                try:
+                    os.remove(os.path.join(self._get_playlists_dir(),
+                                           entry['filename']))
+                except OSError:
+                    pass
+                # FIX: Update self.settings so _save_settings_locked doesn't restore deleted entry
+                self.settings['pl_registry'] = registry
+                self._kv_set('pl_registry', registry)
+        return True
+
+    def export_named_playlist(self, name):
+        """Return raw .m3u8 text so JS can offer a Save-As download."""
+        with self._settings_lock:
+            registry = self.settings.get('pl_registry') or self._kv_get('pl_registry', {})
+            entry    = registry.get(name)
+        if not entry:
+            return None
+        fpath = os.path.join(self._get_playlists_dir(), entry['filename'])
+        if not os.path.exists(fpath):
+            return None
+        with open(fpath, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def import_m3u_playlist(self, name, m3u_text):
+        """Import M3U/M3U8 text from JS (FileReader result), parse, save."""
+        import datetime, tempfile, shutil
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.m3u8')
+        try:
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                f.write(m3u_text)
+            # Move to Playlists dir so _read_m3u8 can resolve relative paths
+            pl_dir   = self._get_playlists_dir()
+            filename = self._safe_filename(name)
+            dest     = os.path.join(pl_dir, filename)
+            shutil.move(tmp_path, dest)
+            tracks = self._read_m3u8(filename)
+            ts     = datetime.datetime.now().isoformat()
+            with self._settings_lock:
+                # FIX: Read from self.settings and write back to self.settings
+                registry = dict(self.settings.get('pl_registry', {}))
+                registry[name] = {
+                    'name': name, 'filename': filename,
+                    'count': len(tracks),
+                    'created': ts, 'modified': ts,
+                }
+                # FIX: Update self.settings so _save_settings_locked doesn't overwrite
+                self.settings['pl_registry'] = registry
+                self._kv_set('pl_registry', registry)
+            return {'ok': True, 'count': len(tracks)}
+        except Exception as e:
+            print(f'[MACAN] import_m3u error: {e}')
+            try: os.remove(tmp_path)
+            except: pass
+            return {'ok': False, 'error': str(e)}
+
+    # ─── Legacy shims (JS may still call old names during transition) ────────────────
+    def save_named_playlists(self, playlists_dict):
+        """Bulk-save shim: migrates old JSON-blob named playlists to M3U8."""
+        for name, entry in playlists_dict.items():
+            tracks = entry.get('tracks', [])
+            if tracks:
+                self.save_named_playlist(name, tracks)
+        return True
+
+    def get_named_playlists(self):
+        """Legacy shim — returns registry dict (no tracks) for old UI code."""
+        return self.get_playlist_registry()
+
+    def save_eq_custom(self, bands):
+        """Persist the 10-band custom EQ preset values (list of 10 floats)."""
+        with self._settings_lock:
+            self.settings['eq_custom_preset'] = bands
+            self._kv_set('eq_custom_preset', bands)
+        return True
+
+    def get_eq_custom(self):
+        """Return the saved custom EQ preset, or a flat all-zeros preset if none."""
+        with self._settings_lock:
+            return list(self.settings.get('eq_custom_preset',
+                                          self._kv_get('eq_custom_preset', [0]*10)))
+
+    def save_eq_preset_name(self, preset_name):
+        """Persist the last-selected EQ preset name (e.g. 'Rock', 'Custom', 'Flat').
+        Stored as a dedicated kv key so it survives even if app_state is missing."""
+        if not isinstance(preset_name, str) or not preset_name:
+            return False
+        with self._settings_lock:
+            self.settings['eq_preset_name'] = preset_name
+            self._kv_set('eq_preset_name', preset_name)
+        return True
+
+    def get_eq_preset_name(self):
+        """Return the last saved EQ preset name, or 'Flat' as default."""
+        with self._settings_lock:
+            return self.settings.get('eq_preset_name',
+                                     self._kv_get('eq_preset_name', 'Flat'))
 
     # ─── PRIVATE: DIALOG WRAPPERS ─────────────────────────────────────────────
 
@@ -1235,32 +1521,194 @@ class MacanMediaAPI:
 
     # ─── PRIVATE: PERSISTENCE ─────────────────────────────────────────────────
 
+    # ─── PRIVATE: PATH HELPERS ────────────────────────────────────────────────
+
     def _get_app_data(self):
+        """Return the persistent app-data directory for Macan Media Player.
+        On Windows: %LOCALAPPDATA%\\MacanMediaPlayer
+        On other:   ~/.macan_media_player"""
         if os.name == 'nt':
             return os.path.join(os.getenv('LOCALAPPDATA', ''), 'MacanMediaPlayer')
         return os.path.join(os.path.expanduser('~'), '.macan_media_player')
 
-    def _load_settings(self):
+    def _get_webview_storage_path(self):
+        """Return the WebView2 user-data / storage path.
+        Keeping this inside the app-data dir mirrors how Shrine/Chrome store
+        their profile data: app_data/WebView2Profile/
+        This directory is passed to webview.start(storage_path=...) so that
+        localStorage, IndexedDB, cookies, and service workers all persist
+        across restarts — exactly like a real browser profile."""
+        return os.path.join(self._get_app_data(), 'WebView2Profile')
+
+    # ─── PRIVATE: SQLite DATABASE (replaces settings.json + playlist.json) ────
+    # Single macan.db file — WAL mode for concurrency, zero-copy for blobs.
+    # Schema:
+    #   kv(key TEXT PK, value TEXT)         ← settings & named-playlist map
+    #   playlist(pos INTEGER PK, data TEXT) ← current queue, one row per track
+    # Migration from legacy JSON files runs once on first startup.
+
+    def _db_connect(self):
+        """Open a connection to macan.db with WAL mode and a short busy timeout."""
         app_data = self._get_app_data()
         os.makedirs(app_data, exist_ok=True)
-        for attr, fname in [('settings', 'settings.json'), ('playlist', 'playlist.json')]:
-            fpath = os.path.join(app_data, fname)
-            loaded = None
-            # FIX: Try main file first; fall back to .tmp if main is corrupt/missing
-            # (handles crash-during-rename edge case)
-            for candidate in [fpath, fpath + '.tmp']:
-                if not os.path.exists(candidate):
-                    continue
-                try:
-                    with open(candidate, 'r', encoding='utf-8') as f:
-                        loaded = json.load(f)
-                    break  # success
-                except (json.JSONDecodeError, OSError) as e:
-                    print(f"[MACAN] Could not load {candidate}: {e}")
-            if loaded is not None:
-                setattr(self, attr, loaded)
-            else:
-                setattr(self, attr, {} if attr == 'settings' else [])
+        db_path = os.path.join(app_data, 'macan.db')
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-8000")   # 8 MB page cache
+        return conn
+
+    def _db_init(self):
+        """Create tables and migrate legacy JSON files (idempotent)."""
+        with self._db_connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS kv (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS playlist (
+                    pos  INTEGER PRIMARY KEY,
+                    data TEXT    NOT NULL
+                )
+            """)
+            conn.commit()
+
+        self._db_migrate_from_json()
+
+    def _db_migrate_from_json(self):
+        """One-time migration: read legacy settings.json / playlist.json into SQLite,
+        then rename them so migration never re-runs."""
+        app_data = self._get_app_data()
+        migrated_any = False
+
+        # ── settings.json → kv table ─────────────────────────────────────────
+        settings_path = os.path.join(app_data, 'settings.json')
+        for candidate in [settings_path, settings_path + '.tmp']:
+            if not os.path.exists(candidate):
+                continue
+            try:
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    with self._db_connect() as conn:
+                        for k, v in data.items():
+                            conn.execute(
+                                "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
+                                (k, json.dumps(v, ensure_ascii=False))
+                            )
+                        conn.commit()
+                    print(f"[MACAN] Migrated {len(data)} keys from settings.json → SQLite")
+                    migrated_any = True
+                os.rename(candidate, candidate + '.migrated')
+                break
+            except Exception as e:
+                print(f"[MACAN] settings.json migration error: {e}")
+
+        # ── playlist.json → playlist table ───────────────────────────────────
+        playlist_path = os.path.join(app_data, 'playlist.json')
+        for candidate in [playlist_path, playlist_path + '.tmp']:
+            if not os.path.exists(candidate):
+                continue
+            try:
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    with self._db_connect() as conn:
+                        conn.execute("DELETE FROM playlist")
+                        for pos, track in enumerate(data):
+                            conn.execute(
+                                "INSERT INTO playlist(pos,data) VALUES(?,?)",
+                                (pos, json.dumps(track, ensure_ascii=False))
+                            )
+                        conn.commit()
+                    print(f"[MACAN] Migrated {len(data)} tracks from playlist.json → SQLite")
+                    migrated_any = True
+                os.rename(candidate, candidate + '.migrated')
+                break
+            except Exception as e:
+                print(f"[MACAN] playlist.json migration error: {e}")
+
+        if migrated_any:
+            print("[MACAN] Legacy JSON migration complete.")
+
+    # ── KV helpers ────────────────────────────────────────────────────────────
+
+    def _kv_get(self, key, default=None):
+        """Read one value from the kv table. Returns parsed Python object."""
+        try:
+            with self._db_connect() as conn:
+                row = conn.execute(
+                    "SELECT value FROM kv WHERE key=?", (key,)
+                ).fetchone()
+            return json.loads(row[0]) if row else default
+        except Exception as e:
+            print(f"[MACAN] _kv_get({key}) error: {e}")
+            return default
+
+    def _kv_set(self, key, value):
+        """Write one value to the kv table. Explicit commit + close."""
+        conn = None
+        try:
+            conn = self._db_connect()
+            conn.execute(
+                "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
+                (key, json.dumps(value, ensure_ascii=False))
+            )
+            conn.commit()
+        except Exception as e:
+            print(f"[MACAN] _kv_set({key}) error: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def _kv_set_many(self, mapping):
+        """Write multiple kv pairs atomically. Explicit commit + close."""
+        conn = None
+        try:
+            conn = self._db_connect()
+            conn.executemany(
+                "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
+                [(k, json.dumps(v, ensure_ascii=False)) for k, v in mapping.items()]
+            )
+            conn.commit()
+        except Exception as e:
+            print(f"[MACAN] _kv_set_many error: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    # ── Settings load / save ──────────────────────────────────────────────────
+
+    def _load_settings(self):
+        """Bootstrap: init DB (+ migrate JSON), then load settings + playlist
+        from SQLite into self.settings and self.playlist."""
+        self._db_init()
+
+        # Load all kv rows into self.settings
+        try:
+            with self._db_connect() as conn:
+                rows = conn.execute("SELECT key, value FROM kv").fetchall()
+            self.settings = {k: json.loads(v) for k, v in rows}
+        except Exception as e:
+            print(f"[MACAN] Load settings from DB error: {e}")
+            self.settings = {}
+
+        # Load playlist from playlist table
+        try:
+            with self._db_connect() as conn:
+                rows = conn.execute(
+                    "SELECT data FROM playlist ORDER BY pos"
+                ).fetchall()
+            self.playlist = [json.loads(r[0]) for r in rows]
+        except Exception as e:
+            print(f"[MACAN] Load playlist from DB error: {e}")
+            self.playlist = []
+
+        print(f"[MACAN] DB loaded — {len(self.settings)} settings keys, "
+              f"{len(self.playlist)} playlist tracks")
 
     def _save_settings(self):
         """Public-safe wrapper — acquires lock then saves."""
@@ -1268,40 +1716,27 @@ class MacanMediaAPI:
             self._save_settings_locked()
 
     def _save_settings_locked(self):
-        """Must only be called while _settings_lock is held.
-        FIX: Writes to a temp file then renames atomically to prevent
-        truncated/corrupt settings.json if the process is killed mid-write."""
+        """Persist self.settings to the kv table.
+        Must only be called while _settings_lock is held.
+        SQLite WAL mode makes this safe and fast even with large payloads."""
         try:
-            fpath = os.path.join(self._get_app_data(), 'settings.json')
-            os.makedirs(os.path.dirname(fpath), exist_ok=True)
-            tmp_path = fpath + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(self.settings, f, indent=2)
-            # Atomic rename — on POSIX this is guaranteed; on Windows it may
-            # raise FileExistsError on older Python, so we remove first.
-            try:
-                os.replace(tmp_path, fpath)
-            except OSError:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
+            self._kv_set_many(self.settings)
         except Exception as e:
             print(f"[MACAN] Save settings error: {e}")
 
     def _save_playlist(self):
-        """FIX: Atomic write via temp file to prevent corruption on crash."""
+        """Persist self.playlist to the playlist table.
+        Replaces the entire table in a single transaction — fast even with
+        hundreds of tracks because SQLite is an in-process library."""
         try:
-            fpath = os.path.join(self._get_app_data(), 'playlist.json')
-            os.makedirs(os.path.dirname(fpath), exist_ok=True)
-            tmp_path = fpath + '.tmp'
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(self.playlist, f, indent=2)
-            try:
-                os.replace(tmp_path, fpath)
-            except OSError:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
+            with self._db_connect() as conn:
+                conn.execute("DELETE FROM playlist")
+                conn.executemany(
+                    "INSERT INTO playlist(pos,data) VALUES(?,?)",
+                    [(pos, json.dumps(track, ensure_ascii=False))
+                     for pos, track in enumerate(self.playlist)]
+                )
+                conn.commit()
         except Exception as e:
             print(f"[MACAN] Save playlist error: {e}")
 
@@ -1313,6 +1748,15 @@ def main():
     api = MacanMediaAPI()
     base_dir = os.path.dirname(os.path.abspath(__file__))
     entry_point = os.path.join(base_dir, 'assets', 'index.html')
+
+    # ── WebView2 persistent storage profile ───────────────────────────────────
+    # Passing storage_path tells EdgeWebView2 to use a fixed user-data directory
+    # (same mechanism as shrine_web.py's hybrid_data_shared / profile_path).
+    # This makes localStorage, IndexedDB, cookies, and cache survive restarts —
+    # identical behaviour to a real Chrome/Edge browser profile.
+    # On non-Windows builds (Qt backend) pywebview ignores the kwarg gracefully.
+    webview_storage = api._get_webview_storage_path()
+    os.makedirs(webview_storage, exist_ok=True)
 
     window = webview.create_window(
         title='Macan Media Player',
@@ -1326,7 +1770,12 @@ def main():
     )
 
     api.set_window(window)
-    webview.start(debug=False, gui=GUI_BACKEND)
+    webview.start(
+        debug=False,
+        gui=GUI_BACKEND,
+        storage_path=webview_storage,   # persistent profile: localStorage / cookies / cache
+        private_mode=False,             # must be False so storage_path is actually used
+    )
 
 
 if __name__ == '__main__':
