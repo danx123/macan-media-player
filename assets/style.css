@@ -337,11 +337,30 @@ body {
   width: 100%;
   height: 48px;
   position: relative;
+  cursor: pointer;
 }
 #mini-canvas {
   width: 100%;
   height: 100%;
 }
+
+/* Visualizer mode label (shown on click) */
+#vis-mode-label {
+  position: absolute;
+  bottom: 4px;
+  right: 6px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 1.5px;
+  color: var(--accent);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+  background: rgba(0,0,0,0.5);
+  padding: 2px 5px;
+  border-radius: 2px;
+}
+#vis-mode-label.show { opacity: 1; }
 
 /* ─── PROGRESS BAR ───────────────────────────────────────────── */
 #progress-container {
@@ -987,6 +1006,160 @@ input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider)::-webk
 
 #video-layer.active { display: block; }
 
+/* ── Center play/pause overlay ──
+   Visibility is 100% controlled by JS (same autohide as #video-controls).
+   No CSS hover-based show/hide — pointer-events:none when hidden. */
+#video-center-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 5;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+  cursor: pointer;
+}
+
+#video-center-overlay.vc-visible {
+  opacity: 1;
+  pointer-events: none; /* clicks pass through to videoLayer listener */
+}
+
+.video-center-playpause {
+  background: rgba(0,0,0,0.5);
+  border: 2px solid rgba(255,255,255,0.35);
+  border-radius: 50%;
+  width: 76px;
+  height: 76px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s, transform 0.15s;
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+}
+
+@keyframes vcenter-flash {
+  0%   { opacity: 1; transform: scale(1.18); }
+  50%  { opacity: 0.9; transform: scale(1.02); }
+  100% { opacity: 0;   transform: scale(0.88); }
+}
+
+.video-center-playpause.flash {
+  animation: vcenter-flash 0.45s ease forwards;
+}
+
+/* Lyrics fullscreen mode */
+/* ── Lyrics fullscreen button (text, red outline) ── */
+.lyrics-fs-btn {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  padding: 5px 10px;
+  border: 1px solid var(--red);
+  border-radius: 2px;
+  color: var(--red);
+  background: none;
+  cursor: pointer;
+  transition: background 0.18s, color 0.18s, box-shadow 0.18s;
+  flex-shrink: 0;
+  margin-right: 8px;
+}
+.lyrics-fs-btn:hover {
+  background: var(--red-dim);
+  box-shadow: 0 0 10px rgba(255,45,85,0.25);
+}
+.lyrics-fs-btn.active {
+  background: var(--red);
+  color: #fff;
+  box-shadow: 0 0 14px rgba(255,45,85,0.4);
+}
+
+/* ── Fullscreen mode — panel takes full screen, only lyrics body visible ── */
+.lyrics-overlay.lyrics-fullscreen {
+  justify-content: stretch;
+  align-items: stretch;
+  background: #000;
+  backdrop-filter: none;
+}
+
+.lyrics-overlay.lyrics-fullscreen .lyrics-panel {
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  transform: none !important;
+}
+
+/* Hide header, track info, footer in fullscreen — only body shown */
+.lyrics-overlay.lyrics-fullscreen .lyrics-header,
+.lyrics-overlay.lyrics-fullscreen .lyrics-track-info,
+.lyrics-overlay.lyrics-fullscreen .lyrics-footer {
+  display: none;
+}
+
+/* Body fills entire screen */
+.lyrics-overlay.lyrics-fullscreen .lyrics-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0;
+}
+
+/* Synced lines bigger + centered in fullscreen */
+.lyrics-overlay.lyrics-fullscreen .lyrics-synced {
+  min-height: 100%;
+  padding: 80px 15vw;
+  justify-content: center;
+  text-align: center;
+  gap: 4px;
+}
+
+.lyrics-overlay.lyrics-fullscreen .lyric-line {
+  font-size: 22px;
+  line-height: 1.8;
+  padding: 8px 12px;
+  color: rgba(255,255,255,0.2);
+}
+
+.lyrics-overlay.lyrics-fullscreen .lyric-line.active {
+  color: var(--accent);
+  font-size: 26px;
+  text-shadow: 0 0 40px rgba(232,255,0,0.45);
+}
+
+.lyrics-overlay.lyrics-fullscreen .lyric-line:hover {
+  color: rgba(255,255,255,0.5);
+}
+
+/* Plain lyrics fullscreen */
+.lyrics-overlay.lyrics-fullscreen .lyrics-plain {
+  font-size: 18px;
+  line-height: 2;
+  padding: 80px 15vw;
+  text-align: center;
+  color: rgba(255,255,255,0.6);
+}
+
+/* ESC hint badge — shown in fullscreen bottom-right corner */
+.lyrics-esc-hint {
+  position: fixed;
+  bottom: 28px;
+  right: 32px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: rgba(255,255,255,0.2);
+  pointer-events: none;
+  z-index: 9999;
+  transition: opacity 0.4s;
+}
+.lyrics-esc-hint.hidden { opacity: 0; }
+
 #video-player {
   width: 100%;
   height: 100%;
@@ -1003,10 +1176,10 @@ input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider)::-webk
   justify-content: space-between;
   opacity: 0;
   transition: opacity 0.3s ease;
-  pointer-events: none;
+  pointer-events: none; /* JS controls this — never intercept clicks via CSS */
 }
 
-#video-layer:hover #video-controls,
+/* .pinned keeps controls visible while seekbar is dragged (set by JS) */
 #video-controls.pinned {
   opacity: 1;
   pointer-events: all;
@@ -3158,3 +3331,268 @@ input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider)::-webk
   35%  { opacity: 1;   transform: scale(1);    }
   100% { opacity: 0;   transform: scale(1.15); }
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   TAG EDITOR MODAL
+═══════════════════════════════════════════════════════════════ */
+
+.tag-editor-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.78);
+  backdrop-filter: blur(14px);
+  z-index: 9500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: te-fade-in 0.2s ease;
+}
+
+@keyframes te-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.te-panel {
+  width: 680px;
+  max-width: calc(100vw - 32px);
+  max-height: 90vh;
+  background: linear-gradient(180deg, #161616 0%, #0e0e0e 100%);
+  border: 1px solid var(--border-hi);
+  border-radius: 4px;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.85), 0 0 0 1px rgba(232,255,0,0.06);
+  display: flex;
+  flex-direction: column;
+  animation: te-slide-in 0.25s cubic-bezier(0.16,1,0.3,1);
+}
+
+@keyframes te-slide-in {
+  from { transform: translateY(18px) scale(0.98); opacity: 0; }
+  to   { transform: translateY(0)    scale(1);    opacity: 1; }
+}
+
+/* Header */
+.te-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.te-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.te-header-left h2 {
+  font-family: var(--font-display);
+  font-size: 18px;
+  letter-spacing: 2.5px;
+  color: var(--text-hi);
+  margin: 0;
+}
+
+.te-close-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-mid);
+  width: 28px; height: 28px;
+  border-radius: 2px;
+  cursor: pointer;
+  font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.2s;
+}
+.te-close-btn:hover {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--red-dim);
+}
+
+/* Filename sub-header */
+.te-filename {
+  padding: 8px 20px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-lo);
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+}
+
+/* Body / form */
+.te-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 20px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(232,255,0,0.18) transparent;
+}
+.te-body::-webkit-scrollbar { width: 4px; }
+.te-body::-webkit-scrollbar-thumb {
+  background: rgba(232,255,0,0.18); border-radius: 2px;
+}
+
+/* Loading / error states */
+.te-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  height: 180px;
+  color: var(--text-lo);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 2px;
+}
+
+.te-spinner {
+  width: 22px; height: 22px;
+  border: 2px solid rgba(232,255,0,0.15);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.te-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  height: 180px;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: var(--text-lo);
+  text-align: center;
+}
+.te-error small { font-size: 9px; opacity: 0.6; }
+
+/* Form grid */
+.te-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 16px;
+}
+
+.te-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+/* Column widths */
+.te-col-full    { width: 100%; }
+.te-col-half    { width: calc(50% - 8px); }
+.te-col-quarter { width: calc(25% - 12px); }
+
+.te-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--text-lo);
+  user-select: none;
+}
+
+.te-input {
+  background: var(--elevated);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--text-hi);
+  font-family: var(--font-body);
+  font-size: 12px;
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color 0.18s;
+  width: 100%;
+}
+.te-input:focus {
+  border-color: var(--border-hi);
+  background: #1e1e1e;
+}
+.te-input::placeholder { color: var(--text-lo); }
+
+.te-textarea {
+  resize: vertical;
+  min-height: 90px;
+  line-height: 1.6;
+  font-size: 12px;
+}
+
+/* Footer */
+.te-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  gap: 12px;
+}
+
+.te-status {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  color: var(--text-lo);
+  flex: 1;
+  min-width: 0;
+}
+
+.te-footer-btns {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.te-btn {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  padding: 7px 16px;
+  border-radius: 2px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  transition: all 0.18s;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.te-btn-cancel {
+  background: none;
+  color: var(--text-mid);
+}
+.te-btn-cancel:hover {
+  border-color: var(--text-mid);
+  color: var(--text-hi);
+}
+
+.te-btn-save {
+  background: var(--accent);
+  color: #000;
+  border-color: var(--accent);
+  font-weight: 700;
+}
+.te-btn-save:hover:not(:disabled) {
+  background: #fff;
+  border-color: #fff;
+  box-shadow: 0 0 16px rgba(232,255,0,0.35);
+}
+.te-btn-save:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Context menu — edit tags item */
+.ctx-edittags { color: var(--accent); }
+.ctx-edittags svg { stroke: var(--accent); }
+.ctx-edittags:hover { background: var(--accent-dim); }
