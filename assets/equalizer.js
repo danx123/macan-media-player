@@ -34,7 +34,7 @@ class Equalizer10Band {
       "Vocal":       [-2, -3, -2, 1, 4, 5, 4, 2, 0, -1]
     };
     
-    this.loadCustomPreset();
+    this.loadCustomPreset();  // no-op sync init; async Python fetch happens in initFromPython()
     this.createFilters();
   }
   
@@ -88,6 +88,13 @@ class Equalizer10Band {
       values.forEach((gain, index) => {
         this.setBandGain(index, gain);
       });
+      // Persist preset name to Python backend so it survives restarts
+      // even before AudioContext is fully initialized
+      if (typeof pywebview !== 'undefined') {
+        pywebview.api.save_eq_preset_name(presetName).catch(e =>
+          console.warn('[EQ] save_eq_preset_name failed:', e)
+        );
+      }
       return values;
     }
     return null;
@@ -111,19 +118,41 @@ class Equalizer10Band {
   
   saveCustomPreset(values) {
     this.presets["Custom"] = values;
-    localStorage.setItem('macan_eq_custom', JSON.stringify(values));
+    if (typeof pywebview !== 'undefined') {
+      pywebview.api.save_eq_custom(values).catch(e =>
+        console.warn('[EQ] save_eq_custom failed:', e)
+      );
+      pywebview.api.save_eq_preset_name("Custom").catch(e =>
+        console.warn('[EQ] save_eq_preset_name failed:', e)
+      );
+    }
   }
-  
+
   loadCustomPreset() {
-    const saved = localStorage.getItem('macan_eq_custom');
-    if (saved) {
-      try {
-        this.presets["Custom"] = JSON.parse(saved);
-      } catch (e) {
-        this.presets["Custom"] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // Sync placeholder — actual restore happens in initFromPython() after pywebview is ready
+    this.presets["Custom"] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  }
+
+  async initFromPython() {
+    // Called once by script.js after pywebview bridge is confirmed ready.
+    // Loads saved Custom preset so it survives app restarts.
+    if (typeof pywebview === 'undefined') return;
+    try {
+      const bands = await pywebview.api.get_eq_custom();
+      if (Array.isArray(bands) && bands.length === 10) {
+        this.presets["Custom"] = bands;
       }
-    } else {
-      this.presets["Custom"] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    } catch (e) {
+      console.warn('[EQ] get_eq_custom failed:', e);
+    }
+    // Also restore last used preset name (non-blocking)
+    try {
+      const lastPreset = await pywebview.api.get_eq_preset_name();
+      if (lastPreset && this.presets[lastPreset]) {
+        this._lastSavedPreset = lastPreset;
+      }
+    } catch (e) {
+      // Older Python version may not have this method yet — ignore
     }
   }
 }
