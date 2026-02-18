@@ -128,6 +128,356 @@ function initAudioContext() {
   }
 }
 
+
+// ═══════════════════════════════════════════════════════════════
+// SMTC — System Media Transport Controls
+// Uses the W3C Media Session API (navigator.mediaSession).
+//
+// EdgeWebView2 requires these Chromium flags to be set BEFORE start:
+//   --enable-features=HardwareMediaKeyHandling,MediaSessionService
+// This is done in main.py via WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS.
+//
+// Cover art: EdgeWebView2 rejects data: URLs in MediaMetadata.artwork.
+// Fix: convert data: → blob: URL via fetch()+URL.createObjectURL().
+// Blob URLs are revoked and recreated each track change to avoid leaks.
+// ═══════════════════════════════════════════════════════════════
+
+let _smtcArtBlobUrl = null; // current blob: URL for cover art (revoked on next update)
+
+async function _dataUrlToBlobUrl(dataUrl) {
+  // Convert base64 data: URL → blob: URL (accepted by mediaSession artwork)
+  try {
+    const res  = await fetch(dataUrl);
+    const blob = await res.blob();
+    return URL.createObjectURL(blob);
+  } catch (e) {
+    console.warn('[SMTC] blob conversion failed:', e.message);
+    return null;
+  }
+}
+
+function _detectMime(dataUrl) {
+  // Extract mime type from data URL header e.g. "data:image/png;base64,..."
+  const m = dataUrl && dataUrl.match(/^data:([^;]+);/);
+  return m ? m[1] : 'image/jpeg';
+}
+
+async function updateMediaSession(track, artSrc) {
+  if (!('mediaSession' in navigator)) return;
+
+  const title  = track.name   || '—';
+  const artist = track.artist || 'Macan Media Player';
+  const album  = track.album  || track.ext || 'MACAN';
+
+  // Revoke previous blob URL to avoid memory leak
+  if (_smtcArtBlobUrl) {
+    URL.revokeObjectURL(_smtcArtBlobUrl);
+    _smtcArtBlobUrl = null;
+  }
+
+  let artwork = [];
+  if (artSrc) {
+    if (artSrc.startsWith('data:')) {
+      // Convert data: → blob: because EdgeWebView2 rejects data: in artwork
+      const mime    = _detectMime(artSrc);
+      const blobUrl = await _dataUrlToBlobUrl(artSrc);
+      if (blobUrl) {
+        _smtcArtBlobUrl = blobUrl;
+        artwork = [
+          { src: blobUrl, sizes: '512x512', type: mime },
+          { src: blobUrl, sizes: '256x256', type: mime },
+        ];
+      }
+    } else if (artSrc.startsWith('http') || artSrc.startsWith('blob:')) {
+      // Already a usable URL
+      artwork = [
+        { src: artSrc, sizes: '512x512', type: 'image/jpeg' },
+        { src: artSrc, sizes: '256x256', type: 'image/jpeg' },
+      ];
+    }
+  }
+
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({ title, artist, album, artwork });
+    navigator.mediaSession.playbackState = S.isPlaying ? 'playing' : 'paused';
+    console.log(`[SMTC] Updated: ${artist} — ${title} | art=${artwork.length > 0}`);
+  } catch (e) {
+    console.warn('[SMTC] MediaMetadata error:', e.message);
+  }
+}
+
+function syncMediaSessionState() {
+  if (!('mediaSession' in navigator)) return;
+
+  navigator.mediaSession.playbackState = S.isPlaying ? 'playing' : 'paused';
+
+  if (S.duration > 0 && Number.isFinite(S.duration)) {
+    try {
+      navigator.mediaSession.setPositionState({
+        duration:     S.duration,
+        playbackRate: activePlayer().playbackRate || 1,
+        position:     Math.min(activePlayer().currentTime, S.duration),
+      });
+    } catch (e) { /* setPositionState not supported on all builds */ }
+  }
+}
+
+function initMediaSessionHandlers() {
+  if (!('mediaSession' in navigator)) {
+    console.warn('[SMTC] navigator.mediaSession not available');
+    return;
+  }
+
+  const handlers = {
+    'play':          () => { if (activePlayer().paused) doPlay(activePlayer()); },
+    'pause':         () => { if (!activePlayer().paused) activePlayer().pause(); },
+    'previoustrack': () => prevTrack(),
+    'nexttrack':     () => nextTrack(),
+    'seekto':        details => {
+      if (details.seekTime !== undefined && S.duration > 0) {
+        activePlayer().currentTime = Math.min(details.seekTime, S.duration);
+        syncMediaSessionState();
+      }
+    },
+    'seekbackward':  details => {
+      activePlayer().currentTime = Math.max(0, activePlayer().currentTime - (details.seekOffset || 10));
+      syncMediaSessionState();
+    },
+    'seekforward':   details => {
+      activePlayer().currentTime = Math.min(S.duration, activePlayer().currentTime + (details.seekOffset || 10));
+      syncMediaSessionState();
+    },
+  };
+
+  for (const [action, handler] of Object.entries(handlers)) {
+    try {
+      navigator.mediaSession.setActionHandler(action, handler);
+    } catch (e) {
+      // Some actions may not be supported in this WebView build
+      console.warn(`[SMTC] Handler not supported: ${action}`);
+    }
+  }
+
+  console.log('[SMTC] Media Session handlers registered');
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// MINI PLAYER — Floating draggable/resizable PiP video overlay
+// ═══════════════════════════════════════════════════════════════
+
+const MiniPlayer = (() => {
+  let active  = false;
+  let mpEl    = null;
+  let mpVideo = null;
+
+  // Drag state
+  let dragging = false, dragStartX = 0, dragStartY = 0, elStartX = 0, elStartY = 0;
+  // Resize state
+  let resizing = false, resStartX = 0, resStartW = 0, resStartH = 0;
+
+  const MARGIN   = 12;
+  const MIN_W    = 240;
+  const MIN_H    = 135;
+  const DEFAULT_W = 320;
+  const DEFAULT_H = 180;
+
+  function init() {
+    mpEl    = document.getElementById('mini-player');
+    mpVideo = document.getElementById('mp-video');
+    if (!mpEl || !mpVideo) return;
+
+    // Wire buttons
+    document.getElementById('mp-play').onclick   = () => togglePlayPause();
+    document.getElementById('mp-prev').onclick   = () => prevTrack();
+    document.getElementById('mp-next').onclick   = () => nextTrack();
+    document.getElementById('mp-expand').onclick = () => expandBack();
+    document.getElementById('mp-close').onclick  = () => closeFromMini();
+
+    // Drag via handle
+    const handle = document.getElementById('mp-drag-handle');
+    handle.addEventListener('mousedown', startDrag);
+    document.addEventListener('mousemove', onDrag);
+    document.addEventListener('mouseup',   stopDrag);
+
+    // Resize via bottom-right handle
+    const rh = document.getElementById('mp-resize-handle');
+    rh.addEventListener('mousedown', startResize);
+    document.addEventListener('mousemove', onResize);
+    document.addEventListener('mouseup',   stopResize);
+
+    // Position — bottom-right by default
+    resetPosition();
+  }
+
+  function resetPosition() {
+    if (!mpEl) return;
+    mpEl.style.width  = DEFAULT_W + 'px';
+    mpEl.style.height = DEFAULT_H + 'px';
+    mpEl.style.right  = MARGIN + 'px';
+    mpEl.style.bottom = MARGIN + 'px';
+    mpEl.style.left   = '';
+    mpEl.style.top    = '';
+  }
+
+  // ── DRAG ──────────────────────────────────────────────────────
+  function startDrag(e) {
+    e.preventDefault();
+    dragging  = true;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    const rect = mpEl.getBoundingClientRect();
+    elStartX   = rect.left;
+    elStartY   = rect.top;
+    mpEl.style.right  = '';
+    mpEl.style.bottom = '';
+  }
+  function onDrag(e) {
+    if (!dragging) return;
+    const dx  = e.clientX - dragStartX;
+    const dy  = e.clientY - dragStartY;
+    const vw  = window.innerWidth;
+    const vh  = window.innerHeight;
+    const w   = mpEl.offsetWidth;
+    const h   = mpEl.offsetHeight;
+    const newX = Math.max(MARGIN, Math.min(vw - w - MARGIN, elStartX + dx));
+    const newY = Math.max(MARGIN, Math.min(vh - h - MARGIN, elStartY + dy));
+    mpEl.style.left = newX + 'px';
+    mpEl.style.top  = newY + 'px';
+  }
+  function stopDrag()   { dragging = false; }
+
+  // ── RESIZE ────────────────────────────────────────────────────
+  function startResize(e) {
+    e.preventDefault();
+    resizing  = true;
+    resStartX = e.clientX;
+    resStartW = mpEl.offsetWidth;
+    resStartH = mpEl.offsetHeight;
+  }
+  function onResize(e) {
+    if (!resizing) return;
+    const dx  = e.clientX - resStartX;
+    const newW = Math.max(MIN_W, resStartW + dx);
+    const newH = Math.round(newW * (9/16)); // maintain 16:9
+    mpEl.style.width  = newW + 'px';
+    mpEl.style.height = Math.max(MIN_H, newH) + 'px';
+  }
+  function stopResize() { resizing = false; }
+
+  // ── OPEN / CLOSE ──────────────────────────────────────────────
+  function open() {
+    if (!mpEl || !mpVideo) return;
+    if (active) return; // already open
+
+    const mainVideo = document.getElementById('video-player');
+    if (!mainVideo || !mainVideo.src) return;
+
+    active = true;
+
+    // Hide fullscreen video layer, show mini player
+    videoLayer.classList.remove('active');
+    document.getElementById('main-layout').style.display = '';
+
+    // Mirror the video src and time to mpVideo
+    mpVideo.src          = mainVideo.src;
+    mpVideo.currentTime  = mainVideo.currentTime;
+    mpVideo.volume       = mainVideo.volume;
+    mpVideo.muted        = mainVideo.muted;
+    mpVideo.playbackRate = mainVideo.playbackRate;
+
+    // Pause the main video — mpVideo takes over output
+    mainVideo.pause();
+    mainVideo.muted = true;  // silence but keep src for expand-back
+
+    resetPosition();
+    mpEl.style.display = 'flex';
+
+    if (!S.isPlaying) {
+      mpVideo.pause();
+    } else {
+      mpVideo.play().catch(() => {});
+    }
+
+    updateMiniInfo();
+    syncMiniPlayState(S.isPlaying);
+    console.log('[MACAN] Mini player opened');
+  }
+
+  function expandBack() {
+    if (!mpEl || !active) return;
+
+    const mainVideo = document.getElementById('video-player');
+    if (mainVideo) {
+      // Sync position back from mpVideo
+      mainVideo.currentTime = mpVideo.currentTime;
+      mainVideo.muted       = false;
+      if (!mpVideo.paused) {
+        mainVideo.play().catch(() => {});
+      }
+    }
+
+    mpVideo.pause();
+    mpVideo.src = '';
+    mpEl.style.display = 'none';
+    active = false;
+
+    // Restore fullscreen video layer
+    videoLayer.classList.add('active');
+    document.getElementById('main-layout').style.display = 'none';
+    console.log('[MACAN] Mini player expanded back');
+  }
+
+  function closeFromMini() {
+    if (!mpEl) return;
+
+    // Stop everything
+    mpVideo.pause();
+    mpVideo.src = '';
+
+    const mainVideo = document.getElementById('video-player');
+    if (mainVideo) { mainVideo.muted = false; mainVideo.pause(); mainVideo.src = ''; }
+
+    mpEl.style.display = 'none';
+    active = false;
+
+    // Return to main layout (not fullscreen)
+    videoLayer.classList.remove('active');
+    document.getElementById('main-layout').style.display = '';
+    onPlayState(false);
+    setStatus('VIDEO CLOSED');
+  }
+
+  function updateMiniInfo() {
+    const titleEl = document.getElementById('mp-title');
+    if (titleEl && S.currentIndex >= 0 && S.playlist[S.currentIndex]) {
+      titleEl.textContent = S.playlist[S.currentIndex].name;
+    }
+  }
+
+  function syncMiniPlayState(playing) {
+    const pi = document.getElementById('mp-icon-play');
+    const pa = document.getElementById('mp-icon-pause');
+    if (pi) pi.style.display = playing ? 'none'  : 'block';
+    if (pa) pa.style.display = playing ? 'block' : 'none';
+    if (active && mpVideo) {
+      if (playing && mpVideo.paused)  mpVideo.play().catch(() => {});
+      if (!playing && !mpVideo.paused) mpVideo.pause();
+    }
+  }
+
+  function syncMiniVolume(vol) {
+    if (mpVideo) {
+      mpVideo.volume = vol / 100;
+      mpVideo.muted  = S.isMuted;
+    }
+  }
+
+  function isActive() { return active; }
+
+  return { init, open, expandBack, closeFromMini, updateMiniInfo, syncMiniPlayState, syncMiniVolume, isActive };
+})();
+
 // ─── DOM ──────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 const audio         = $('audio-player');
@@ -516,12 +866,19 @@ window.addEventListener('load', () => {
   vcVolSlider.oninput        = e => setVolume(+e.target.value);
 
   // Video overlay buttons
-  $('vc-play').onclick    = togglePlayPause;
-  $('vc-prev').onclick    = prevTrack;
-  $('vc-next').onclick    = nextTrack;
-  $('vc-close').onclick   = closeVideo;
-  $('vc-mute').onclick    = toggleMute;
-  $('vc-fullscreen').onclick = () => pw() && pywebview.api.toggle_fullscreen();
+  $('vc-play').onclick        = togglePlayPause;
+  $('vc-prev').onclick        = prevTrack;
+  $('vc-next').onclick        = nextTrack;
+  $('vc-close').onclick       = closeVideo;
+  $('vc-mute').onclick        = toggleMute;
+  $('vc-fullscreen').onclick  = () => pw() && pywebview.api.toggle_fullscreen();
+  $('vc-miniplayer').onclick  = () => MiniPlayer.open();
+
+  // Init mini player drag/resize/controls
+  MiniPlayer.init();
+
+  // Init SMTC (Media Session API) handlers
+  initMediaSessionHandlers();
 
   // ─── STATE RESTORE ──────────────────────────────────────────
   // FIX: Use event-driven readiness instead of a fragile setTimeout.
@@ -972,13 +1329,44 @@ function setupAudioEvents() {
   audio.addEventListener('canplay',       () => console.log('[MACAN] Audio: canplay fired'));
   audio.addEventListener('error', e => {
     const err = audio.error;
-    if (!err) return; // Ignore if no error (e.g., src cleared)
+    if (!err) return;
+    // Suppress spurious "Empty src" errors fired when src is cleared intentionally
+    if (!audio.src || audio.src === window.location.href) return;
+    if (err.message && err.message.toLowerCase().includes('empty')) return;
     const codes = {1:'ABORTED',2:'NETWORK',3:'DECODE ERROR',4:'FORMAT NOT SUPPORTED'};
     const msg = codes[err.code] || `UNKNOWN (${err.code})`;
-    console.error('[MACAN] Audio error:', err.code, err.message);
-    setStatus(`AUDIO ERROR — ${msg}: ${err.message || ''}`);
+    console.warn('[MACAN] Audio error:', err.code, err.message);
+    setStatus(`AUDIO ERROR — ${msg}`);
     onPlayState(false);
   });
+}
+
+
+// ─── VIDEO CLICK FEEDBACK ─────────────────────────────────────
+// Shows a brief centered play/pause icon flash when user clicks the video.
+let _vcFeedbackTimer = null;
+function showVideoClickFeedback(state) {
+  let el = document.getElementById('vc-click-feedback');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'vc-click-feedback';
+    videoLayer.appendChild(el);
+  }
+
+  // Reset animation by removing and re-adding class
+  el.className = '';
+  el.innerHTML = state === 'play'
+    ? '<svg width="52" height="52" viewBox="0 0 24 24" fill="white"><polygon points="5,3 19,12 5,21"/></svg>'
+    : '<svg width="52" height="52" viewBox="0 0 24 24" fill="white"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>';
+
+  clearTimeout(_vcFeedbackTimer);
+  // Force reflow so animation restarts cleanly
+  void el.offsetWidth;
+  el.className = 'vc-click-feedback-show';
+
+  _vcFeedbackTimer = setTimeout(() => {
+    el.className = '';
+  }, 600);
 }
 
 function setupVideoEvents() {
@@ -991,10 +1379,13 @@ function setupVideoEvents() {
   video.addEventListener('error', e => {
     const err = video.error;
     if (!err) return;
+    // Suppress spurious "Empty src" errors fired when src is cleared intentionally
+    if (!video.src || video.src === window.location.href) return;
+    if (err.message && err.message.toLowerCase().includes('empty')) return;
     const codes = {1:'ABORTED',2:'NETWORK',3:'DECODE ERROR',4:'FORMAT NOT SUPPORTED'};
     const msg = codes[err.code] || `UNKNOWN (${err.code})`;
-    console.error('[MACAN] Video error:', err.code, err.message);
-    setStatus(`VIDEO ERROR — ${msg}: ${err.message || ''}`);
+    console.warn('[MACAN] Video error:', err.code, err.message);
+    setStatus(`VIDEO ERROR — ${msg}`);
     onPlayState(false);
   });
 }
@@ -1164,15 +1555,22 @@ function setupVideoControls() {
     if (!S.vcSeekDragging) hideVcControls();
   });
 
-  // FIX: Guard both click handlers — if a context menu is open, clicks
-  // on its items should not also trigger play/pause via event bubbling.
-  video.addEventListener('dblclick', e => {
-    if (document.getElementById('macan-ctx-menu')) return;
-    togglePlayPause();
-  });
+  // Click on video area → play/pause with visual feedback.
+  // Use a short timer to distinguish single-click from double-click,
+  // so double-clicking doesn't accidentally trigger play/pause twice.
+  let _clickTimer = null;
   video.addEventListener('click', e => {
     if (document.getElementById('macan-ctx-menu')) return;
-    togglePlayPause();
+    clearTimeout(_clickTimer);
+    const wasPaused = video.paused;
+    _clickTimer = setTimeout(() => {
+      togglePlayPause();
+      showVideoClickFeedback(wasPaused ? 'play' : 'pause');
+    }, 200);
+  });
+  video.addEventListener('dblclick', e => {
+    // Cancel the single-click timer so play/pause isn't triggered on dblclick
+    clearTimeout(_clickTimer);
   });
 }
 
@@ -1215,6 +1613,9 @@ async function loadTrack(index, autoplay = true) {
   updateTrackInfo(track);
   updatePlaylistHighlight(index);
   setStatus(`LOADING — ${track.name}`);
+
+  // Update mini player title if it's currently showing
+  if (MiniPlayer.isActive()) MiniPlayer.updateMiniInfo();
 
   // Apply ReplayGain normalization gain
   applyNormalization(track);
@@ -1394,6 +1795,9 @@ function updateTrackInfo(track) {
   if (S.lyricsOpen && !track.is_video) {
     fetchLyrics(track);
   }
+
+  // Update SMTC immediately with known info (art will follow via applyArt)
+  updateMediaSession(track, track.cover_art || null);
 }
 
 function applyArt(src) {
@@ -1411,6 +1815,9 @@ function applyArt(src) {
     const wasNew = !track.cover_art;
     track.cover_art = src;
     thumbCache.set(track.path, src);
+
+    // Update SMTC with newly received cover art
+    updateMediaSession(track, src);
     // FIX: placeholder is a <div class="pl-thumb-placeholder">, not an img
     const activeItem = playlistList.querySelector(`.pl-item[data-index="${S.currentIndex}"]`);
     if (activeItem) {
@@ -1438,6 +1845,12 @@ function onPlayState(playing) {
   const npp = document.getElementById('now-playing-panel');
   if (playing) npp.classList.add('playing');
   else         npp.classList.remove('playing');
+
+  // Sync SMTC play state
+  syncMediaSessionState();
+
+  // Sync mini player play state
+  MiniPlayer.syncMiniPlayState(playing);
 }
 
 // ─── METADATA / TIME ──────────────────────────────────────────
@@ -1503,6 +1916,12 @@ function onTimeUpdate() {
       S._lastStateSaveWallMs = now;
       scheduleStateSave();
     }
+  }
+
+  // Sync SMTC position (throttled via ~1s wall-clock)
+  if (!S._smtcSyncMs || now - S._smtcSyncMs > 1000) {
+    S._smtcSyncMs = now;
+    syncMediaSessionState();
   }
 }
 
@@ -1629,6 +2048,9 @@ function syncVcVolume(val) {
   vcVolSlider.value = val;
   vcVolSlider.style.background =
     `linear-gradient(90deg, var(--accent) ${val}%, rgba(255,255,255,0.2) ${val}%)`;
+
+  // Sync mini player volume
+  MiniPlayer.syncMiniVolume(val);
 }
 
 function toggleMute() {
@@ -1641,6 +2063,11 @@ function toggleMute() {
 }
 
 function closeVideo() {
+  // If mini player is active, close it fully
+  if (MiniPlayer.isActive()) {
+    MiniPlayer.closeFromMini();
+    return;
+  }
   video.pause(); video.src = '';
   videoLayer.classList.remove('active');
   $('main-layout').style.display = '';
@@ -2108,6 +2535,16 @@ function updatePlaylistMeta() {
 // ─── KEYBOARD SHORTCUTS ───────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (document.activeElement === $('search-input')) return;
+
+  // ESC: exit video fullscreen (or mini player)
+  if (e.code === 'Escape') {
+    if (videoLayer.classList.contains('active')) {
+      e.preventDefault();
+      closeVideo();
+    }
+    return;
+  }
+
   const p = activePlayer();
   switch(e.code) {
     case 'Space':      e.preventDefault(); togglePlayPause(); break;
