@@ -1913,6 +1913,21 @@ input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider)::-webk
   letter-spacing: 0.3px;
 }
 
+.pm-item-badge {
+  display: inline-block;
+  font-family: 'Space Mono', monospace;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(232, 255, 0, 0.12);
+  color: var(--accent);
+  border: 1px solid rgba(232, 255, 0, 0.25);
+  margin-left: 5px;
+  vertical-align: middle;
+}
+
 .pm-item-actions {
   display: flex;
   gap: 6px;
