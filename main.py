@@ -34,6 +34,22 @@ if hasattr(webview, 'settings'):
 
 GUI_BACKEND = 'edgechromium' if sys.platform == 'win32' else 'qt'
 
+# ── EdgeWebView2: enable SMTC / Media Session API ────────────────────────────
+# Without these flags, navigator.mediaSession exists but is silently ignored —
+# the OS overlay, taskbar thumbnail, and hardware media keys won't respond.
+# Must be set before webview.start() is called (env var is read at process start).
+if sys.platform == 'win32':
+    _wv2_flags = ' '.join([
+        '--enable-features=HardwareMediaKeyHandling,MediaSessionService',
+        '--autoplay-policy=no-user-gesture-required',
+    ])
+    _existing = os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', '')
+    if '--enable-features=HardwareMediaKeyHandling' not in _existing:
+        os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = (
+            (_existing + ' ' + _wv2_flags).strip()
+        )
+
+
 
 # ─── LOCAL MEDIA HTTP SERVER ──────────────────────────────────────────────────
 # EdgeWebView2 on Windows blocks <audio>/<video> with file:// src (CORS).
@@ -886,7 +902,8 @@ class MacanMediaAPI:
     # ─── LYRICS ───────────────────────────────────────────────────────────────
 
     def get_lyrics(self, path, artist, title, duration=None):
-        """Get lyrics for a track. Checks DB first, then fetches online.
+        """Get lyrics for a track.
+        Priority: 1) Local .lrc file → 2) Local DB → 3) Online fetch
         Returns {content, is_synced} or None."""
         # Normalise inputs — use tag data as fallback
         if not artist or not title:
@@ -895,17 +912,48 @@ class MacanMediaAPI:
             artist = artist or meta.get('artist') or ''
             title  = title  or meta.get('title')  or p.stem
 
+        # 1. Local .lrc file — same folder, same stem as the audio file
+        #    e.g. /music/song.mp3 → /music/song.lrc
+        try:
+            lrc_path = Path(path).with_suffix('.lrc')
+            if lrc_path.exists():
+                lrc_text = lrc_path.read_text(encoding='utf-8', errors='replace').strip()
+                if lrc_text:
+                    print(f"[Lyrics] Found local .lrc: {lrc_path.name}")
+                    # Detect if it has timestamp tags → synced
+                    import re as _re
+                    is_synced = bool(_re.search(r'\[\d+:\d+', lrc_text))
+                    # Save to DB so future lookups skip disk read
+                    if artist and title:
+                        self._lyric_cache.save(artist, title, lrc_text, is_synced)
+                    return {"content": lrc_text, "is_synced": is_synced}
+        except Exception as e:
+            print(f"[Lyrics] .lrc read error: {e}")
+
         if not artist or not title:
             return None
 
-        # 1. Local DB
+        # 2. Local DB
         cached = self._lyric_cache.get(artist, title)
         if cached:
             return cached
 
-        # 2. Online fetch (synchronous — called from JS, runs in thread)
+        # 3. Online fetch (synchronous — called from JS, runs in thread)
         result = self._lyric_cache.fetch_online(artist, title, duration)
         return result
+
+
+    def get_cover_art_blob(self, path):
+        """Return cover art as base64 PNG for use with navigator.mediaSession.
+        Falls back to None if no art is available."""
+        # Reuse the existing art cache logic
+        try:
+            art = self._art_cache.get_art(path)
+            if art:
+                return art  # already base64 data-url
+        except Exception:
+            pass
+        return None
 
     def _get_duration(self, path):
         """Fallback duration reader using mutagen for any file type."""
