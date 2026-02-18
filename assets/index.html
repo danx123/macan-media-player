@@ -84,8 +84,11 @@
       </div>
     </div>
 
-    <!-- MINI WAVEFORM -->
-    <div id="mini-vis"><canvas id="mini-canvas" width="320" height="44"></canvas></div>
+    <!-- MINI WAVEFORM VISUALIZER -->
+    <div id="mini-vis" title="Click to change visualizer style">
+      <canvas id="mini-canvas" width="320" height="44"></canvas>
+      <div id="vis-mode-label"></div>
+    </div>
 
     <!-- SEEKBAR -->
     <div id="progress-container">
@@ -257,6 +260,14 @@
 <div id="video-layer">
   <video id="video-player" preload="auto"></video>
 
+  <!-- Center play/pause overlay button (YouTube-style) -->
+  <div id="video-center-overlay" title="Click to play/pause">
+    <button id="video-center-btn" class="video-center-playpause">
+      <svg id="vcenter-icon-play" width="48" height="48" viewBox="0 0 24 24" fill="white"><polygon points="5,3 19,12 5,21"/></svg>
+      <svg id="vcenter-icon-pause" width="48" height="48" viewBox="0 0 24 24" fill="white" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+    </button>
+  </div>
+
   <!-- YouTube-style overlay controls (autohide) -->
   <div id="video-controls">
     <!-- top gradient -->
@@ -342,6 +353,7 @@
         <h2>LYRICS</h2>
         <span id="lyrics-sync-badge" class="lyrics-badge" style="display:none">SYNCED</span>
       </div>
+      <button class="lyrics-fs-btn" id="lyrics-fullscreen">FULLSCREEN MODE</button>
       <button class="lyrics-close-btn" id="lyrics-close">✕</button>
     </div>
     <div class="lyrics-track-info">
