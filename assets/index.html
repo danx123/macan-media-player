@@ -320,6 +320,12 @@
             <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
           </svg>
         </button>
+        <button class="vc-btn" id="vc-miniplayer" title="Mini Player">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="3" width="20" height="14" rx="2"/>
+            <rect x="12" y="11" width="8" height="6" rx="1" fill="currentColor" stroke="none" opacity="0.85"/>
+          </svg>
+        </button>
       </div>
     </div>
   </div>
@@ -539,6 +545,46 @@
 
 <!-- hidden file input for M3U -->
 <input type="file" id="tv-m3u-file-input" accept=".m3u,.m3u8" style="display:none">
+
+
+<!-- ═══════════ MINI PLAYER (floating draggable video overlay) ═ -->
+<div id="mini-player" class="mini-player" style="display:none">
+  <div class="mp-drag-handle" id="mp-drag-handle"></div>
+  <video id="mp-video" class="mp-video"></video>
+  <div class="mp-controls">
+    <div class="mp-info">
+      <div class="mp-title" id="mp-title">—</div>
+    </div>
+    <div class="mp-btn-row">
+      <button class="mp-btn" id="mp-prev" title="Previous">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+          <polygon points="19,20 9,12 19,4"/><rect x="5" y="4" width="2" height="16"/>
+        </svg>
+      </button>
+      <button class="mp-btn mp-play-btn" id="mp-play" title="Play/Pause">
+        <svg id="mp-icon-play" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+        <svg id="mp-icon-pause" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+      </button>
+      <button class="mp-btn" id="mp-next" title="Next">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+          <polygon points="5,4 15,12 5,20"/><rect x="17" y="4" width="2" height="16"/>
+        </svg>
+      </button>
+      <button class="mp-btn mp-expand" id="mp-expand" title="Expand to fullscreen">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/>
+          <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
+        </svg>
+      </button>
+      <button class="mp-btn mp-close" id="mp-close" title="Close video">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+  <div class="mp-resize-handle" id="mp-resize-handle"></div>
+</div>
 
 <!-- ═══════════ SCRIPTS ═══════════════════════════════════ -->
 <script src="equalizer.js"></script>
