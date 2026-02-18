@@ -7,7 +7,9 @@ A sleek, fullscreen desktop media player built with Python and pywebview. Macan 
 ## Screenshot
 <img width="1365" height="767" alt="Screenshot 2026-02-18 044554" src="https://github.com/user-attachments/assets/b2ba464c-e1de-4c67-92b0-6b1e1bed0483" />
 <img width="1365" height="767" alt="Screenshot 2026-02-18 044825" src="https://github.com/user-attachments/assets/10399916-24fb-42da-971d-f39da5c141f6" />
-<img width="1365" height="767" alt="Screenshot 2026-02-18 170728" src="https://github.com/user-attachments/assets/37dd3819-87de-46f0-a447-59831c1d714b" />
+<img width="1365" height="767" alt="Screenshot 2026-02-18 201753" src="https://github.com/user-attachments/assets/67db6512-698e-4fb5-b01a-e088504fbcf9" />
+
+
 
 
 
