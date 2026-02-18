@@ -3002,3 +3002,159 @@ input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider)::-webk
   border-top: 1px solid rgba(255,255,255,0.04);
   flex-shrink: 0;
 }
+/* ═══════════════════════════════════════════════════════════════
+   MINI PLAYER — Floating draggable/resizable video overlay
+   ═══════════════════════════════════════════════════════════════ */
+
+.mini-player {
+  position: fixed;
+  z-index: 9000;
+  width: 320px;
+  height: 220px;            /* video + controls strip */
+  bottom: 16px;
+  right: 16px;
+  background: #0a0a0a;
+  border: 1px solid rgba(232,255,0,0.20);
+  border-radius: 6px;
+  box-shadow: 0 8px 40px rgba(0,0,0,0.85), 0 0 0 1px rgba(232,255,0,0.05);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: box-shadow 0.2s;
+  user-select: none;
+}
+.mini-player:hover {
+  box-shadow: 0 12px 50px rgba(0,0,0,0.9), 0 0 0 1px rgba(232,255,0,0.18);
+}
+
+/* Invisible drag strip at top */
+.mp-drag-handle {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 30px;
+  cursor: grab;
+  z-index: 10;
+}
+.mp-drag-handle:active { cursor: grabbing; }
+
+/* The video itself */
+.mp-video {
+  width: 100%;
+  flex: 1;
+  object-fit: contain;
+  background: #000;
+  display: block;
+  min-height: 0;
+}
+
+/* Controls strip */
+.mp-controls {
+  flex-shrink: 0;
+  background: rgba(4,4,4,0.97);
+  border-top: 1px solid rgba(255,255,255,0.06);
+  padding: 5px 8px 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mp-info {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.mp-title {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-hi);
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mp-btn-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.mp-btn {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.5);
+  cursor: pointer;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  transition: color 0.12s, background 0.12s;
+  flex-shrink: 0;
+}
+.mp-btn:hover {
+  color: var(--text-hi);
+  background: rgba(255,255,255,0.08);
+}
+.mp-play-btn {
+  background: rgba(232,255,0,0.10);
+  color: var(--accent);
+  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+}
+.mp-play-btn:hover {
+  background: rgba(232,255,0,0.22);
+  color: var(--accent);
+}
+.mp-expand:hover { color: var(--accent); }
+.mp-close:hover  { color: var(--red, #ff2d55); }
+
+/* Resize grip — bottom-right corner */
+.mp-resize-handle {
+  position: absolute;
+  bottom: 0; right: 0;
+  width: 18px; height: 18px;
+  cursor: se-resize;
+  z-index: 20;
+  background: linear-gradient(135deg,
+    transparent 30%,
+    rgba(232,255,0,0.30) 30%, rgba(232,255,0,0.30) 42%,
+    transparent 42% 57%,
+    rgba(232,255,0,0.30) 57%, rgba(232,255,0,0.30) 68%,
+    transparent 68%
+  );
+}
+
+/* Mini player button in video controls */
+#vc-miniplayer { margin-left: 2px; }
+
+/* ── Video click play/pause feedback ── */
+#vc-click-feedback {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  width: 88px;
+  height: 88px;
+  margin-top: -44px;
+  margin-left: -44px;
+  background: rgba(0, 0, 0, 0.50);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  opacity: 0;
+  z-index: 9999;
+  will-change: opacity, transform;
+}
+
+#vc-click-feedback.vc-click-feedback-show {
+  animation: vc-feedback-pop 0.55s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+@keyframes vc-feedback-pop {
+  0%   { opacity: 0;   transform: scale(0.65); }
+  18%  { opacity: 1;   transform: scale(1.05); }
+  35%  { opacity: 1;   transform: scale(1);    }
+  100% { opacity: 0;   transform: scale(1.15); }
+}
