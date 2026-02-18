@@ -641,6 +641,256 @@ class MacanMediaAPI:
             print(f"[MACAN] get_file_info error: {e}")
             return None
 
+    # ─── TAG EDITOR ───────────────────────────────────────────────────────────
+
+    def get_tags(self, path):
+        """Read all editable tags from an audio file.
+        Returns dict: {title, artist, album, albumartist, tracknumber, discnumber,
+                       date, genre, comment, composer, lyrics} or None on error."""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return None
+            ext = p.suffix.lower()
+            if ext in {'.mp4', '.mkv', '.avi', '.webm', '.mov', '.wmv'}:
+                return None  # video — no tag editing
+
+            tags = {
+                "title": "", "artist": "", "album": "", "albumartist": "",
+                "tracknumber": "", "discnumber": "", "date": "", "genre": "",
+                "comment": "", "composer": "", "lyrics": ""
+            }
+
+            def _first(val):
+                """Return first string value from a mutagen list/str."""
+                if val is None:
+                    return ""
+                if isinstance(val, (list, tuple)):
+                    return str(val[0]).strip() if val else ""
+                return str(val).strip()
+
+            if ext == '.mp3':
+                try:
+                    audio = ID3(path)
+                except Exception:
+                    audio = None
+                if audio:
+                    tags["title"]       = _first(audio.get("TIT2"))
+                    tags["artist"]      = _first(audio.get("TPE1"))
+                    tags["album"]       = _first(audio.get("TALB"))
+                    tags["albumartist"] = _first(audio.get("TPE2"))
+                    tags["tracknumber"] = _first(audio.get("TRCK"))
+                    tags["discnumber"]  = _first(audio.get("TPOS"))
+                    tags["date"]        = _first(audio.get("TDRC"))
+                    tags["genre"]       = _first(audio.get("TCON"))
+                    tags["composer"]    = _first(audio.get("TCOM"))
+                    # Comment
+                    for tag in audio.values():
+                        if tag.FrameID == "COMM":
+                            tags["comment"] = _first(getattr(tag, "text", ""))
+                            break
+                    # Lyrics (unsynchronized)
+                    for tag in audio.values():
+                        if tag.FrameID == "USLT":
+                            tags["lyrics"] = getattr(tag, "text", "")
+                            break
+
+            elif ext == '.flac':
+                audio = FLAC(path)
+                tags["title"]       = _first(audio.get("title"))
+                tags["artist"]      = _first(audio.get("artist"))
+                tags["album"]       = _first(audio.get("album"))
+                tags["albumartist"] = _first(audio.get("albumartist"))
+                tags["tracknumber"] = _first(audio.get("tracknumber"))
+                tags["discnumber"]  = _first(audio.get("discnumber"))
+                tags["date"]        = _first(audio.get("date"))
+                tags["genre"]       = _first(audio.get("genre"))
+                tags["comment"]     = _first(audio.get("comment"))
+                tags["composer"]    = _first(audio.get("composer"))
+                tags["lyrics"]      = _first(audio.get("lyrics"))
+
+            elif ext in ('.m4a', '.aac'):
+                audio = MP4(path)
+                def _mp4(key):
+                    v = audio.tags.get(key) if audio.tags else None
+                    return _first(v)
+                tags["title"]       = _mp4("\xa9nam")
+                tags["artist"]      = _mp4("\xa9ART")
+                tags["album"]       = _mp4("\xa9alb")
+                tags["albumartist"] = _mp4("aART")
+                tags["date"]        = _mp4("\xa9day")
+                tags["genre"]       = _mp4("\xa9gen")
+                tags["comment"]     = _mp4("\xa9cmt")
+                tags["composer"]    = _mp4("\xa9wrt")
+                tags["lyrics"]      = _mp4("\xa9lyr")
+                # Track number: MP4 stores as (number, total) tuple
+                trk = audio.tags.get("trkn") if audio.tags else None
+                if trk and isinstance(trk[0], (tuple, list)):
+                    n, t = trk[0][0], trk[0][1]
+                    tags["tracknumber"] = f"{n}/{t}" if t else str(n)
+                disk = audio.tags.get("disk") if audio.tags else None
+                if disk and isinstance(disk[0], (tuple, list)):
+                    n, t = disk[0][0], disk[0][1]
+                    tags["discnumber"] = f"{n}/{t}" if t else str(n)
+
+            else:
+                # Generic via mutagen easy tags (OGG, OPUS, WMA, WAV, etc.)
+                audio = mutagen.File(path, easy=True)
+                if audio is not None:
+                    tags["title"]       = _first(audio.get("title"))
+                    tags["artist"]      = _first(audio.get("artist"))
+                    tags["album"]       = _first(audio.get("album"))
+                    tags["albumartist"] = _first(audio.get("albumartist"))
+                    tags["tracknumber"] = _first(audio.get("tracknumber"))
+                    tags["discnumber"]  = _first(audio.get("discnumber"))
+                    tags["date"]        = _first(audio.get("date"))
+                    tags["genre"]       = _first(audio.get("genre"))
+                    tags["comment"]     = _first(audio.get("comment"))
+                    tags["composer"]    = _first(audio.get("composer"))
+                    tags["lyrics"]      = _first(audio.get("lyrics"))
+
+            return tags
+
+        except Exception as e:
+            print(f"[TagEditor] get_tags error for {path}: {e}")
+            return None
+
+    def save_tags(self, path, tags):
+        """Write tag dict back to audio file using mutagen.
+        tags: {title, artist, album, albumartist, tracknumber, discnumber,
+               date, genre, comment, composer, lyrics}
+        Returns {ok: bool, error: str|None, updated_track: dict|None}"""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return {"ok": False, "error": "File not found", "updated_track": None}
+            ext = p.suffix.lower()
+
+            def _s(k):
+                return (tags.get(k) or "").strip()
+
+            if ext == '.mp3':
+                from mutagen.id3 import (ID3, TIT2, TPE1, TALB, TPE2, TRCK,
+                                          TPOS, TDRC, TCON, TCOM, COMM, USLT)
+                try:
+                    audio = ID3(path)
+                except Exception:
+                    audio = ID3()
+
+                def _set(frame_cls, key, **kw):
+                    val = _s(key)
+                    if val:
+                        audio[frame_cls.__name__] = frame_cls(encoding=3, text=val, **kw)
+                    else:
+                        audio.delall(frame_cls.__name__)
+
+                _set(TIT2, "title")
+                _set(TPE1, "artist")
+                _set(TALB, "album")
+                _set(TPE2, "albumartist")
+                _set(TRCK, "tracknumber")
+                _set(TPOS, "discnumber")
+                _set(TDRC, "date")
+                _set(TCON, "genre")
+                _set(TCOM, "composer")
+
+                comment = _s("comment")
+                audio.delall("COMM")
+                if comment:
+                    audio["COMM::eng"] = COMM(encoding=3, lang="eng", desc="", text=comment)
+
+                lyrics = _s("lyrics")
+                audio.delall("USLT")
+                if lyrics:
+                    audio["USLT::eng"] = USLT(encoding=3, lang="eng", desc="", text=lyrics)
+
+                audio.save(path)
+
+            elif ext == '.flac':
+                audio = FLAC(path)
+                for field, tag_key in [
+                    ("title","title"), ("artist","artist"), ("album","album"),
+                    ("albumartist","albumartist"), ("tracknumber","tracknumber"),
+                    ("discnumber","discnumber"), ("date","date"), ("genre","genre"),
+                    ("comment","comment"), ("composer","composer"), ("lyrics","lyrics")
+                ]:
+                    val = _s(field)
+                    if val:
+                        audio[tag_key] = [val]
+                    elif tag_key in audio:
+                        del audio[tag_key]
+                audio.save()
+
+            elif ext in ('.m4a', '.aac'):
+                audio = MP4(path)
+                if audio.tags is None:
+                    audio.add_tags()
+
+                def _mp4set(mp4key, field):
+                    val = _s(field)
+                    if val:
+                        audio.tags[mp4key] = [val]
+                    elif mp4key in audio.tags:
+                        del audio.tags[mp4key]
+
+                _mp4set("\xa9nam", "title")
+                _mp4set("\xa9ART", "artist")
+                _mp4set("\xa9alb", "album")
+                _mp4set("aART",   "albumartist")
+                _mp4set("\xa9day", "date")
+                _mp4set("\xa9gen", "genre")
+                _mp4set("\xa9cmt", "comment")
+                _mp4set("\xa9wrt", "composer")
+                _mp4set("\xa9lyr", "lyrics")
+
+                # Track/disc: parse "n/total" or just "n"
+                for mp4key, field in [("trkn","tracknumber"), ("disk","discnumber")]:
+                    val = _s(field)
+                    if val:
+                        parts = val.split("/")
+                        try:
+                            n = int(parts[0])
+                            t = int(parts[1]) if len(parts) > 1 else 0
+                            audio.tags[mp4key] = [(n, t)]
+                        except ValueError:
+                            pass
+                    elif mp4key in audio.tags:
+                        del audio.tags[mp4key]
+
+                audio.save()
+
+            else:
+                # Generic easy tags (OGG, OPUS, WAV, WMA, etc.)
+                audio = mutagen.File(path, easy=True)
+                if audio is None:
+                    return {"ok": False, "error": "Unsupported format", "updated_track": None}
+                for field in ["title","artist","album","albumartist","tracknumber",
+                              "discnumber","date","genre","comment","composer","lyrics"]:
+                    val = _s(field)
+                    if val:
+                        audio[field] = [val]
+                    elif field in audio:
+                        del audio[field]
+                audio.save()
+
+            # Update in-memory playlist so the change is reflected immediately
+            updated_track = None
+            for track in self.playlist:
+                if track.get("path") == str(p.resolve()):
+                    if _s("title"):  track["name"]   = _s("title")
+                    if _s("artist"): track["artist"] = _s("artist")
+                    if _s("album"):  track["album"]  = _s("album")
+                    updated_track = dict(track)
+                    break
+            self._save_playlist()
+
+            print(f"[TagEditor] Saved tags for: {p.name}")
+            return {"ok": True, "error": None, "updated_track": updated_track}
+
+        except Exception as e:
+            print(f"[TagEditor] save_tags error: {e}")
+            return {"ok": False, "error": str(e), "updated_track": None}
+
     def save_settings(self, settings_dict):
         with self._settings_lock:
             self.settings.update(settings_dict)
