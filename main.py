@@ -407,6 +407,188 @@ class MacanMediaAPI:
             print(f"[MACAN] get_file_url error: {e}")
             return None
 
+    def get_subtitle_url(self, video_path):
+        """Look for a same-named .srt file next to the video and serve it via
+        the local media server so the browser can load it cross-origin."""
+        try:
+            p = Path(video_path).resolve()
+            srt = p.with_suffix('.srt')
+            if not srt.exists():
+                # Case-insensitive fallback (useful on Windows-originated paths)
+                for sibling in p.parent.iterdir():
+                    if sibling.stem.lower() == p.stem.lower() and sibling.suffix.lower() == '.srt':
+                        srt = sibling
+                        break
+                else:
+                    return None
+            url = _media_server.register(srt)
+            print(f"[MACAN] Serving subtitle: {url}  ← {srt.name}")
+            return url
+        except Exception as e:
+            print(f"[MACAN] get_subtitle_url error: {e}")
+            return None
+
+    def get_subtitle_url(self, video_path):
+        """Look for a same-named .srt file next to the video and serve it via
+        the local media server so the browser can load it cross-origin."""
+        try:
+            p = Path(video_path).resolve()
+            srt = p.with_suffix('.srt')
+            if not srt.exists():
+                # Case-insensitive fallback (useful on Windows-originated paths)
+                for sibling in p.parent.iterdir():
+                    if sibling.stem.lower() == p.stem.lower() and sibling.suffix.lower() == '.srt':
+                        srt = sibling
+                        break
+                else:
+                    return None
+            url = _media_server.register(srt)
+            print(f"[MACAN] Serving subtitle: {url}  ← {srt.name}")
+            return url
+        except Exception as e:
+            print(f"[MACAN] get_subtitle_url error: {e}")
+            return None
+
+    # ─── CACHE MANAGER ───────────────────────────────────────────────────────
+
+    def _dir_size(self, path: str) -> int:
+        """Recursively compute total size in bytes of a directory."""
+        total = 0
+        try:
+            for entry in os.scandir(path):
+                if entry.is_file(follow_symlinks=False):
+                    total += entry.stat().st_size
+                elif entry.is_dir(follow_symlinks=False):
+                    total += self._dir_size(entry.path)
+        except (PermissionError, FileNotFoundError):
+            pass
+        return total
+
+    def _fmt_bytes(self, n: int) -> str:
+        """Return human-readable size string."""
+        for unit in ('B', 'KB', 'MB', 'GB'):
+            if n < 1024:
+                return f"{n:.1f} {unit}" if unit != 'B' else f"{n} B"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+    def get_cache_sizes(self):
+        """Return sizes of all cache locations as a dict with human-readable strings."""
+        app_data   = self._get_app_data()
+        wv2_path   = self._get_webview_storage_path()
+        art_path   = os.path.join(app_data, 'AlbumArtCache')
+        lyrics_db  = os.path.join(app_data, 'lyrics.db')
+
+        wv2_bytes    = self._dir_size(wv2_path)   if os.path.isdir(wv2_path)  else 0
+        art_bytes    = self._dir_size(art_path)    if os.path.isdir(art_path)  else 0
+        lyrics_bytes = os.path.getsize(lyrics_db)  if os.path.isfile(lyrics_db) else 0
+        # Video thumbnail cache is in-memory only — report count × ~5 KB estimate
+        vthumb_count = len(getattr(self, '_video_thumb_cache', {}))
+        vthumb_bytes = vthumb_count * 5 * 1024
+
+        return {
+            'webview2': {
+                'size_bytes': wv2_bytes,
+                'size_str':   self._fmt_bytes(wv2_bytes),
+                'path':       wv2_path,
+            },
+            'albumart': {
+                'size_bytes': art_bytes,
+                'size_str':   self._fmt_bytes(art_bytes),
+                'path':       art_path,
+            },
+            'lyrics': {
+                'size_bytes': lyrics_bytes,
+                'size_str':   self._fmt_bytes(lyrics_bytes),
+                'path':       lyrics_db,
+            },
+            'videothumb': {
+                'size_bytes': vthumb_bytes,
+                'size_str':   f"{vthumb_count} frames (~{self._fmt_bytes(vthumb_bytes)})",
+                'path':       'in-memory',
+            },
+        }
+
+    def clear_cache(self, target: str) -> dict:
+        """
+        Clear a specific cache. target: 'webview2' | 'albumart' | 'lyrics' | 'videothumb' | 'all'
+        Returns { ok: bool, message: str }
+        """
+        import shutil
+        app_data = self._get_app_data()
+        errors   = []
+
+        def _rmdir(path):
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+                os.makedirs(path, exist_ok=True)   # recreate empty dir
+
+        def _clear_webview2():
+            wv2 = self._get_webview_storage_path()
+            # Only delete the known cache sub-folders — leave the profile intact
+            cache_subdirs = ['Cache', 'Code Cache', 'GPUCache',
+                             'Service Worker', 'CacheStorage', 'blob_storage']
+            for sub in cache_subdirs:
+                p = os.path.join(wv2, sub)
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+            # Also remove EBWebView sub-profile caches (WebView2 nests them)
+            ebwv = os.path.join(wv2, 'EBWebView')
+            if os.path.isdir(ebwv):
+                for sub in cache_subdirs:
+                    p = os.path.join(ebwv, sub)
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+
+        def _clear_albumart():
+            art_path = os.path.join(app_data, 'AlbumArtCache')
+            _rmdir(art_path)
+            # Also wipe the SQLite art_cache table so stale references are gone
+            try:
+                with self._db_connect() as conn:
+                    conn.execute("DELETE FROM kv WHERE key LIKE 'art_%'")
+                    conn.commit()
+            except Exception:
+                pass
+
+        def _clear_lyrics():
+            lyrics_db = os.path.join(app_data, 'lyrics.db')
+            try:
+                import sqlite3 as _sq
+                with _sq.connect(lyrics_db) as lconn:
+                    lconn.execute("DELETE FROM lyrics")
+                    lconn.execute("VACUUM")
+                    lconn.commit()
+            except Exception as e:
+                errors.append(f"lyrics: {e}")
+
+        def _clear_videothumb():
+            if hasattr(self, '_video_thumb_cache'):
+                self._video_thumb_cache.clear()
+
+        targets = ['webview2', 'albumart', 'lyrics', 'videothumb'] if target == 'all' else [target]
+
+        dispatch = {
+            'webview2':   _clear_webview2,
+            'albumart':   _clear_albumart,
+            'lyrics':     _clear_lyrics,
+            'videothumb': _clear_videothumb,
+        }
+
+        for t in targets:
+            fn = dispatch.get(t)
+            if fn:
+                try:
+                    fn()
+                    print(f"[CacheManager] Cleared: {t}")
+                except Exception as e:
+                    errors.append(f"{t}: {e}")
+                    print(f"[CacheManager] Error clearing {t}: {e}")
+
+        if errors:
+            return {'ok': False, 'message': 'Partial clear — errors: ' + '; '.join(errors)}
+        return {'ok': True, 'message': f"Cache cleared: {', '.join(targets)}"}
+
     # ─── PLAYLIST MANAGEMENT ─────────────────────────────────────────────────
 
     def get_playlist(self):
