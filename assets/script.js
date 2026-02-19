@@ -119,30 +119,15 @@ function initAudioContext() {
       S._fadeGain.connect(audioContext.destination);
     }
 
-    // Apply saved EQ bands SYNCHRONOUSLY before any async work.
-    // JS is single-threaded so no periodic save can interleave here.
-    // By the time initAudioContext() returns, equalizer has the correct bands.
-    if (S._pendingEqBands) {
-      equalizer.setAllBands(S._pendingEqBands);
-      if (equalizerUI) equalizerUI.syncSlidersFromEq(S._pendingEqPreset);
-      S._pendingEqBands  = null;
-      S._pendingEqPreset = null;
-    }
-
-    // Load Custom preset values from Python (async).
-    // _pendingEqBands already applied above, so this gap is safe.
-    // If no pending bands (first run / no saved state), fall back to
-    // last-used preset name stored in the dedicated kv key.
+    // Load saved Custom preset from Python (async, non-blocking)
+    // Must happen before applying pendingEqBands so Custom preset is available
     equalizer.initFromPython().then(() => {
-      // Fallback 1: only a preset name was stored (no band values) — apply by name
-      if (S._pendingEqPreset && equalizerUI) {
-        equalizerUI.applyPreset(S._pendingEqPreset);
+      // Apply pending EQ state restored from app_state
+      if (S._pendingEqBands) {
+        equalizer.setAllBands(S._pendingEqBands);
+        if (equalizerUI) equalizerUI.syncSlidersFromEq(S._pendingEqPreset);
+        S._pendingEqBands  = null;
         S._pendingEqPreset = null;
-        return;
-      }
-      // Fallback 2: no state at all — use dedicated kv key (first run / migration)
-      if (equalizer._lastSavedPreset && equalizerUI && equalizerUI.currentPreset === 'Flat') {
-        equalizerUI.applyPreset(equalizer._lastSavedPreset);
       }
     });
   }
@@ -578,9 +563,8 @@ playlistManager.onSave(async (name) => {
     ext:      item.ext      || '',
     is_video: item.is_video || false,
   }));
-  const ok = await playlistManager.saveCurrentPlaylist(name, tracks);
-  if (ok !== false) setStatus(`PLAYLIST "${name}" SAVED`);
-  return ok;
+  await playlistManager.saveCurrentPlaylist(name, tracks);
+  setStatus(`PLAYLIST "${name}" SAVED`);
 });
 
 playlistManager.onLoad(async (name) => {
@@ -959,7 +943,13 @@ window.addEventListener('load', () => {
   // Bind buttons
   $('btn-close').onclick     = () => { if(pw()) pywebview.api.close_app(); else window.close(); };
   $('btn-minimize').onclick  = () => pw() && pywebview.api.minimize_app();
-  btnPlay.onclick            = togglePlayPause;
+  btnPlay.onclick            = () => {
+    const wasPaused = activePlayer().paused;
+    togglePlayPause();
+    if (videoLayer.classList.contains('active')) {
+      flashCenterOverlay(wasPaused ? 'play' : 'pause');
+    }
+  };
   $('btn-prev').onclick      = prevTrack;
   $('btn-next').onclick      = nextTrack;
   btnShuffle.onclick         = toggleShuffle;
@@ -973,7 +963,11 @@ window.addEventListener('load', () => {
   vcVolSlider.oninput        = e => setVolume(+e.target.value);
 
   // Video overlay buttons
-  $('vc-play').onclick        = togglePlayPause;
+  $('vc-play').onclick        = () => {
+    const wasPaused = activePlayer().paused;
+    togglePlayPause();
+    flashCenterOverlay(wasPaused ? 'play' : 'pause');
+  };
   $('vc-prev').onclick        = prevTrack;
   $('vc-next').onclick        = nextTrack;
   $('vc-close').onclick       = closeVideo;
@@ -1038,21 +1032,18 @@ async function _doStateRestore() {
       if (state.fadeDuration !== undefined) S.fadeDuration = state.fadeDuration;
       if (state.normEnabled  !== undefined) S.normEnabled  = state.normEnabled;
 
-      // Store EQ bands as pending — AudioContext may not exist yet.
-      // Applied synchronously in initAudioContext() on first user interaction.
+      // FIX: Store EQ bands as pending — AudioContext may not exist yet.
+      // If AudioContext is already initialized (e.g. user had interacted before
+      // this restore path runs), apply immediately so audio effect is live.
+      // Otherwise applied in initAudioContext() on first user interaction.
       if (Array.isArray(state.eqBands) && state.eqBands.length === 10) {
-        S._pendingEqBands  = state.eqBands;
-        S._pendingEqPreset = state.eqPreset || null;
-        // If AudioContext already initialized (rare), apply immediately
         if (equalizer && audioContext) {
           equalizer.setAllBands(state.eqBands);
-          S._pendingEqBands  = null;
           if (equalizerUI) equalizerUI.syncSlidersFromEq(state.eqPreset || null);
-          S._pendingEqPreset = null;
+        } else {
+          S._pendingEqBands  = state.eqBands;
+          S._pendingEqPreset = state.eqPreset || null;
         }
-      } else if (state.eqPreset) {
-        // Only preset name saved (no bands) — store name; initFromPython fallback will apply
-        S._pendingEqPreset = state.eqPreset;
       }
 
       // ── 3. Restore last track + seek position ──────────────
@@ -1579,8 +1570,42 @@ function setupAudioEvents() {
 }
 
 
-// ─── VIDEO CLICK FEEDBACK ─────────────────────────────────────
-// Shows a brief centered play/pause icon flash when user clicks the video.
+// ─── CENTER OVERLAY FLASH ──────────────────────────────────────
+// Only triggered by explicit user play/pause actions:
+// nav bar play button, vc-play button, or spacebar.
+// NOT triggered by mouse movement over the video.
+let _centerOverlayTimer = null;
+function flashCenterOverlay(state) {
+  // Only flash when video is active
+  if (!videoLayer.classList.contains('active')) return;
+
+  const overlay  = document.getElementById('video-center-overlay');
+  const vcenterBtn = document.getElementById('video-center-btn');
+  if (!overlay) return;
+
+  // Update icon to reflect new state
+  const iconPlay  = document.getElementById('vcenter-icon-play');
+  const iconPause = document.getElementById('vcenter-icon-pause');
+  if (iconPlay && iconPause) {
+    iconPlay.style.display  = state === 'play'  ? '' : 'none';
+    iconPause.style.display = state === 'pause' ? '' : 'none';
+  }
+
+  // Show overlay then auto-hide after animation
+  overlay.classList.add('vc-visible');
+  clearTimeout(_centerOverlayTimer);
+
+  if (vcenterBtn) {
+    vcenterBtn.classList.remove('flash');
+    void vcenterBtn.offsetWidth;
+    vcenterBtn.classList.add('flash');
+  }
+
+  _centerOverlayTimer = setTimeout(() => {
+    overlay.classList.remove('vc-visible');
+    if (vcenterBtn) vcenterBtn.classList.remove('flash');
+  }, 650);
+}
 let _vcFeedbackTimer = null;
 function showVideoClickFeedback(state) {
   let el = document.getElementById('vc-click-feedback');
@@ -1830,7 +1855,8 @@ function setupVideoControls() {
   function showAllVcControls() {
     videoControls.style.opacity = '1';
     videoControls.style.pointerEvents = 'all';
-    if (vcenterOverlay) vcenterOverlay.classList.add('vc-visible');
+    // NOTE: vcenterOverlay is intentionally NOT shown here.
+    // It only appears via flashCenterOverlay() triggered by explicit play/pause actions.
     clearTimeout(S.vcHideTimer);
     S.vcHideTimer = setTimeout(hideVcControls, 3000);
   }
@@ -1861,13 +1887,8 @@ function setupVideoControls() {
       togglePlayPause();
       showVideoClickFeedback(wasPaused ? 'play' : 'pause');
 
-      // Flash the center button for visual feedback
-      if (vcenterBtn) {
-        vcenterBtn.classList.remove('flash');
-        void vcenterBtn.offsetWidth;
-        vcenterBtn.classList.add('flash');
-        setTimeout(() => vcenterBtn.classList.remove('flash'), 500);
-      }
+      // Flash the center overlay for explicit click feedback
+      flashCenterOverlay(wasPaused ? 'play' : 'pause');
 
       // Reset autohide timer so controls stay briefly after click
       showAllVcControls();
@@ -1882,9 +1903,6 @@ function hideVcControls() {
   if (S.vcSeekDragging) return;
   videoControls.style.opacity = '0';
   videoControls.style.pointerEvents = 'none';
-  // Hide center overlay together with controls
-  const vcenterOverlay = document.getElementById('video-center-overlay');
-  if (vcenterOverlay) vcenterOverlay.classList.remove('vc-visible');
   // Hide cursor together with controls
   if (S._hideCursor) S._hideCursor();
 }
@@ -1892,9 +1910,6 @@ function hideVcControls() {
 function pinVcControls(on) {
   if (on) {
     videoControls.classList.add('pinned');
-    // Keep center overlay visible while seekbar is being dragged
-    const vcenterOverlay = document.getElementById('video-center-overlay');
-    if (vcenterOverlay) vcenterOverlay.classList.add('vc-visible');
     // Show cursor and freeze hide timer during drag
     if (S._showCursor) S._showCursor();
     clearTimeout(S.vcCursorTimer);
@@ -2339,6 +2354,7 @@ function scheduleStateSave() {
 
 async function persistAppState() {
   if (!pw()) return;
+  // FIX: Skip if a save is already in-flight — reschedule for after it lands.
   if (S._saveLock) {
     clearTimeout(S._stateSaveTimer);
     S._stateSaveTimer = setTimeout(persistAppState, 400);
@@ -2346,17 +2362,6 @@ async function persistAppState() {
   }
   S._saveLock = true;
   try {
-    // EQ state: if equalizer is initialized, always read live values — it's safe because
-    // initAudioContext() applies _pendingEqBands SYNCHRONOUSLY before returning, so by the
-    // time any async code (like this) can run, the equalizer already has the correct bands.
-    // If equalizer not yet initialized, preserve pending values so we don't lose saved preset.
-    const eqBands  = equalizer
-      ? equalizer.getCurrentValues()
-      : (S._pendingEqBands || null);
-    const eqPreset = equalizerUI
-      ? equalizerUI.currentPreset
-      : (S._pendingEqPreset || null);
-
     const state = {
       currentIndex:  S.currentIndex,
       seekPosition:  S.currentIndex >= 0 ? (activePlayer().currentTime || 0) : 0,
@@ -2366,13 +2371,13 @@ async function persistAppState() {
       fadeEnabled:   S.fadeEnabled,
       fadeDuration:  S.fadeDuration,
       normEnabled:   S.normEnabled,
-      eqBands,
-      eqPreset,
+      // FIX: If AudioContext/equalizer hasn't been initialized yet (user hasn't
+      // interacted with EQ), fall back to the pending values from restore so we
+      // don't overwrite a valid saved EQ state with null.
+      eqBands:  equalizer ? equalizer.getCurrentValues() : (S._pendingEqBands || null),
+      eqPreset: equalizerUI ? equalizerUI.currentPreset  : (S._pendingEqPreset || null),
     };
     await pywebview.api.save_app_state(state);
-    if (eqPreset) {
-      pywebview.api.save_eq_preset_name(eqPreset).catch(() => {});
-    }
   } catch(e) {
     console.warn('[MACAN] State save failed:', e);
   } finally {
@@ -3073,7 +3078,9 @@ function updatePlaylistMeta() {
 
 // ─── KEYBOARD SHORTCUTS ───────────────────────────────────────
 document.addEventListener('keydown', e => {
-  if (document.activeElement === $('search-input')) return;
+  // Block all playback shortcuts when user is typing in any input or textarea
+  const tag = document.activeElement?.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
   // ESC priority: 1) exit lyrics fullscreen  2) close lyrics  3) close video
   if (e.code === 'Escape') {
@@ -3090,7 +3097,15 @@ document.addEventListener('keydown', e => {
 
   const p = activePlayer();
   switch(e.code) {
-    case 'Space':      e.preventDefault(); togglePlayPause(); break;
+    case 'Space':
+      e.preventDefault();
+      { const wasPaused = activePlayer().paused;
+        togglePlayPause();
+        if (videoLayer.classList.contains('active')) {
+          flashCenterOverlay(wasPaused ? 'play' : 'pause');
+        }
+      }
+      break;
     case 'ArrowRight': e.shiftKey ? nextTrack() : (p.currentTime=Math.min(S.duration,p.currentTime+10)); break;
     case 'ArrowLeft':  e.shiftKey ? prevTrack() : (p.currentTime=Math.max(0,p.currentTime-10)); break;
     case 'ArrowUp':    e.preventDefault(); setVolume(Math.min(100,S.volume+5)); break;
