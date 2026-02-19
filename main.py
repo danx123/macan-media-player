@@ -1201,6 +1201,212 @@ class MacanMediaAPI:
             return self.settings.get('eq_preset_name',
                                      self._kv_get('eq_preset_name', 'Flat'))
 
+    # ─── CONVERTER BRIDGE ────────────────────────────────────────────────────
+    # Wraps core/converter.py into pywebview-callable methods.
+    # Progress is pushed to the frontend via evaluate_js so the JS layer never
+    # needs to poll — identical pattern to get_cover_art_with_online_fallback().
+
+    def converter_get_formats(self):
+        """Return supported formats and bitrates for the UI to populate dropdowns."""
+        from core.converter import AUDIO_FORMATS, VIDEO_FORMATS, AUDIO_BITRATES, VIDEO_ENCODERS
+        return {
+            'audio_formats':  AUDIO_FORMATS,
+            'video_formats':  VIDEO_FORMATS,
+            'audio_bitrates': AUDIO_BITRATES,
+            'video_encoders': VIDEO_ENCODERS,
+        }
+
+    def converter_browse_files(self, mode: str) -> list | None:
+        """Open a file dialog filtered by mode: 'audio' | 'video'."""
+        if mode == 'audio':
+            types = ('Audio Files (*.mp3;*.wav;*.aac;*.flac;*.ogg;*.m4a)',)
+        elif mode == 'video':
+            types = ('Video Files (*.mp4;*.mkv;*.avi;*.mov;*.webm)',)
+        else:
+            types = ()
+        result = self._open_dialog(allow_multiple=True, file_types=types)
+        return list(result) if result else None
+
+    def converter_browse_output_folder(self) -> str | None:
+        """Open a folder picker for the output directory."""
+        result = self._folder_dialog()
+        if result:
+            return result[0] if isinstance(result, (list, tuple)) else result
+        return None
+
+    def converter_start(self, job_id: str, files: list[str], output_dir: str,
+                        mode: str, options: dict) -> dict:
+        """
+        Start a conversion job in a background thread.
+
+        mode:    'audio' | 'video' | 'extract_audio'
+        options: dict matching AudioConverter / VideoConverter kwargs
+        job_id:  opaque string used to route JS progress callbacks
+
+        Returns immediately with {'ok': True} or {'ok': False, 'error': '...'}.
+        Progress updates are pushed via evaluate_js:
+            window.converterProgress(job_id, index, total, percent, status)
+        Completion:
+            window.converterDone(job_id, success, message)
+        """
+        from core.converter import (
+            find_ffmpeg, AudioConverter, VideoConverter,
+            ExtractAudioConverter, BatchRunner
+        )
+
+        if not files:
+            return {'ok': False, 'error': 'No files provided.'}
+        if not output_dir or not os.path.isdir(output_dir):
+            return {'ok': False, 'error': 'Invalid output folder.'}
+
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            return {'ok': False, 'error':
+                    'ffmpeg not found. Place ffmpeg.exe next to the application '
+                    'or add it to your system PATH.'}
+
+        total = len(files)
+        # Shared mutable state for batch tracking
+        state = {'index': 0, 'cancelled': False}
+
+        def make_progress_cb(idx):
+            def cb(pct, status):
+                if self._window:
+                    js = (f"window.converterProgress && "
+                          f"window.converterProgress({json.dumps(job_id)}, "
+                          f"{idx}, {total}, {pct}, {json.dumps(status)});")
+                    try:
+                        self._window.evaluate_js(js)
+                    except Exception:
+                        pass
+            return cb
+
+        def make_done_cb(idx, fname):
+            def cb(success, message):
+                if not success:
+                    state['cancelled'] = True
+                if self._window:
+                    js = (f"window.converterItemDone && "
+                          f"window.converterItemDone({json.dumps(job_id)}, "
+                          f"{idx}, {total}, {json.dumps(success)}, "
+                          f"{json.dumps(fname)}, {json.dumps(message)});")
+                    try:
+                        self._window.evaluate_js(js)
+                    except Exception:
+                        pass
+            return cb
+
+        tasks = []
+        for idx, fpath in enumerate(files):
+            fname    = os.path.basename(fpath)
+            prog_cb  = make_progress_cb(idx)
+            done_cb  = make_done_cb(idx, fname)
+
+            if mode == 'audio':
+                task = AudioConverter(
+                    ffmpeg_path  = ffmpeg,
+                    input_path   = fpath,
+                    output_dir   = output_dir,
+                    out_format   = options.get('out_format', 'mp3'),
+                    bitrate      = options.get('bitrate', '192k'),
+                    progress_cb  = prog_cb,
+                    done_cb      = done_cb,
+                )
+            elif mode == 'extract_audio':
+                task = ExtractAudioConverter(
+                    ffmpeg_path  = ffmpeg,
+                    input_path   = fpath,
+                    output_dir   = output_dir,
+                    out_format   = options.get('out_format', 'mp3'),
+                    bitrate      = options.get('bitrate', '192k'),
+                    progress_cb  = prog_cb,
+                    done_cb      = done_cb,
+                )
+            elif mode == 'video':
+                task = VideoConverter(
+                    ffmpeg_path  = ffmpeg,
+                    input_path   = fpath,
+                    output_dir   = output_dir,
+                    out_format   = options.get('out_format', 'mp4'),
+                    resolution   = options.get('resolution', 'original'),
+                    quality      = options.get('quality', 'medium'),
+                    use_gpu      = options.get('use_gpu', False),
+                    advanced     = options.get('advanced', False),
+                    v_bitrate    = options.get('v_bitrate', 'auto'),
+                    fps          = options.get('fps', 'original'),
+                    v_encoder    = options.get('v_encoder', 'libx264'),
+                    a_encoder    = options.get('a_encoder', 'aac'),
+                    a_bitrate    = options.get('a_bitrate', 'original'),
+                    a_channels   = options.get('a_channels', 'original'),
+                    a_samplerate = options.get('a_samplerate', 'original'),
+                    custom_flags = options.get('custom_flags', ''),
+                    ref_frames   = options.get('ref_frames', 0),
+                    use_cabac    = options.get('use_cabac', True),
+                    progress_cb  = prog_cb,
+                    done_cb      = done_cb,
+                )
+            else:
+                return {'ok': False, 'error': f'Unknown mode: {mode}'}
+
+            tasks.append(task)
+
+        def on_item_start(idx, total, fname):
+            if self._window:
+                js = (f"window.converterItemStart && "
+                      f"window.converterItemStart({json.dumps(job_id)}, "
+                      f"{idx}, {total}, {json.dumps(fname)});")
+                try:
+                    self._window.evaluate_js(js)
+                except Exception:
+                    pass
+
+        def on_all_done(ok_count, fail_count):
+            if self._window:
+                js = (f"window.converterDone && "
+                      f"window.converterDone({json.dumps(job_id)}, "
+                      f"{ok_count}, {fail_count});")
+                try:
+                    self._window.evaluate_js(js)
+                except Exception:
+                    pass
+            # Remove batch runner from registry
+            self._converter_jobs.pop(job_id, None)
+
+        runner = BatchRunner(tasks, on_item_start, on_all_done)
+        # Store reference so we can cancel
+        if not hasattr(self, '_converter_jobs'):
+            self._converter_jobs = {}
+        self._converter_jobs[job_id] = runner
+        runner.start()
+        return {'ok': True}
+
+    def converter_cancel(self, job_id: str) -> dict:
+        """Cancel an active conversion job."""
+        if not hasattr(self, '_converter_jobs'):
+            return {'ok': False, 'error': 'No active jobs.'}
+        runner = self._converter_jobs.get(job_id)
+        if runner:
+            runner.stop()
+            self._converter_jobs.pop(job_id, None)
+            return {'ok': True}
+        return {'ok': False, 'error': 'Job not found.'}
+
+    def converter_open_folder(self, folder_path: str) -> dict:
+        """Open the output folder in the OS file explorer."""
+        import subprocess as sp
+        if not os.path.isdir(folder_path):
+            return {'ok': False, 'error': 'Folder not found.'}
+        try:
+            if sys.platform == 'win32':
+                os.startfile(folder_path)
+            elif sys.platform == 'darwin':
+                sp.Popen(['open', folder_path])
+            else:
+                sp.Popen(['xdg-open', folder_path])
+            return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
     # ─── PRIVATE: DIALOG WRAPPERS ─────────────────────────────────────────────
 
     def _open_dialog(self, allow_multiple=False, file_types=()):
