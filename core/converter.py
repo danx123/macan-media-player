@@ -62,11 +62,14 @@ def find_ffmpeg() -> str | None:
 def _get_duration(ffmpeg_path: str, input_path: str) -> int | None:
     """Run ffmpeg -i to read media duration in seconds."""
     try:
+        # Hide the ffmpeg console window on Windows
+        _no_window = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         result = subprocess.run(
             [ffmpeg_path, '-i', input_path],
             stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE,
             timeout=10,
+            creationflags=_no_window,
         )
         output = result.stdout.decode('utf-8', errors='ignore')
         m = DURATION_RE.search(output)
@@ -110,6 +113,8 @@ class _BaseConverter:
         cmd = [self.ffmpeg] + args
         print(f'[Converter] FFmpeg: {" ".join(cmd)}')
         try:
+            # Hide the ffmpeg console window on Windows
+            _no_window = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             self._proc = subprocess.Popen(
                 cmd,
                 stderr=subprocess.PIPE,
@@ -117,6 +122,7 @@ class _BaseConverter:
                 universal_newlines=True,
                 encoding='utf-8',
                 errors='ignore',
+                creationflags=_no_window,
             )
         except FileNotFoundError:
             self.done_cb(False, 'ffmpeg not found. Please place ffmpeg.exe next to the application.')
