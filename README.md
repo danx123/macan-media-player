@@ -156,8 +156,10 @@ macan-media-player/
 ├── core/
 │   └── __init__.py          # Core package placeholder
 │   └── video_utils.py       # Core OpenCV generate hover thumbnail seekbar
+│   └── converter.py         # Core ffmpeg to convert audio/video
 └── assets/
     ├── index.html           # App shell and HTML structure
+    ├── converter.js         # Engine for converter
     ├── equalizer.js         # Engine for equalizer
     ├── playlist-manager.js  # For manage playlist with .json
     ├── radio-tv.js          # For manage radio & tv online
