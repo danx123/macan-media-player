@@ -193,19 +193,19 @@
             <line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/>
             <line x1="17" y1="16" x2="23" y2="16"/>
           </svg>
-          EQ
+          <span class="pl-btn-label">EQUALIZER</span>
         </button>
         <button class="pl-tool-btn" id="btn-playlist-manager" title="Playlist Manager">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
           </svg>
-          PLAYLISTS
+          <span class="pl-btn-label">PLAYLISTS</span>
         </button>
         <button class="pl-tool-btn" id="btn-lyrics" title="Lyrics">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
           </svg>
-          LYRICS
+          <span class="pl-btn-label">LYRICS</span>
         </button>
         <button class="pl-tool-btn" id="btn-radio" title="Radio Online">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -214,15 +214,23 @@
             <circle cx="12" cy="16" r="2"/>
             <line x1="19" y1="10" x2="19" y2="10"/>
           </svg>
-          RADIO
+          <span class="pl-btn-label">RADIO</span>
         </button>
         <button class="pl-tool-btn" id="btn-tv" title="TV Online">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <rect x="2" y="7" width="20" height="15" rx="2"/>
             <polyline points="17 2 12 7 7 2"/>
           </svg>
-          TV
+          <span class="pl-btn-label">TV</span>
         </button>
+        <button class="pl-tool-btn" id="btn-converter">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+          <span class="pl-btn-label">CONVERTER</span>
+        </button>
+
         <div id="search-wrap">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -602,6 +610,7 @@
 <script src="equalizer.js"></script>
 <script src="playlist-manager.js"></script>
 <script src="radio-tv.js"></script>
+<script src="converter.js"></script>
 <script src="script.js"></script>
 </body>
 </html>
