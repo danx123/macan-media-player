@@ -736,7 +736,127 @@ document.getElementById('lyrics-close').addEventListener('click', () => closeLyr
   }
 })();
 
-// Lyrics fullscreen toggle
+// ── Cache Manager ─────────────────────────────────────────────────────────
+(function _initCacheManager() {
+  const overlay   = document.getElementById('cache-manager-overlay');
+  const btnOpen   = document.getElementById('btn-cache-manager');
+  const btnClose  = document.getElementById('cm-close');
+  const btnRefresh = document.getElementById('cm-refresh');
+  const btnClearAll = document.getElementById('cm-clear-all');
+  if (!overlay || !btnOpen) return;
+
+  // Size element refs
+  const sizeEls = {
+    webview2:   document.getElementById('cm-size-webview2'),
+    albumart:   document.getElementById('cm-size-albumart'),
+    lyrics:     document.getElementById('cm-size-lyrics'),
+    videothumb: document.getElementById('cm-size-videothumb'),
+  };
+  const totalEl = document.getElementById('cm-total-size');
+
+  // Individual clear buttons
+  const clearBtns = {
+    webview2:   document.getElementById('cm-clear-webview2'),
+    albumart:   document.getElementById('cm-clear-albumart'),
+    lyrics:     document.getElementById('cm-clear-lyrics'),
+    videothumb: document.getElementById('cm-clear-videothumb'),
+  };
+
+  async function loadSizes() {
+    // Set all to loading state
+    Object.values(sizeEls).forEach(el => {
+      if (el) { el.textContent = '…'; el.className = 'cm-entry-size loading'; }
+    });
+    if (totalEl) totalEl.textContent = '…';
+
+    if (!pw()) {
+      Object.values(sizeEls).forEach(el => {
+        if (el) { el.textContent = 'N/A'; el.className = 'cm-entry-size'; }
+      });
+      if (totalEl) totalEl.textContent = 'N/A';
+      return;
+    }
+
+    try {
+      const data = await pywebview.api.get_cache_sizes();
+      let totalBytes = 0;
+      for (const [key, info] of Object.entries(data)) {
+        const el = sizeEls[key];
+        if (el) {
+          el.textContent = info.size_str;
+          el.className = 'cm-entry-size';
+        }
+        totalBytes += info.size_bytes || 0;
+      }
+      // Format total
+      let t = totalBytes;
+      let unit = 'B';
+      if (t >= 1073741824) { t /= 1073741824; unit = 'GB'; }
+      else if (t >= 1048576) { t /= 1048576; unit = 'MB'; }
+      else if (t >= 1024) { t /= 1024; unit = 'KB'; }
+      if (totalEl) totalEl.textContent = unit === 'B' ? `${t} B` : `${t.toFixed(1)} ${unit}`;
+    } catch (e) {
+      console.warn('[CacheManager] get_cache_sizes error:', e);
+      Object.values(sizeEls).forEach(el => {
+        if (el) { el.textContent = 'ERR'; el.className = 'cm-entry-size'; }
+      });
+    }
+  }
+
+  async function doClear(target, btn) {
+    if (!pw()) return;
+    const origText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+      const result = await pywebview.api.clear_cache(target);
+      if (!result.ok) console.warn('[CacheManager]', result.message);
+    } catch (e) {
+      console.warn('[CacheManager] clear_cache error:', e);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = origText;
+      await loadSizes();
+    }
+  }
+
+  // Wire individual clear buttons
+  for (const [key, btn] of Object.entries(clearBtns)) {
+    if (btn) btn.addEventListener('click', () => doClear(key, btn));
+  }
+
+  // Clear all
+  if (btnClearAll) {
+    btnClearAll.addEventListener('click', async () => {
+      if (!confirm('Clear ALL caches? This cannot be undone.')) return;
+      btnClearAll.disabled = true;
+      btnClearAll.textContent = 'CLEARING…';
+      try {
+        if (pw()) await pywebview.api.clear_cache('all');
+      } catch (e) {
+        console.warn('[CacheManager] clear_cache all error:', e);
+      } finally {
+        btnClearAll.disabled = false;
+        btnClearAll.textContent = '🗑 CLEAR ALL';
+        await loadSizes();
+      }
+    });
+  }
+
+  if (btnRefresh) btnRefresh.addEventListener('click', loadSizes);
+
+  function openCacheManager() {
+    overlay.classList.add('active');
+    loadSizes();
+  }
+  function closeCacheManager() {
+    overlay.classList.remove('active');
+  }
+
+  btnOpen.addEventListener('click', openCacheManager);
+  if (btnClose) btnClose.addEventListener('click', closeCacheManager);
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeCacheManager(); });
+})();
 let _lyricsFullscreen = false;
 let _lyricsEscHintTimer = null;
 
@@ -2049,7 +2169,10 @@ async function loadTrack(index, autoplay = true) {
     video.src = srcUrl;
     video.load();
     if (autoplay) doPlay(video);
+    // Load .srt subtitle if available
+    _loadSubtitle(track.path || '');
   } else {
+    _clearSubtitleTracks();
     videoLayer.classList.remove('active');
     $('main-layout').style.display = '';
     audio.src = srcUrl;
@@ -2059,6 +2182,103 @@ async function loadTrack(index, autoplay = true) {
 
   scheduleStateSave();
 }
+
+// ─── SUBTITLE (SRT) SUPPORT ───────────────────────────────────
+
+/** Convert SRT text → WebVTT text (browser-native format). */
+function _srtToVtt(srt) {
+  return 'WEBVTT\n\n' + srt
+    .replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2')  // SRT comma → VTT dot
+    .trim();
+}
+
+/** Remove any existing <track> elements from the video element. */
+function _clearSubtitleTracks() {
+  [...video.querySelectorAll('track')].forEach(t => t.remove());
+  const btn = $('vc-subtitle');
+  if (btn) btn.style.display = 'none';
+}
+
+/**
+ * Try to find a .srt file for the current video path.
+ * If found, convert SRT→VTT in-memory, create a Blob URL, and
+ * inject a <track> element into the video player.
+ */
+async function _loadSubtitle(videoPath) {
+  _clearSubtitleTracks();
+  if (!pw() || !videoPath) return;
+
+  try {
+    const srtUrl = await pywebview.api.get_subtitle_url(videoPath);
+    if (!srtUrl) return;  // no .srt found — silently ignore
+
+    // Fetch the raw SRT text via the local media server
+    const resp = await fetch(srtUrl);
+    if (!resp.ok) return;
+    const srtText = await resp.text();
+
+    // Convert to WebVTT and create an in-memory Blob URL
+    const vttText = _srtToVtt(srtText);
+    const blob    = new Blob([vttText], { type: 'text/vtt' });
+    const blobUrl = URL.createObjectURL(blob);
+
+    // Inject <track> into the <video> element
+    const trackEl    = document.createElement('track');
+    trackEl.kind     = 'subtitles';
+    trackEl.label    = 'Subtitle';
+    trackEl.srclang  = 'id';
+    trackEl.src      = blobUrl;
+    trackEl.default  = true;
+    video.appendChild(trackEl);
+
+    // Enable the track and raise subtitle position off the bottom edge
+    trackEl.addEventListener('load', () => {
+      const tt = video.textTracks[0];
+      if (!tt) return;
+      tt.mode = 'showing';
+      // Shift each cue upward: line -4 = 4 lines from bottom (clears the control bar)
+      for (const cue of tt.cues) {
+        cue.line        = -4;   // negative = counted from bottom
+        cue.snapToLines = true;
+      }
+    });
+
+    // Show the CC toggle button
+    const btn = $('vc-subtitle');
+    if (btn) {
+      btn.style.display = '';
+      btn.classList.add('active');
+      btn.title = 'Subtitles ON — click to toggle';
+    }
+
+    console.log(`[MACAN] Subtitle loaded: ${videoPath.split(/[\\/]/).pop().replace(/\.[^.]+$/, '.srt')}`);
+  } catch (e) {
+    console.warn('[MACAN] _loadSubtitle error:', e);
+  }
+}
+
+// Subtitle CC toggle button — wired directly (no DOMContentLoaded needed,
+// the element already exists when this script runs at bottom of <body>).
+(function _initSubtitleToggle() {
+  const btn = $('vc-subtitle');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    const t = video.textTracks[0];
+    if (!t) return;
+    if (t.mode === 'showing') {
+      t.mode = 'hidden';
+      btn.classList.remove('active');
+      btn.title = 'Subtitles OFF — click to toggle';
+    } else {
+      t.mode = 'showing';
+      btn.classList.add('active');
+      btn.title = 'Subtitles ON — click to toggle';
+    }
+  });
+})();
+
+// ─── PLAYBACK ─────────────────────────────────────────────────
 
 function doPlay(player) {
   // Always try to resume AudioContext (browser policy)
