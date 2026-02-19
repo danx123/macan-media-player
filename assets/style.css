@@ -152,7 +152,7 @@ body {
 .header-right {
   display: flex;
   align-items: center;
-  gap: 20px;
+  gap: 12px;
   flex-shrink: 0;
 }
 
@@ -174,6 +174,40 @@ body {
   color: var(--text-lo);
   letter-spacing: 2px;
   margin-top: 2px;
+}
+
+/* CONVERT button in header (next to clock) */
+.header-convert-btn {
+  display: flex !important;
+  align-items: center;
+  gap: 6px;
+  background: rgba(200, 255, 0, 0.1) !important;
+  border: 1px solid rgba(200, 255, 0, 0.4) !important;
+  color: #E8FF00 !important;
+  padding: 6px 11px;
+  border-radius: 4px;
+  font-family: 'Space Mono', monospace;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.header-convert-btn:hover {
+  background: rgba(200, 255, 0, 0.22) !important;
+  border-color: #c8ff00 !important;
+  transform: translateY(-1px);
+}
+.header-convert-btn.active {
+  background: rgba(200, 255, 0, 0.22) !important;
+  border-color: #c8ff00 !important;
+  box-shadow: 0 0 8px rgba(200,255,0,0.25);
+}
+.header-convert-btn svg {
+  flex-shrink: 0;
+  opacity: 0.9;
 }
 
 .wm-controls { display: flex; gap: 6px; }
@@ -607,14 +641,15 @@ body {
   background: rgba(6,6,6,0.7);
   backdrop-filter: blur(30px);
   overflow: hidden;
+  min-width: 0;
 }
 
 #playlist-header {
-  height: 52px;
-  padding: 0 24px;
+  padding: 8px 16px;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   background: rgba(0,0,0,0.4);
@@ -641,11 +676,12 @@ body {
 #search-wrap {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   background: var(--surface);
   border: 1px solid var(--border);
-  padding: 6px 12px;
-  min-width: 200px;
+  padding: 5px 10px;
+  width: 140px;
+  flex-shrink: 1;
 }
 #search-wrap svg { color: var(--text-lo); flex-shrink: 0; }
 #search-input {
@@ -1420,34 +1456,69 @@ input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider)::-webk
 .pl-header-right {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
+  flex-shrink: 0;
+  overflow: visible;
 }
 
+/* Icon-only tool buttons — text label hidden by default, shown on wider screens */
 .pl-tool-btn {
   display: flex;
   align-items: center;
-  gap: 5px;
+  justify-content: center;
+  gap: 0;
   background: rgba(232, 255, 0, 0.05);
   border: 1px solid rgba(232, 255, 0, 0.2);
   color: #E8FF00;
-  padding: 6px 12px;
+  padding: 7px 9px;
   border-radius: 4px;
   font-family: 'Space Mono', monospace;
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.5px;
   cursor: pointer;
   transition: all 0.2s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+  position: relative;
+}
+
+/* Always show text label next to icon */
+.pl-tool-btn {
+  gap: 5px;
+  padding: 6px 10px;
+}
+
+.pl-tool-btn .pl-btn-label {
+  display: inline;
 }
 
 .pl-tool-btn:hover {
-  background: rgba(232, 255, 0, 0.1);
-  border-color: rgba(232, 255, 0, 0.4);
+  background: rgba(232, 255, 0, 0.12);
+  border-color: rgba(232, 255, 0, 0.5);
   transform: translateY(-1px);
 }
 
+
 .pl-tool-btn svg {
-  opacity: 0.8;
+  opacity: 0.85;
+  flex-shrink: 0;
+}
+
+/* CONVERT button accent — kept for legacy reference */
+.pl-tool-btn--convert {
+  background: rgba(200, 255, 0, 0.1);
+  border-color: rgba(200, 255, 0, 0.4);
+}
+.pl-tool-btn--convert:hover {
+  background: rgba(200, 255, 0, 0.22) !important;
+  border-color: #c8ff00 !important;
+}
+
+/* Active/toggled state */
+.pl-tool-btn.active {
+  background: rgba(232, 255, 0, 0.18);
+  border-color: rgba(232, 255, 0, 0.6);
 }
 
 /* ═══════════════════════════════════════════════════════════════
