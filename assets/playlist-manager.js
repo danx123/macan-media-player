@@ -24,7 +24,7 @@ class PlaylistManager {
         if (data && typeof data === 'object' && !Array.isArray(data)) {
           this.registry = data;
           this.updatePlaylistList();
-          return true;
+          return;
         }
       }
     } catch (e) {
@@ -36,7 +36,6 @@ class PlaylistManager {
       this.registry = {};
     }
     this.updatePlaylistList();
-    return false;
   }
 
   async saveCurrentPlaylist(name, tracks) {
@@ -52,22 +51,12 @@ class PlaylistManager {
 
     if (typeof pywebview !== 'undefined') {
       try {
-        const ok = await pywebview.api.save_named_playlist(name, tracks);
-        if (!ok) {
-          console.error('[PlaylistManager] save_named_playlist returned falsy');
-          alert(`Failed to save playlist "${name}". Check console for errors.`);
-          return false;
-        }
-        // Reload registry from Python to get the stable filename
+        await pywebview.api.save_named_playlist(name, tracks);
         await this._loadRegistry();
-        return true;
       } catch (e) {
         console.error('[PlaylistManager] save_named_playlist failed:', e);
-        alert(`Error saving playlist "${name}": ${e.message || e}`);
-        return false;
       }
     }
-    return true;
   }
 
   async loadPlaylistTracks(name) {
@@ -203,6 +192,13 @@ class PlaylistManager {
       if (e.target === this.container) this.close();
     });
 
+    // Block all keyboard shortcuts while typing in the playlist name input.
+    // Without this, keys like Space, N, P, S, R, M trigger playback controls.
+    const nameInput = this.container.querySelector('#pm-playlist-name');
+    nameInput.addEventListener('keydown', e => e.stopPropagation());
+    nameInput.addEventListener('keyup',   e => e.stopPropagation());
+    nameInput.addEventListener('keypress',e => e.stopPropagation());
+
     this.container.querySelector('#pm-save').addEventListener('click', async () => {
       const nameInput = this.container.querySelector('#pm-playlist-name');
       const name = nameInput.value.trim();
@@ -211,32 +207,17 @@ class PlaylistManager {
       btn.disabled = true;
       btn.textContent = 'SAVING…';
       try {
-        let saved = false;
         if (this.onSaveCallback) {
-          saved = await this.onSaveCallback(name);
+          await this.onSaveCallback(name);
         }
         nameInput.value = '';
-        if (saved !== false) {
-          btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="20 6 9 17 4 12"/>
-          </svg> SAVED!`;
-          setTimeout(() => {
-            btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
-              <polyline points="17 21 17 13 7 13 7 21"/>
-              <polyline points="7 3 7 8 15 8"/>
-            </svg> SAVE CURRENT`;
-          }, 2000);
-        }
       } finally {
         btn.disabled = false;
-        if (!btn.innerHTML.includes('SAVED')) {
-          btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
-            <polyline points="17 21 17 13 7 13 7 21"/>
-            <polyline points="7 3 7 8 15 8"/>
-          </svg> SAVE CURRENT`;
-        }
+        btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+          <polyline points="17 21 17 13 7 13 7 21"/>
+          <polyline points="7 3 7 8 15 8"/>
+        </svg> SAVE CURRENT`;
       }
     });
 
