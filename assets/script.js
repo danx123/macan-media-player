@@ -666,6 +666,76 @@ const btnLyrics      = document.getElementById('btn-lyrics');
 btnLyrics.addEventListener('click', () => toggleLyrics());
 document.getElementById('lyrics-close').addEventListener('click', () => closeLyrics());
 
+// ── Converter button ─────────────────────────────────────────────────────
+// Auto-inject the CONVERT button next to the clock if it doesn't exist in HTML
+(function _injectConverterBtn() {
+  if (document.getElementById('btn-converter')) {
+    // Already exists in HTML — just bind it
+    document.getElementById('btn-converter').addEventListener('click', () => {
+      if (typeof openConverter === 'function') openConverter();
+    });
+    return;
+  }
+
+  // Not found in HTML — create and inject next to clock
+  const btn = document.createElement('button');
+  btn.id        = 'btn-converter';
+  btn.title     = 'Converter';
+  btn.innerHTML = `
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+    </svg>
+    <span>CONVERT</span>`;
+
+  Object.assign(btn.style, {
+    display:       'flex',
+    alignItems:    'center',
+    gap:           '6px',
+    background:    'rgba(200,255,0,0.10)',
+    border:        '1px solid rgba(200,255,0,0.45)',
+    color:         '#E8FF00',
+    padding:       '6px 12px',
+    borderRadius:  '4px',
+    fontFamily:    "'Space Mono', monospace",
+    fontSize:      '9px',
+    fontWeight:    '700',
+    letterSpacing: '1px',
+    cursor:        'pointer',
+    whiteSpace:    'nowrap',
+    flexShrink:    '0',
+    transition:    'all 0.2s ease',
+  });
+
+  btn.addEventListener('mouseenter', () => {
+    btn.style.background   = 'rgba(200,255,0,0.22)';
+    btn.style.borderColor  = '#c8ff00';
+  });
+  btn.addEventListener('mouseleave', () => {
+    btn.style.background   = btn.classList.contains('active')
+      ? 'rgba(200,255,0,0.22)' : 'rgba(200,255,0,0.10)';
+    btn.style.borderColor  = btn.classList.contains('active')
+      ? '#c8ff00' : 'rgba(200,255,0,0.45)';
+  });
+
+  btn.addEventListener('click', () => {
+    if (typeof openConverter === 'function') openConverter();
+  });
+
+  // Insert before the wm-controls (minimize/close buttons) inside .header-right
+  const headerRight = document.querySelector('.header-right');
+  const wmControls  = document.querySelector('.wm-controls');
+  if (headerRight && wmControls) {
+    headerRight.insertBefore(btn, wmControls);
+  } else if (headerRight) {
+    headerRight.appendChild(btn);
+  } else {
+    // Last resort: append to top-bar
+    const topBar = document.getElementById('top-bar');
+    if (topBar) topBar.appendChild(btn);
+  }
+})();
+
 // Lyrics fullscreen toggle
 let _lyricsFullscreen = false;
 let _lyricsEscHintTimer = null;
