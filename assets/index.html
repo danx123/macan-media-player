@@ -46,6 +46,14 @@
       <span id="clock-time">00:00:00</span>
       <span id="clock-date">MON 00</span>
     </div>
+    <button id="btn-about" title="About Macan Media Player">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="12" y1="8" x2="12" y2="12"/>
+        <line x1="12" y1="16" x2="12.01" y2="16"/>
+      </svg>
+      ABOUT
+    </button>
     <div class="wm-controls">
       <button class="wm-btn" id="btn-minimize" title="Minimize">─</button>
       <button class="wm-btn danger" id="btn-close" title="Close">✕</button>
@@ -716,11 +724,108 @@
   </div>
 </div>
 
+<!-- ═══════════ ABOUT OVERLAY ══════════════════════════════════ -->
+<div id="about-overlay" class="about-overlay">
+  <div class="about-panel">
+
+    <!-- Header -->
+    <div class="about-header">
+      <button class="about-close-btn" id="about-close">&#x2715;</button>
+    </div>
+
+    <!-- Hero / Branding -->
+    <div class="about-hero">
+      <div class="about-logo-ring">
+        <svg width="52" height="52" viewBox="0 0 28 28" fill="none">
+          <polygon points="14,2 26,8 26,20 14,26 2,20 2,8" stroke="#E8FF00" stroke-width="1.5" fill="none"/>
+          <circle cx="14" cy="14" r="4" fill="#E8FF00"/>
+        </svg>
+      </div>
+      <div class="about-title-block">
+        <h1 class="about-app-name">MACAN</h1>
+        <span class="about-app-sub">MEDIA PLAYER</span>
+      </div>
+      <div class="about-version-badge">
+        <span class="about-ver-label">VERSION</span>
+        <span class="about-ver-num" id="about-ver-num">—</span>
+      </div>
+    </div>
+
+    <!-- Description -->
+    <div class="about-desc">
+      <p>
+        Macan Media Player is a lightweight, high-fidelity desktop media player built for
+        audiophiles and power users who demand full control over their listening experience.
+        Engineered with a focus on performance and clarity, it supports a wide range of
+        audio and video formats, real-time parametric equalization, synchronized lyrics,
+        online radio and TV streaming, and advanced playlist management — all within a
+        single, distraction-free interface.
+      </p>
+      <p>
+        Macan is designed to get out of your way and let the music speak for itself.
+      </p>
+    </div>
+
+    <!-- Divider -->
+    <div class="about-divider"></div>
+
+    <!-- Meta info grid -->
+    <div class="about-meta-grid">
+      <div class="about-meta-item">
+        <span class="about-meta-label">DEVELOPER</span>
+        <span class="about-meta-val">Macan Angkasa</span>
+      </div>
+      <div class="about-meta-item">
+        <span class="about-meta-label">PLATFORM</span>
+        <span class="about-meta-val">Windows · pywebview + EdgeWebView2</span>
+      </div>
+      <div class="about-meta-item">
+        <span class="about-meta-label">LICENSE</span>
+        <span class="about-meta-val">Proprietary — All Rights Reserved</span>
+      </div>
+      <div class="about-meta-item">
+        <span class="about-meta-label">REPOSITORY</span>
+        <a class="about-meta-link" id="about-repo-link" href="#">github.com/danx123/macan-media-player</a>
+      </div>
+    </div>
+
+    <div class="about-divider"></div>
+
+    <!-- Update checker -->
+    <div class="about-update-row">
+      <div class="about-update-info">
+        <span class="about-update-label">SOFTWARE UPDATE</span>
+        <span class="about-update-status" id="about-update-status">Click CHECK UPDATE to check for the latest release.</span>
+      </div>
+      <button class="about-update-btn" id="about-check-update">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"/>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+        CHECK UPDATE
+      </button>
+    </div>
+
+    <!-- Update progress bar (hidden by default) -->
+    <div class="about-update-progress" id="about-update-progress" style="display:none">
+      <div class="about-update-bar" id="about-update-bar"></div>
+    </div>
+
+    <!-- Footer -->
+    <div class="about-footer">
+      <span>© 2026 Macan Angkasa — All Rights Reserved.</span>
+      <span class="about-footer-build" id="about-footer-build"></span>
+    </div>
+
+  </div>
+</div>
+
 <!-- ═══════════ SCRIPTS ═══════════════════════════════════ -->
 <script src="equalizer.js"></script>
 <script src="playlist-manager.js"></script>
 <script src="radio-tv.js"></script>
 <script src="converter.js"></script>
+<script src="about.js"></script>
 <script src="script.js"></script>
 </body>
 </html>
