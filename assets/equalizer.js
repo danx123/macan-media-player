@@ -135,8 +135,10 @@ class Equalizer10Band {
 
   async initFromPython() {
     // Called once by script.js after pywebview bridge is confirmed ready.
-    // Loads saved Custom preset so it survives app restarts.
+    // Loads saved Custom preset and last-used preset name so they survive restarts.
     if (typeof pywebview === 'undefined') return;
+
+    // Step 1 — restore Custom preset bands from Python
     try {
       const bands = await pywebview.api.get_eq_custom();
       if (Array.isArray(bands) && bands.length === 10) {
@@ -145,14 +147,22 @@ class Equalizer10Band {
     } catch (e) {
       console.warn('[EQ] get_eq_custom failed:', e);
     }
-    // Also restore last used preset name (non-blocking)
+
+    // Step 2 — restore last-used preset name AND apply it
     try {
       const lastPreset = await pywebview.api.get_eq_preset_name();
       if (lastPreset && this.presets[lastPreset]) {
         this._lastSavedPreset = lastPreset;
+        // Apply bands to all filters so the audio effect is live immediately
+        this.applyPreset(lastPreset);
+        // Notify EqualizerUI to sync sliders + dropdown (if UI is already built)
+        // equalizerUI is a global set by script.js — safe to reference here
+        if (typeof equalizerUI !== 'undefined' && equalizerUI) {
+          equalizerUI.syncSlidersFromEq(lastPreset);
+        }
       }
     } catch (e) {
-      // Older Python version may not have this method yet — ignore
+      console.warn('[EQ] get_eq_preset_name failed (older backend?):', e);
     }
   }
 }
