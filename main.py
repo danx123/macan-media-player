@@ -407,48 +407,6 @@ class MacanMediaAPI:
             print(f"[MACAN] get_file_url error: {e}")
             return None
 
-    def get_subtitle_url(self, video_path):
-        """Look for a same-named .srt file next to the video and serve it via
-        the local media server so the browser can load it cross-origin."""
-        try:
-            p = Path(video_path).resolve()
-            srt = p.with_suffix('.srt')
-            if not srt.exists():
-                # Case-insensitive fallback (useful on Windows-originated paths)
-                for sibling in p.parent.iterdir():
-                    if sibling.stem.lower() == p.stem.lower() and sibling.suffix.lower() == '.srt':
-                        srt = sibling
-                        break
-                else:
-                    return None
-            url = _media_server.register(srt)
-            print(f"[MACAN] Serving subtitle: {url}  ← {srt.name}")
-            return url
-        except Exception as e:
-            print(f"[MACAN] get_subtitle_url error: {e}")
-            return None
-
-    def get_subtitle_url(self, video_path):
-        """Look for a same-named .srt file next to the video and serve it via
-        the local media server so the browser can load it cross-origin."""
-        try:
-            p = Path(video_path).resolve()
-            srt = p.with_suffix('.srt')
-            if not srt.exists():
-                # Case-insensitive fallback (useful on Windows-originated paths)
-                for sibling in p.parent.iterdir():
-                    if sibling.stem.lower() == p.stem.lower() and sibling.suffix.lower() == '.srt':
-                        srt = sibling
-                        break
-                else:
-                    return None
-            url = _media_server.register(srt)
-            print(f"[MACAN] Serving subtitle: {url}  ← {srt.name}")
-            return url
-        except Exception as e:
-            print(f"[MACAN] get_subtitle_url error: {e}")
-            return None
-
     # ─── CACHE MANAGER ───────────────────────────────────────────────────────
 
     def _dir_size(self, path: str) -> int:
@@ -1082,13 +1040,9 @@ class MacanMediaAPI:
             return dict(self.settings)
 
     def save_app_state(self, state_dict):
-        """Save full application state: current index, position, volume, EQ bands, etc.
-        FIX: Wrapped in _settings_lock to prevent concurrent writes from parallel
-        JS→Python bridge calls (e.g. periodic 10s saves overlapping with user actions)."""
+        """Save full application state: current index, position, volume, EQ bands, etc."""
         with self._settings_lock:
             self.settings['app_state'] = state_dict
-            # FIX: Also sync eq_preset_name as a dedicated key so EQ preset
-            # survives even if app_state is partially corrupt or missing eqBands.
             if isinstance(state_dict, dict):
                 eq_preset = state_dict.get('eqPreset')
                 if eq_preset and isinstance(eq_preset, str):
@@ -1097,6 +1051,8 @@ class MacanMediaAPI:
                 if isinstance(eq_bands, list) and len(eq_bands) == 10:
                     self.settings['eq_bands_backup'] = eq_bands
             self._save_settings_locked()
+            print(f"[MACAN] State saved — keys={len(self.settings)}, "
+                  f"eq_preset={self.settings.get('eq_preset_name','—')}")
         return True
 
     def get_app_state(self):
