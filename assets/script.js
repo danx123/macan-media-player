@@ -96,41 +96,138 @@ let equalizer;
 let equalizerUI;
 let playlistManager;
 
-function initAudioContext() {
-  if (!audioContext) {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    equalizer = new Equalizer10Band(audioContext);
-    equalizerUI = new EqualizerUI(equalizer);
-
-    // GainNode for ReplayGain normalization
-    S._gainNode = audioContext.createGain();
-    S._gainNode.gain.value = 1.0;
-
-    // GainNode for fade in/out
-    S._fadeGain = audioContext.createGain();
-    S._fadeGain.gain.value = 1.0;
-
-    // Connect chain: source → EQ → normGain → fadeGain → destination
-    if (!audioSource) {
-      audioSource = audioContext.createMediaElementSource(audioPlayer);
-      audioSource.connect(equalizer.input);
-      equalizer.connect(S._gainNode);
-      S._gainNode.connect(S._fadeGain);
-      S._fadeGain.connect(audioContext.destination);
+// ── EQ UI bootstrap (no AudioContext needed) ──────────────────
+// EqualizerUI is created immediately at script load so:
+//   1. The EQ overlay is rendered and interactive from the start.
+//   2. equalizerUI.currentPreset is always available for persistAppState,
+//      even before the user has ever pressed Play.
+//   3. Preset selection and scheduleStateSave() work without AudioContext.
+//
+// A lightweight stub equalizer (no BiquadFilters, no AudioContext) is used
+// until initAudioContext() is called — at which point the real Equalizer10Band
+// takes over and equalizerUI.eq is swapped to it.
+const _eqStub = {
+  // Preset table — duplicated here so UI can populate dropdown without AudioContext
+  presets: {
+    'Custom':        [0,0,0,0,0,0,0,0,0,0],
+    'Flat':          [0,0,0,0,0,0,0,0,0,0],
+    'Acoustic':      [4,4,3,1,2,2,3,4,3,2],
+    'Bass Boost':    [9,7,5,2,0,0,0,0,0,0],
+    'Bass Cut':      [-4,-3,-1,0,0,0,0,1,2,2],
+    'Classical':     [5,4,3,2,-1,-1,0,2,3,4],
+    'Dance':         [4,6,2,0,0,-2,-2,-2,4,4],
+    'Electronic':    [5,4,1,0,-2,2,1,2,5,6],
+    'Hip-Hop':       [6,5,1,2,-1,-1,1,-2,2,3],
+    'Jazz':          [4,3,1,2,-2,-2,0,2,4,5],
+    'Metal':         [5,4,4,2,0,-2,2,4,5,6],
+    'Pop':           [-2,-1,2,4,5,4,2,0,-1,-1],
+    'R&B':           [3,7,5,1,-2,-1,2,3,3,4],
+    'Rock':          [5,4,3,1,-1,-1,1,3,4,5],
+    'Small Speakers':[ 6,5,4,3,2,0,-2,-3,-4,-5],
+    'Spoken Word':   [-2,-1,0,1,5,5,4,2,0,-3],
+    'Treble Boost':  [0,0,0,0,0,1,3,5,7,9],
+    'Vocal':         [-2,-3,-2,1,4,5,4,2,0,-1],
+  },
+  bandNames: ['31Hz','62Hz','125Hz','250Hz','500Hz','1kHz','2kHz','4kHz','8kHz','16kHz'],
+  _pendingValues: null,
+  _lastSavedPreset: 'Flat',
+  applyPreset(name) {
+    const v = this.presets[name];
+    if (!v) return null;
+    this._pendingValues = v.slice();
+    if (typeof pywebview !== 'undefined') {
+      pywebview.api.save_eq_preset_name(name).catch(() => {});
     }
-
-    // Load saved Custom preset from Python (async, non-blocking)
-    // Must happen before applying pendingEqBands so Custom preset is available
-    equalizer.initFromPython().then(() => {
-      // Apply pending EQ state restored from app_state
-      if (S._pendingEqBands) {
-        equalizer.setAllBands(S._pendingEqBands);
-        if (equalizerUI) equalizerUI.syncSlidersFromEq(S._pendingEqPreset);
-        S._pendingEqBands  = null;
-        S._pendingEqPreset = null;
+    return v;
+  },
+  getCurrentValues() {
+    return this._pendingValues ? this._pendingValues.slice() : Array(10).fill(0);
+  },
+  setBandGain() {},
+  getBandGain(i) { return this._pendingValues?.[i] ?? 0; },
+  setAllBands(vals) { if (vals) this._pendingValues = vals.slice(); },
+  saveCustomPreset(vals) {
+    this.presets['Custom'] = vals.slice();
+    if (typeof pywebview !== 'undefined') {
+      pywebview.api.save_eq_custom(vals).catch(() => {});
+      pywebview.api.save_eq_preset_name('Custom').catch(() => {});
+    }
+  },
+  async initFromPython() {
+    if (typeof pywebview === 'undefined') return;
+    try {
+      const bands = await pywebview.api.get_eq_custom();
+      if (Array.isArray(bands) && bands.length === 10) this.presets['Custom'] = bands;
+    } catch (_) {}
+    try {
+      const name = await pywebview.api.get_eq_preset_name();
+      if (name && this.presets[name]) {
+        this._lastSavedPreset = name;
+        this.applyPreset(name);
+        if (equalizerUI) equalizerUI.syncSlidersFromEq(name);
       }
-    });
+    } catch (_) {}
+  },
+};
+
+// Build the UI immediately against the stub
+equalizerUI = new EqualizerUI(_eqStub);
+
+// As soon as pywebview is ready, load the saved preset into the stub UI
+// (initFromPython is called again on the real equalizer after AudioContext init)
+window.addEventListener('pywebviewready', () => {
+  _eqStub.initFromPython();
+}, { once: true });
+
+function initAudioContext() {
+  if (audioContext) return; // already initialized
+
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  equalizer    = new Equalizer10Band(audioContext);
+
+  // Swap stub → real equalizer in the existing UI instance
+  // (avoids destroying and rebuilding the DOM overlay)
+  equalizerUI.eq = equalizer;
+
+  // Copy preset state from stub to real equalizer
+  equalizer.presets['Custom'] = _eqStub.presets['Custom'].slice();
+
+  // GainNode for ReplayGain normalization
+  S._gainNode = audioContext.createGain();
+  S._gainNode.gain.value = 1.0;
+
+  // GainNode for fade in/out
+  S._fadeGain = audioContext.createGain();
+  S._fadeGain.gain.value = 1.0;
+
+  // Connect chain: source → EQ → normGain → fadeGain → destination
+  if (!audioSource) {
+    audioSource = audioContext.createMediaElementSource(audioPlayer);
+    audioSource.connect(equalizer.input);
+    equalizer.connect(S._gainNode);
+    S._gainNode.connect(S._fadeGain);
+    S._fadeGain.connect(audioContext.destination);
   }
+
+  // Apply the preset that was selected in the stub (or restored from DB)
+  // _pendingEqBands from _doStateRestore takes priority (exact band values)
+  // over the stub's preset name (which may differ if user tweaked sliders).
+  equalizer.initFromPython().then(() => {
+    if (S._pendingEqBands) {
+      equalizer.setAllBands(S._pendingEqBands);
+      equalizerUI.syncSlidersFromEq(S._pendingEqPreset);
+      S._pendingEqBands  = null;
+      S._pendingEqPreset = null;
+    } else {
+      // No save_app_state bands — fall back to whatever initFromPython restored
+      // (which is the eq_preset_name key), or the stub's pending values.
+      const stubVals = _eqStub._pendingValues;
+      if (stubVals) {
+        equalizer.setAllBands(stubVals);
+        equalizerUI.syncSlidersFromEq(equalizerUI.currentPreset);
+      }
+    }
+  });
 }
 
 
@@ -615,7 +712,7 @@ playlistManager.onLoad(async (name) => {
 });
 
 btnEqualizer.addEventListener('click', () => {
-  initAudioContext();
+  // AudioContext init deferred to actual playback — UI is already available
   equalizerUI.toggle();
 });
 
@@ -2303,6 +2400,24 @@ function doPlay(player) {
       if (S.fadeEnabled && S._fadeGain && audioContext && !player.isVideo) {
         doFadeIn();
       }
+      // FIX: Re-push SMTC metadata + playing state AFTER play() resolves.
+      // updateTrackInfo() fires before play() so mediaSession.playbackState
+      // may still be 'paused' or stale from the previous track. Refreshing
+      // here guarantees Windows SMTC (taskbar thumbnail, lock screen) shows
+      // the correct track name and playing indicator immediately.
+      if ('mediaSession' in navigator) {
+        const track = S.playlist[S.currentIndex];
+        if (track) {
+          navigator.mediaSession.playbackState = 'playing';
+          // Only re-push full metadata if title has changed (avoids redundant
+          // blob URL creation on resume-after-pause of the same track).
+          const currentTitle = navigator.mediaSession.metadata?.title;
+          if (currentTitle !== (track.name || '—')) {
+            updateMediaSession(track, track.cover_art || null);
+          }
+          syncMediaSessionState();
+        }
+      }
     }).catch(err => {
       if (err.name === 'AbortError') {
         console.log('[MACAN] Play aborted (track changed), ignoring.');
@@ -2436,7 +2551,12 @@ function updateTrackInfo(track) {
     fetchLyrics(track);
   }
 
-  // Update SMTC immediately with known info (art will follow via applyArt)
+  // Update SMTC immediately with known info (art will follow via applyArt).
+  // Set playbackState to 'none' temporarily to signal to Windows SMTC that
+  // the track has changed — doPlay() will push 'playing' once resolved.
+  if ('mediaSession' in navigator) {
+    try { navigator.mediaSession.playbackState = 'none'; } catch (_) {}
+  }
   updateMediaSession(track, track.cover_art || null);
 }
 
@@ -2661,11 +2781,12 @@ async function persistAppState() {
       fadeEnabled:   S.fadeEnabled,
       fadeDuration:  S.fadeDuration,
       normEnabled:   S.normEnabled,
-      // FIX: If AudioContext/equalizer hasn't been initialized yet (user hasn't
-      // interacted with EQ), fall back to the pending values from restore so we
-      // don't overwrite a valid saved EQ state with null.
-      eqBands:  equalizer ? equalizer.getCurrentValues() : (S._pendingEqBands || null),
-      eqPreset: equalizerUI ? equalizerUI.currentPreset  : (S._pendingEqPreset || null),
+      // equalizerUI is always available (created at script load against the stub).
+      // equalizer (real Web Audio) may still be null if user hasn't played yet —
+      // fall back to stub values so we don't overwrite a valid saved EQ state.
+      eqBands:  equalizer ? equalizer.getCurrentValues()
+                           : (_eqStub._pendingValues || S._pendingEqBands || null),
+      eqPreset: equalizerUI.currentPreset || S._pendingEqPreset || 'Flat',
     };
     await pywebview.api.save_app_state(state);
   } catch(e) {
