@@ -4896,3 +4896,65 @@ video::cue {
   scrollbar-width: thin;
   scrollbar-color: rgba(255,255,255,0.08) transparent;
 }
+
+/* ── Smart Playlist — tabs row + LOAD button ── */
+.sp-tabs-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 20px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  flex-shrink: 0;
+  gap: 10px;
+}
+.sp-tabs-row .sp-tabs {
+  display: flex;
+  gap: 0;
+  padding: 0;
+  border-bottom: none;
+  margin-bottom: -1px;
+}
+
+.sp-load-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 13px;
+  background: rgba(232,255,0,0.1);
+  border: 1px solid rgba(232,255,0,0.35);
+  border-radius: 4px;
+  color: #E8FF00;
+  font-family: 'Space Mono', monospace;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+  margin-bottom: 10px;
+}
+.sp-load-btn:hover {
+  background: rgba(232,255,0,0.2);
+  border-color: #E8FF00;
+  transform: translateY(-1px);
+}
+.sp-load-btn:active { transform: translateY(0); }
+
+/* play count badge on each row */
+.sp-play-count {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: 'Space Mono', monospace;
+  font-size: 0.62rem;
+  color: rgba(232,255,0,0.6);
+  white-space: nowrap;
+  min-width: 28px;
+}
+
+/* selected row highlight */
+.sp-item.sp-selected {
+  background: rgba(232,255,0,0.06);
+  border-left: 2px solid #E8FF00;
+  padding-left: calc(20px - 2px);
+}
