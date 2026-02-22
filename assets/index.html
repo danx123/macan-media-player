@@ -22,6 +22,10 @@
 <!-- ═══════════ HEADER ════════════════════════════════════ -->
 <header id="top-bar">
   <div class="brand">
+    <!-- Burger menu button -->
+    <button id="btn-burger" class="burger-btn" title="Menu" aria-label="Open menu">
+      <span></span><span></span><span></span>
+    </button>
     <svg width="26" height="26" viewBox="0 0 28 28" fill="none">
       <polygon points="14,2 26,8 26,20 14,26 2,20 2,8" stroke="#E8FF00" stroke-width="1.5" fill="none"/>
       <circle cx="14" cy="14" r="4" fill="#E8FF00"/>
@@ -410,87 +414,136 @@
 </div>
 
 
-<!-- ═══════════ RADIO OVERLAY ══════════════════════════════════ -->
-<div id="radio-overlay" class="radio-tv-overlay">
-  <div class="rtv-panel">
-    <div class="rtv-header">
-      <div class="rtv-header-left">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+<!-- ═══════════ RADIO OVERLAY (Center Modal) ════════════════════ -->
+<div id="radio-overlay" class="radio-modal-overlay">
+  <div class="radio-modal">
+
+    <!-- Header -->
+    <div class="radio-modal-header">
+      <div class="radio-modal-header-left">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="2">
           <rect x="3" y="10" width="18" height="11" rx="2"/>
           <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
           <circle cx="12" cy="16" r="2"/>
         </svg>
         <h2>RADIO ONLINE</h2>
-        <span id="radio-live-badge" class="rtv-live-badge" style="display:none">&#9679; LIVE</span>
+        <span id="radio-live-badge" class="radio-live-badge" style="display:none">&#9679; LIVE</span>
       </div>
-      <button class="rtv-close-btn" id="radio-close">&#x2715;</button>
+      <button class="radio-modal-close" id="radio-close">&#x2715;</button>
     </div>
 
-    <div class="rtv-now-playing" id="radio-now-playing" style="display:none">
-      <div class="rtv-np-icon">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="16" r="2"/><path d="M7 10V7a5 5 0 0 1 10 0v3"/>
-          <rect x="3" y="10" width="18" height="11" rx="2"/>
+    <!-- Now Playing + Controls -->
+    <div class="radio-player-section">
+      <!-- Album art / station logo placeholder -->
+      <div class="radio-art-frame">
+        <div class="radio-art-rings">
+          <div class="radio-ring radio-ring-1"></div>
+          <div class="radio-ring radio-ring-2"></div>
+        </div>
+        <div class="radio-art-icon" id="radio-art-icon">
+          <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.5">
+            <rect x="3" y="10" width="18" height="11" rx="2"/>
+            <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
+            <circle cx="12" cy="16" r="2"/>
+          </svg>
+        </div>
+        <!-- Animated bars (visible when playing) -->
+        <div class="radio-vis-bars" id="radio-vis-bars" style="display:none">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+
+      <!-- Track info -->
+      <div class="radio-now-playing" id="radio-now-playing">
+        <div class="radio-now-name" id="radio-now-name">— SELECT A STATION —</div>
+        <div class="radio-now-meta" id="radio-now-meta">RADIO ONLINE · MACAN</div>
+        <div class="radio-now-status" id="radio-status">IDLE</div>
+      </div>
+
+      <!-- Playback controls -->
+      <div class="radio-controls">
+        <button class="radio-ctrl-btn" id="radio-prev" title="Previous station">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="19,20 9,12 19,4"/><line x1="5" y1="4" x2="5" y2="20"/>
+          </svg>
+        </button>
+        <button class="radio-ctrl-btn radio-ctrl-play" id="radio-play-btn" title="Play / Pause">
+          <svg id="radio-icon-play" width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+          <svg id="radio-icon-stop" width="28" height="28" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+        <button class="radio-ctrl-btn" id="radio-next" title="Next station">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="5,4 15,12 5,20"/><line x1="19" y1="4" x2="19" y2="20"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Volume -->
+      <div class="radio-vol-row">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.6">
+          <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
         </svg>
-      </div>
-      <div class="rtv-np-info">
-        <div class="rtv-np-name" id="radio-now-name">&#8212;</div>
-        <div class="rtv-np-meta" id="radio-now-meta">&#8212;</div>
-      </div>
-      <div class="rtv-np-vis" id="radio-vis-bars">
-        <span></span><span></span><span></span><span></span><span></span>
-      </div>
-      <button class="rtv-stop-btn" id="radio-stop">&#9632; STOP</button>
-    </div>
-
-    <div class="rtv-controls-row">
-      <div class="rtv-search-wrap">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-        </svg>
-        <input type="text" id="radio-search" placeholder="SEARCH STATIONS..." class="rtv-search"/>
-      </div>
-      <button class="rtv-action-btn" id="radio-refresh" title="Refresh from internet">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="23 4 23 10 17 10"/>
-          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-        </svg>
-        REFRESH
-      </button>
-      <button class="rtv-action-btn" id="radio-add-custom">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-        </svg>
-        ADD URL
-      </button>
-    </div>
-
-    <div class="rtv-custom-url-row" id="radio-custom-url-row" style="display:none">
-      <input type="text" id="radio-custom-name" placeholder="Station name..." class="rtv-url-input"/>
-      <input type="text" id="radio-custom-url" placeholder="Stream URL (http://...)..." class="rtv-url-input"/>
-      <button class="rtv-action-btn accent" id="radio-custom-save">SAVE &amp; PLAY</button>
-      <button class="rtv-action-btn" id="radio-custom-cancel">CANCEL</button>
-    </div>
-
-    <div class="rtv-list-header">
-      <span>STATIONS</span>
-      <span class="rtv-count" id="radio-count">&#8212; stations</span>
-    </div>
-
-    <div class="rtv-list" id="radio-list">
-      <div class="rtv-empty-state">
-        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
-          <rect x="3" y="10" width="18" height="11" rx="2"/>
-          <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
-          <circle cx="12" cy="16" r="2"/>
-        </svg>
-        <p>PRESS REFRESH TO LOAD STATIONS</p>
+        <input type="range" id="radio-vol-slider" class="radio-vol-slider" min="0" max="100" value="80">
+        <span class="radio-vol-val" id="radio-vol-val">80</span>
       </div>
     </div>
 
-    <div class="rtv-footer">
-      <span id="radio-status">IDLE</span>
+    <!-- Divider -->
+    <div class="radio-divider"></div>
+
+    <!-- Station list section -->
+    <div class="radio-list-section">
+      <!-- Search + actions -->
+      <div class="radio-search-row">
+        <div class="radio-search-wrap">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input type="text" id="radio-search" placeholder="SEARCH STATIONS..." class="radio-search-input"/>
+        </div>
+        <button class="radio-action-btn" id="radio-refresh" title="Refresh">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="23 4 23 10 17 10"/>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+          </svg>
+          REFRESH
+        </button>
+        <button class="radio-action-btn" id="radio-add-custom">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          ADD URL
+        </button>
+      </div>
+
+      <!-- Custom URL row -->
+      <div class="radio-custom-row" id="radio-custom-url-row" style="display:none">
+        <input type="text" id="radio-custom-name" placeholder="Station name..." class="radio-url-input"/>
+        <input type="text" id="radio-custom-url" placeholder="Stream URL (http://...)..." class="radio-url-input"/>
+        <button class="radio-action-btn radio-action-accent" id="radio-custom-save">SAVE &amp; PLAY</button>
+        <button class="radio-action-btn" id="radio-custom-cancel">CANCEL</button>
+      </div>
+
+      <!-- List header -->
+      <div class="radio-list-header">
+        <span>STATIONS</span>
+        <span id="radio-count" class="radio-count">— stations</span>
+      </div>
+
+      <!-- Station list -->
+      <div class="radio-list" id="radio-list">
+        <div class="rtv-empty-state">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
+            <rect x="3" y="10" width="18" height="11" rx="2"/>
+            <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
+            <circle cx="12" cy="16" r="2"/>
+          </svg>
+          <p>PRESS REFRESH TO LOAD STATIONS</p>
+        </div>
+      </div>
     </div>
+
   </div>
 </div>
 
@@ -820,12 +873,70 @@
   </div>
 </div>
 
+<!-- ═══════════ NAV MENU ══════════════════════════════════════ -->
+<div id="nav-menu-overlay"></div>
+<div id="nav-menu-panel">
+  <div class="nm-header">
+    <span class="nm-title">MENU</span>
+    <button class="nm-close-btn" id="nm-close-btn">✕</button>
+  </div>
+  <div id="nav-menu-list"></div>
+</div>
+
+<!-- ═══════════ SMART PLAYLIST OVERLAY ════════════════════════ -->
+<div id="smart-playlist-overlay">
+  <div class="sp-panel">
+    <div class="sp-header">
+      <div class="sp-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26"/>
+        </svg>
+        <h2>SMART PLAYLIST</h2>
+        <span class="sp-count-badge" id="sp-count">0 TRACKS</span>
+      </div>
+      <button class="sp-close-btn" id="smart-playlist-close">✕</button>
+    </div>
+
+    <div class="sp-subheader">
+      <span class="sp-sub-label">TOP 25 MOST PLAYED</span>
+    </div>
+
+    <div class="sp-tabs">
+      <button class="sp-tab active" id="sp-tab-audio">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/>
+        </svg>
+        AUDIO
+      </button>
+      <button class="sp-tab" id="sp-tab-video">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="7" width="20" height="15" rx="2"/>
+          <polyline points="17 2 12 7 7 2"/>
+        </svg>
+        VIDEO
+      </button>
+    </div>
+
+    <div class="sp-list" id="sp-list"></div>
+
+    <div class="sp-empty" id="sp-empty" style="display:none">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
+        <polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26"/>
+      </svg>
+      <p>NO PLAY HISTORY YET</p>
+      <p class="sp-empty-sub">TRACKS APPEAR HERE AFTER YOU PLAY THEM</p>
+    </div>
+  </div>
+</div>
+
 <!-- ═══════════ SCRIPTS ═══════════════════════════════════ -->
 <script src="equalizer.js"></script>
 <script src="playlist-manager.js"></script>
 <script src="radio-tv.js"></script>
 <script src="converter.js"></script>
 <script src="about.js"></script>
+<script src="smart-playlist.js"></script>
+<script src="nav-menu.js"></script>
 <script src="script.js"></script>
 </body>
 </html>
