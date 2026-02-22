@@ -2321,13 +2321,89 @@ def main():
     entry_point = os.path.join(base_dir, 'assets', 'index.html')
 
     # ── WebView2 persistent storage profile ───────────────────────────────────
-    # Passing storage_path tells EdgeWebView2 to use a fixed user-data directory
-    # (same mechanism as shrine_web.py's hybrid_data_shared / profile_path).
-    # This makes localStorage, IndexedDB, cookies, and cache survive restarts —
-    # identical behaviour to a real Chrome/Edge browser profile.
+    # Passing storage_path tells EdgeWebView2 to use a fixed user-data directory.
+    # This makes localStorage, IndexedDB, cookies, and cache survive restarts.
     # On non-Windows builds (Qt backend) pywebview ignores the kwarg gracefully.
     webview_storage = api._get_webview_storage_path()
     os.makedirs(webview_storage, exist_ok=True)
+
+    # ── Auto cache-bust: clear WebView2 disk cache when assets change ─────────
+    # Problem: WebView2 aggressively caches HTML/CSS/JS on disk. When source
+    # files are updated, the old cached versions are served instead — the app
+    # visually looks unchanged even after a code update.
+    #
+    # Solution: on every startup, hash all frontend asset files. If the hash
+    # differs from the one stored in the profile (from the last run), wipe ONLY
+    # the disk-cache subdirectories (Cache, Code Cache, GPUCache, Service Worker).
+    # localStorage / IndexedDB / cookies are NOT touched — user data is safe.
+    #
+    # Hash file location: <WebView2Profile>/asset_hash.txt
+    # Cleared folders: Cache, Code Cache, GPUCache, Service Worker,
+    #                  CacheStorage, blob_storage (and their EBWebView mirrors).
+
+    import hashlib, shutil as _shutil
+
+    def _hash_assets(assets_dir: str) -> str:
+        """SHA-256 over the content of every .html/.css/.js file in assets_dir."""
+        h = hashlib.sha256()
+        exts = {'.html', '.css', '.js'}
+        try:
+            for root, dirs, files in os.walk(assets_dir):
+                dirs.sort()   # deterministic walk order
+                for fname in sorted(files):
+                    if os.path.splitext(fname)[1].lower() in exts:
+                        fpath = os.path.join(root, fname)
+                        try:
+                            with open(fpath, 'rb') as f:
+                                h.update(f.read())
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+        return h.hexdigest()
+
+    def _clear_wv2_disk_cache(wv2_root: str) -> None:
+        """Delete only disk-cache subdirs inside the WebView2 profile.
+        Leaves LocalStorage, IndexedDB, Cookies, etc. untouched."""
+        cache_dirs = [
+            'Cache', 'Code Cache', 'GPUCache',
+            'Service Worker', 'CacheStorage', 'blob_storage',
+        ]
+        for sub in cache_dirs:
+            p = os.path.join(wv2_root, sub)
+            if os.path.isdir(p):
+                _shutil.rmtree(p, ignore_errors=True)
+        # WebView2 nests a second profile layer under EBWebView/
+        ebwv = os.path.join(wv2_root, 'EBWebView')
+        if os.path.isdir(ebwv):
+            for sub in cache_dirs:
+                p = os.path.join(ebwv, sub)
+                if os.path.isdir(p):
+                    _shutil.rmtree(p, ignore_errors=True)
+
+    _hash_file   = os.path.join(webview_storage, 'asset_hash.txt')
+    _assets_dir  = os.path.join(base_dir, 'assets')
+    _current_hash = _hash_assets(_assets_dir)
+
+    _stored_hash = ''
+    try:
+        with open(_hash_file, 'r', encoding='utf-8') as _f:
+            _stored_hash = _f.read().strip()
+    except OSError:
+        pass   # first run — no hash file yet
+
+    if _current_hash != _stored_hash:
+        # Assets changed (or first run) → clear WebView2 disk cache
+        print(f'[Macan] Asset hash changed — clearing WebView2 disk cache '
+              f'({_stored_hash[:8] or "none"!r} → {_current_hash[:8]!r})')
+        _clear_wv2_disk_cache(webview_storage)
+        try:
+            with open(_hash_file, 'w', encoding='utf-8') as _f:
+                _f.write(_current_hash)
+        except OSError as _e:
+            print(f'[Macan] Warning: could not write asset_hash.txt: {_e}')
+    else:
+        print(f'[Macan] Assets unchanged (hash {_current_hash[:8]!r}) — WebView2 cache kept')
 
     window = webview.create_window(
         title='Macan Media Player',
