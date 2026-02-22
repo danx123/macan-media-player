@@ -87,8 +87,107 @@ function _seedThumbCache(tracks) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// AUDIO CONTEXT & EQUALIZER INITIALIZATION
+// LAZY THUMBNAIL LOADER
+// Uses IntersectionObserver to fetch cover art / video thumbnails
+// only when a playlist row scrolls into (or near) the viewport.
+//
+// How it works:
+//   _buildPlaylistItem() renders a <div class="pl-thumb-placeholder"
+//     data-lazy="audio|video" data-path="..."> for rows without art.
+//   _lazyThumbObserver watches these placeholders with rootMargin 300px
+//   so art is pre-fetched slightly before the row becomes visible.
+//   On intersection → fetch → swap placeholder → <img>, persist to Python.
 // ═══════════════════════════════════════════════════════════════
+
+// _lazyThumbObserver is initialized lazily on first use so that
+// #playlist-body is guaranteed to exist in the DOM.
+let _lazyThumbObserver = null;
+function _getLazyObserver() {
+  if (_lazyThumbObserver) return _lazyThumbObserver;
+  _lazyThumbObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const el = entry.target;
+      _lazyThumbObserver.unobserve(el);
+      _fetchLazyThumb(el);
+    }
+  }, {
+    root:       document.getElementById('playlist-body'),
+    rootMargin: '300px 0px',
+    threshold:  0,
+  });
+  return _lazyThumbObserver;
+}
+
+async function _fetchLazyThumb(placeholder) {
+  if (!pw()) return;
+  const path    = placeholder.dataset.path;
+  const kind    = placeholder.dataset.lazy;   // 'audio' | 'video'
+  const idx     = parseInt(placeholder.closest('.pl-item')?.dataset.index ?? '-1', 10);
+  if (!path) return;
+
+  try {
+    let dataUrl = null;
+
+    if (kind === 'video') {
+      // Check in-memory cache first (populated by earlier loads)
+      dataUrl = videoThumbCache.get(path) || null;
+      if (!dataUrl) {
+        dataUrl = await pywebview.api.get_video_thumbnail(path);
+      }
+      if (dataUrl) {
+        videoThumbCache.set(path, dataUrl);
+        const track = idx >= 0 ? S.playlist[idx] : null;
+        if (track) {
+          const wasNew = !track.video_thumb;
+          track.video_thumb = dataUrl;
+          if (!track.cover_art) {
+            track.cover_art = dataUrl;
+            thumbCache.set(path, dataUrl);
+            if (idx === S.currentIndex) applyArt(dataUrl);
+            if (wasNew) _persistArtToServer(path, dataUrl, true);
+          }
+          if (wasNew) _persistArtToServer(path, dataUrl, true);
+        }
+      }
+    } else {
+      // Audio: check memory cache → embedded tags → online fallback
+      dataUrl = thumbCache.get(path) || null;
+      if (!dataUrl) {
+        dataUrl = await pywebview.api.get_cover_art(path);
+      }
+      if (dataUrl) {
+        thumbCache.set(path, dataUrl);
+        const track = idx >= 0 ? S.playlist[idx] : null;
+        if (track) {
+          const wasNew = !track.cover_art;
+          track.cover_art = dataUrl;
+          if (idx === S.currentIndex) applyArt(dataUrl);
+          if (wasNew) _persistArtToServer(path, dataUrl, false);
+        }
+      }
+    }
+
+    if (!dataUrl) return;
+
+    // Swap placeholder → img in the DOM (placeholder may be gone if row
+    // was removed while fetch was in-flight — guard with isConnected)
+    if (!placeholder.isConnected) return;
+    const img = document.createElement('img');
+    img.className  = kind === 'video'
+      ? 'pl-thumb pl-thumb-video-img'
+      : 'pl-thumb';
+    img.src        = dataUrl;
+    img.alt        = '';
+    img.draggable  = false;
+    img.loading    = 'lazy';
+    placeholder.replaceWith(img);
+
+  } catch (e) {
+    // Silently ignore — placeholder stays, no crash
+  }
+}
+
 
 let audioContext;
 let audioSource;
@@ -702,6 +801,7 @@ playlistManager.onLoad(async (name) => {
     S.playlist = playlist;
     _seedThumbCache(S.playlist);
     renderPlaylist();
+    _rebuildTotalDuration();
     updatePlaylistMeta();
     setStatus(`LOADED "${name}" — ${playlist.length} TRACK(S)`);
     loadTrack(0);
@@ -1295,6 +1395,7 @@ async function _doStateRestore() {
       S.playlist = saved;
       _seedThumbCache(S.playlist);
       renderPlaylist();
+      _rebuildTotalDuration();
       updatePlaylistMeta();
     }
 
@@ -2851,16 +2952,11 @@ async function openFiles() {
   if (!pw()) { setStatus('pywebview required'); return; }
   setStatus('OPENING FILE DIALOG...');
   try {
-    // browse_files() returns raw file path strings
     const paths = await pywebview.api.browse_files();
     if (paths?.length) {
-      // add_tracks() accepts raw paths, builds metadata, returns updated playlist
-      const playlist = await pywebview.api.add_tracks(paths);
-      S.playlist = playlist;
-      _seedThumbCache(S.playlist);
-      renderPlaylist(); updatePlaylistMeta();
-      setStatus(`ADDED ${paths.length} TRACK(S)`);
-      if (S.currentIndex < 0) loadTrack(0);
+      setStatus(`SCANNING ${paths.length} FILE(S)...`);
+      await pywebview.api.add_tracks_stream(paths);
+      // Rendering happens progressively via onTrackBatchReady
     } else { setStatus('NO FILES SELECTED'); }
   } catch(e) { console.error(e); setStatus('ERROR — SEE CONSOLE'); }
 }
@@ -2869,19 +2965,63 @@ async function openFolder() {
   if (!pw()) { setStatus('pywebview required'); return; }
   setStatus('SCANNING FOLDER...');
   try {
-    // browse_folder() returns raw file path strings
     const paths = await pywebview.api.browse_folder();
     if (paths?.length) {
-      // add_tracks() accepts raw paths, builds metadata, returns updated playlist
-      const playlist = await pywebview.api.add_tracks(paths);
-      S.playlist = playlist;
-      _seedThumbCache(S.playlist);
-      renderPlaylist(); updatePlaylistMeta();
-      setStatus(`LOADED ${paths.length} TRACK(S)`);
-      if (S.currentIndex < 0) loadTrack(0);
+      setStatus(`SCANNING ${paths.length} FILE(S)...`);
+      await pywebview.api.add_tracks_stream(paths);
+      // Rendering happens progressively via onTrackBatchReady
     } else { setStatus('NO MEDIA FOUND'); }
   } catch(e) { console.error(e); setStatus('ERROR — SEE CONSOLE'); }
 }
+
+// ── Streaming batch receiver — called from Python via evaluate_js ──────────
+// Receives batches of 12 tracks as Python finishes scanning them,
+// appends to S.playlist, and re-renders only the new rows (not the full list).
+window.onTrackBatchReady = function(tracks, done) {
+  if (!Array.isArray(tracks) || tracks.length === 0) {
+    if (done) {
+      _seedThumbCache(S.playlist);
+      updatePlaylistMeta();
+      if (S.currentIndex < 0 && S.playlist.length > 0) loadTrack(0);
+      setStatus(`LOADED ${S.playlist.length} TRACK(S)`);
+    }
+    return;
+  }
+
+  // Dedup against existing playlist (Python already deduped but be safe)
+  const known = new Set(S.playlist.map(t => t.path));
+  const newTracks = tracks.filter(t => !known.has(t.path));
+  if (!newTracks.length) {
+    if (done) { updatePlaylistMeta(); }
+    return;
+  }
+
+  const startIdx = S.playlist.length;
+  S.playlist.push(...newTracks);
+
+  // Update cached total duration incrementally (no full reduce needed)
+  for (const t of newTracks) _cachedTotalDuration += (t.duration || 0);
+
+  // Seed caches for the new tracks only
+  for (const t of newTracks) {
+    if (t.cover_art)    thumbCache.set(t.path, t.cover_art);
+    if (t.video_thumb)  videoThumbCache.set(t.path, t.video_thumb);
+  }
+
+  // Append only the new rows (no full re-render)
+  _appendPlaylistRows(newTracks, startIdx);
+
+  playlistEmpty.classList.add('hidden');
+  plCount.textContent = `${S.playlist.length} TRACK${S.playlist.length !== 1 ? 'S' : ''}`;
+
+  if (done) {
+    updatePlaylistMeta();
+    if (S.currentIndex < 0 && S.playlist.length > 0) loadTrack(0);
+    setStatus(`LOADED ${S.playlist.length} TRACK(S)`);
+  } else {
+    setStatus(`LOADING... ${S.playlist.length} tracks`);
+  }
+};
 
 async function removeTrack(path, e) {
   e.stopPropagation();
@@ -2891,6 +3031,7 @@ async function removeTrack(path, e) {
     S.playlist = S.playlist.filter(t => t.path !== path);
   }
   if (S.currentIndex >= S.playlist.length) S.currentIndex = S.playlist.length - 1;
+  _rebuildTotalDuration();
   renderPlaylist(); updatePlaylistMeta();
 }
 
@@ -2902,6 +3043,7 @@ async function clearPlaylist() {
   S.currentIndex = -1; onPlayState(false);
   if (pw()) await pywebview.api.clear_playlist();
   S.playlist = [];
+  _cachedTotalDuration = 0;
   renderPlaylist(); updatePlaylistMeta();
 
   trackTitle.textContent = '—';
@@ -2921,7 +3063,12 @@ async function clearPlaylist() {
 }
 
 let filterQ = '';
-function filterPlaylist(q) { filterQ = q.trim().toLowerCase(); renderPlaylist(); }
+let _filterTimer = null;
+function filterPlaylist(q) {
+  filterQ = q.trim().toLowerCase();
+  clearTimeout(_filterTimer);
+  _filterTimer = setTimeout(() => renderPlaylist(), 120); // 120ms debounce
+}
 
 // ─── DRAG-AND-DROP STATE ──────────────────────────────────────
 const DND = {
@@ -2930,167 +3077,174 @@ const DND = {
   indicator:  null,
 };
 
+function _buildPlaylistItem(track, realIdx) {
+  const isActive = realIdx === S.currentIndex;
+  const div = document.createElement('div');
+  div.className = 'pl-item' + (isActive ? ' active' : '');
+  div.dataset.index = realIdx;
+  div.draggable = !filterQ;
+
+  // ── thumbnail ──────────────────────────────────────────────
+  // If art is already in cache/track object → render immediately.
+  // Otherwise render a placeholder with data-lazy so _lazyThumbObserver
+  // fetches it when the row scrolls into view (300px lookahead).
+  let thumbHtml = '';
+  if (track.is_video) {
+    if (!track.video_thumb && videoThumbCache.has(track.path))
+      track.video_thumb = videoThumbCache.get(track.path);
+
+    if (track.video_thumb) {
+      thumbHtml = `<img class="pl-thumb pl-thumb-video-img" src="${track.video_thumb}" alt="" loading="lazy" draggable="false">`;
+    } else {
+      // Lazy placeholder — observer will fetch when visible
+      thumbHtml = `
+        <div class="pl-thumb pl-thumb-placeholder pl-thumb-video"
+             data-lazy="video" data-path="${esc(track.path)}" title="Video">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.6">
+            <polygon points="23,7 16,12 23,17"/>
+            <rect x="1" y="5" width="15" height="14" rx="2"/>
+          </svg>
+        </div>`;
+    }
+  } else {
+    if (!track.cover_art && thumbCache.has(track.path))
+      track.cover_art = thumbCache.get(track.path);
+    if (track.cover_art && !thumbCache.has(track.path))
+      thumbCache.set(track.path, track.cover_art);
+
+    if (track.cover_art) {
+      thumbHtml = `<img class="pl-thumb" src="${track.cover_art}" alt="" loading="lazy" draggable="false">`;
+    } else {
+      // Lazy placeholder — observer will fetch when visible
+      thumbHtml = `
+        <div class="pl-thumb pl-thumb-placeholder"
+             data-lazy="audio" data-path="${esc(track.path)}" title="No art">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.35">
+            <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/>
+          </svg>
+        </div>`;
+    }
+  }
+
+  div.innerHTML = `
+    <div class="pl-drag-handle" title="Drag to reorder">
+      <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor">
+        <circle cx="3" cy="2.5" r="1.5"/><circle cx="7" cy="2.5" r="1.5"/>
+        <circle cx="3" cy="7"   r="1.5"/><circle cx="7" cy="7"   r="1.5"/>
+        <circle cx="3" cy="11.5" r="1.5"/><circle cx="7" cy="11.5" r="1.5"/>
+      </svg>
+    </div>
+    <div class="pl-idx">${realIdx + 1}</div>
+    <div class="pl-playing-indicator"><div class="bar"></div><div class="bar"></div><div class="bar"></div></div>
+    ${thumbHtml}
+    <div class="pl-item-info">
+      <span class="pl-item-name">${esc(track.name)}</span>
+      <span class="pl-item-artist">${track.artist ? esc(track.artist) : ''}</span>
+      <span class="pl-item-ext">${track.ext || ''}</span>
+    </div>
+    <span class="pl-item-duration">${track.duration_str || '--:--'}</span>
+    <span class="pl-item-type ${track.is_video ? 'video' : ''}">
+      ${track.is_video
+        ? '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" style="margin-right:3px;opacity:.7"><polygon points="23,7 16,12 23,17"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>VIDEO'
+        : 'AUDIO'}
+    </span>
+    <button class="pl-remove-btn" title="Remove">✕</button>`;
+
+  div.querySelector('.pl-remove-btn').addEventListener('click', e => removeTrack(track.path, e));
+  div.addEventListener('click', () => loadTrack(realIdx));
+  div.addEventListener('dblclick', () => loadTrack(realIdx, true));
+  div.addEventListener('contextmenu', e => {
+    e.preventDefault(); e.stopPropagation();
+    showContextMenu(e.clientX, e.clientY, track);
+  });
+
+  if (!filterQ) {
+    div.addEventListener('dragstart', e => {
+      DND.dragIndex = realIdx;
+      div.classList.add('pl-dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(realIdx));
+      const ghost = div.cloneNode(true);
+      ghost.style.cssText = 'position:fixed;top:-200px;left:0;width:300px;opacity:.8;pointer-events:none;';
+      document.body.appendChild(ghost);
+      e.dataTransfer.setDragImage(ghost, 20, 20);
+      setTimeout(() => ghost.remove(), 0);
+    });
+    div.addEventListener('dragend', () => {
+      div.classList.remove('pl-dragging');
+      _dndCleanup();
+    });
+    div.addEventListener('dragover', e => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      if (DND.dragIndex === realIdx) return;
+      const rect = div.getBoundingClientRect();
+      const after = e.clientY > rect.top + rect.height / 2;
+      const targetIdx = after ? realIdx + 1 : realIdx;
+      if (DND.overIndex !== targetIdx) {
+        DND.overIndex = targetIdx;
+        _dndShowIndicator(div, after);
+      }
+    });
+    div.addEventListener('dragleave', e => {
+      if (!playlistList.contains(e.relatedTarget)) _dndCleanup(false);
+    });
+    div.addEventListener('drop', e => {
+      e.preventDefault();
+      if (DND.dragIndex < 0 || DND.dragIndex === DND.overIndex) { _dndCleanup(); return; }
+      _doPlaylistReorder(DND.dragIndex, DND.overIndex);
+      _dndCleanup();
+    });
+  }
+
+  return div;
+}
+
+// Register all lazy placeholders in a container with the IntersectionObserver.
+// Call AFTER the container is inserted into the live DOM.
+function _observeLazyThumbs(container) {
+  const obs = _getLazyObserver();
+  container.querySelectorAll('.pl-thumb-placeholder[data-lazy]').forEach(el => {
+    obs.observe(el);
+  });
+}
+
+// Append only new rows to the list — used by streaming loader
+function _appendPlaylistRows(tracks, startIdx) {
+  const frag = document.createDocumentFragment();
+  tracks.forEach((track, i) => {
+    frag.appendChild(_buildPlaylistItem(track, startIdx + i));
+  });
+  playlistList.appendChild(frag);
+  // Observe after insertion so IntersectionObserver has real layout positions
+  _observeLazyThumbs(playlistList);
+}
+
 function renderPlaylist() {
-  playlistList.innerHTML = '';
   const list = filterQ
     ? S.playlist.filter(t => t.name.toLowerCase().includes(filterQ))
     : S.playlist;
 
   playlistEmpty.classList.toggle('hidden', list.length > 0);
 
+  // Disconnect existing observations before rebuilding the list
+  _getLazyObserver().disconnect();
+
+  // Build all items into a DocumentFragment — single DOM insertion,
+  // eliminates per-item reflow that caused jank with 100+ tracks.
+  const frag = document.createDocumentFragment();
   list.forEach((track) => {
     const realIdx = S.playlist.indexOf(track);
-    const isActive = realIdx === S.currentIndex;
-    const div = document.createElement('div');
-    div.className = 'pl-item' + (isActive ? ' active' : '');
-    div.dataset.index = realIdx;
-    div.draggable = !filterQ;
-
-    // ── thumbnail ──────────────────────────────────────────────
-    let thumbHtml = '';
-    if (track.is_video) {
-      // Merge cache → track object so render is instant on re-add after clear
-      if (!track.video_thumb && videoThumbCache.has(track.path))
-        track.video_thumb = videoThumbCache.get(track.path);
-
-      if (track.video_thumb) {
-        thumbHtml = `<img class="pl-thumb pl-thumb-video-img" src="${track.video_thumb}" alt="" loading="lazy" draggable="false">`;
-      } else {
-        thumbHtml = `
-          <div class="pl-thumb pl-thumb-placeholder pl-thumb-video" title="Video">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.6">
-              <polygon points="23,7 16,12 23,17"/>
-              <rect x="1" y="5" width="15" height="14" rx="2"/>
-            </svg>
-          </div>`;
-        if (pw()) {
-          (async (t, idx) => {
-            try {
-              const thumb = await pywebview.api.get_video_thumbnail(t.path);
-              if (thumb) {
-                const wasNew = !t.video_thumb;
-                t.video_thumb = thumb;
-                videoThumbCache.set(t.path, thumb);
-                // ── NEW: Use video thumbnail as cover art so it shows in the player
-                // and is cached in thumbCache for persistence across sessions.
-                if (!t.cover_art) {
-                  t.cover_art = thumb;
-                  thumbCache.set(t.path, thumb);
-                  // If this is the currently playing track, apply as album art
-                  if (idx === S.currentIndex) applyArt(thumb);
-                  // Persist to Python so it survives restarts
-                  if (wasNew) _persistArtToServer(t.path, thumb, true);
-                }
-                // ──────────────────────────────────────────────────────────────
-                // FIX: placeholder is a <div>, not <img>
-                const el = playlistList.querySelector(`.pl-item[data-index="${idx}"] .pl-thumb-placeholder`);
-                if (el) {
-                  const img = document.createElement('img');
-                  img.className = 'pl-thumb pl-thumb-video-img';
-                  img.src = thumb; img.alt = ''; img.draggable = false; img.loading = 'lazy';
-                  el.replaceWith(img);
-                }
-                if (wasNew) _persistArtToServer(t.path, thumb, true);
-              }
-            } catch(e) {}
-          })(track, realIdx);
-        }
-      }
-    } else {
-      // Merge cache → track object so render is instant on re-add after clear
-      if (!track.cover_art && thumbCache.has(track.path))
-        track.cover_art = thumbCache.get(track.path);
-      // Merge track object → cache (seed from Python-fetched embedded art)
-      if (track.cover_art && !thumbCache.has(track.path))
-        thumbCache.set(track.path, track.cover_art);
-
-      if (track.cover_art) {
-        thumbHtml = `<img class="pl-thumb" src="${track.cover_art}" alt="" loading="lazy" draggable="false">`;
-      } else {
-        thumbHtml = `
-          <div class="pl-thumb pl-thumb-placeholder" title="No art">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.35">
-              <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/>
-            </svg>
-          </div>`;
-      }
-    }
-
-    div.innerHTML = `
-      <div class="pl-drag-handle" title="Drag to reorder">
-        <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor">
-          <circle cx="3" cy="2.5" r="1.5"/><circle cx="7" cy="2.5" r="1.5"/>
-          <circle cx="3" cy="7"   r="1.5"/><circle cx="7" cy="7"   r="1.5"/>
-          <circle cx="3" cy="11.5" r="1.5"/><circle cx="7" cy="11.5" r="1.5"/>
-        </svg>
-      </div>
-      <div class="pl-idx">${realIdx+1}</div>
-      <div class="pl-playing-indicator"><div class="bar"></div><div class="bar"></div><div class="bar"></div></div>
-      ${thumbHtml}
-      <div class="pl-item-info">
-        <span class="pl-item-name">${esc(track.name)}</span>
-        <span class="pl-item-artist">${track.artist ? esc(track.artist) : ''}</span>
-        <span class="pl-item-ext">${track.ext||''}</span>
-      </div>
-      <span class="pl-item-duration">${track.duration_str||'--:--'}</span>
-      <span class="pl-item-type ${track.is_video?'video':''}">
-        ${track.is_video
-          ? '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" style="margin-right:3px;opacity:.7"><polygon points="23,7 16,12 23,17"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>VIDEO'
-          : 'AUDIO'}
-      </span>
-      <button class="pl-remove-btn" title="Remove">✕</button>`;
-
-    div.querySelector('.pl-remove-btn').addEventListener('click', e => removeTrack(track.path, e));
-    div.addEventListener('click', () => loadTrack(realIdx));
-    div.addEventListener('dblclick', () => loadTrack(realIdx, true));
-    div.addEventListener('contextmenu', e => {
-      e.preventDefault(); e.stopPropagation();
-      showContextMenu(e.clientX, e.clientY, track);
-    });
-
-    if (!filterQ) {
-      div.addEventListener('dragstart', e => {
-        DND.dragIndex = realIdx;
-        div.classList.add('pl-dragging');
-        e.dataTransfer.effectAllowed = 'move';
-        e.dataTransfer.setData('text/plain', String(realIdx));
-        const ghost = div.cloneNode(true);
-        ghost.style.cssText = 'position:fixed;top:-200px;left:0;width:300px;opacity:.8;pointer-events:none;';
-        document.body.appendChild(ghost);
-        e.dataTransfer.setDragImage(ghost, 20, 20);
-        setTimeout(() => ghost.remove(), 0);
-      });
-      div.addEventListener('dragend', () => {
-        div.classList.remove('pl-dragging');
-        _dndCleanup();
-      });
-      div.addEventListener('dragover', e => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = 'move';
-        if (DND.dragIndex === realIdx) return;
-        const rect = div.getBoundingClientRect();
-        const after = e.clientY > rect.top + rect.height / 2;
-        const targetIdx = after ? realIdx + 1 : realIdx;
-        if (DND.overIndex !== targetIdx) {
-          DND.overIndex = targetIdx;
-          _dndShowIndicator(div, after);
-        }
-      });
-      div.addEventListener('dragleave', e => {
-        if (!playlistList.contains(e.relatedTarget)) _dndCleanup(false);
-      });
-      div.addEventListener('drop', e => {
-        e.preventDefault();
-        if (DND.dragIndex < 0 || DND.dragIndex === DND.overIndex) { _dndCleanup(); return; }
-        _doPlaylistReorder(DND.dragIndex, DND.overIndex);
-        _dndCleanup();
-      });
-    }
-
-    playlistList.appendChild(div);
+    frag.appendChild(_buildPlaylistItem(track, realIdx));
   });
 
-  plCount.textContent = `${S.playlist.length} TRACK${S.playlist.length!==1?'S':''}`;
+  // Single DOM write — replaces the entire list in one operation
+  playlistList.replaceChildren(frag);
+
+  // Observe all lazy placeholders now that they're in the live DOM
+  _observeLazyThumbs(playlistList);
+
+  plCount.textContent = `${S.playlist.length} TRACK${S.playlist.length !== 1 ? 'S' : ''}`;
 }
 
 function _dndShowIndicator(refEl, insertAfter) {
@@ -3476,15 +3630,24 @@ async function showTagEditor(track) {
 }
 
 function updatePlaylistHighlight(idx) {
-  document.querySelectorAll('.pl-item').forEach(el => {
-    el.classList.toggle('active', +el.dataset.index === idx);
-  });
+  // Remove active from previous — track via data attribute lookup (O(1))
+  const prev = playlistList.querySelector('.pl-item.active');
+  if (prev) prev.classList.remove('active');
+  // Add active to new
+  const next = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
+  if (next) next.classList.add('active');
+}
+
+// Cached total duration — updated incrementally to avoid O(n) reduce on every call
+let _cachedTotalDuration = 0;
+function _rebuildTotalDuration() {
+  _cachedTotalDuration = S.playlist.reduce((a, t) => a + (t.duration || 0), 0);
 }
 
 function updatePlaylistMeta() {
-  const total = S.playlist.reduce((a,t) => a+(t.duration||0), 0);
-  plDuration.textContent = total>0 ? `Total: ${formatTime(total)}` : 'Total: —';
-  plCount.textContent = `${S.playlist.length} TRACK${S.playlist.length!==1?'S':''}`;
+  const total = _cachedTotalDuration;
+  plDuration.textContent = total > 0 ? `Total: ${formatTime(total)}` : 'Total: —';
+  plCount.textContent = `${S.playlist.length} TRACK${S.playlist.length !== 1 ? 'S' : ''}`;
 }
 
 // ─── KEYBOARD SHORTCUTS ───────────────────────────────────────
