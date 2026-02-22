@@ -703,6 +703,9 @@ body {
   padding: 8px 0;
   scrollbar-width: thin;
   scrollbar-color: var(--elevated) transparent;
+  /* PERF: Promote to own compositor layer for smooth GPU-accelerated scroll */
+  will-change: scroll-position;
+  overscroll-behavior: contain;
 }
 #playlist-body::-webkit-scrollbar { width: 4px; }
 #playlist-body::-webkit-scrollbar-thumb { background: var(--elevated); }
@@ -743,6 +746,10 @@ body {
   transition: background 0.15s, border-color 0.15s, opacity 0.15s;
   position: relative;
   user-select: none;
+  /* PERF: Browser-native virtual scroll — skip paint/layout for off-screen rows.
+     contain-intrinsic-size matches the row height so scrollbar stays accurate. */
+  content-visibility: auto;
+  contain-intrinsic-size: 0 52px;
 }
 .pl-item.pl-dragging {
   opacity: 0.35;
