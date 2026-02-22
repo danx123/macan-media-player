@@ -2323,6 +2323,9 @@ async function loadTrack(index, autoplay = true) {
   const track = S.playlist[index];
   const isVid  = track.is_video;
 
+  // Record play count for smart playlist
+  if (track.path && window.SmartPlaylist) SmartPlaylist.recordPlay(track.path);
+
   // Stop both players first
   audio.pause(); video.pause();
 
