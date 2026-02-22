@@ -44,6 +44,14 @@ const RTV = (() => {
   const radioCustomRow    = document.getElementById('radio-custom-url-row');
   const radioCustomName   = document.getElementById('radio-custom-name');
   const radioCustomUrl    = document.getElementById('radio-custom-url');
+  const radioVisBars      = document.getElementById('radio-vis-bars');
+  const radioPlayBtn      = document.getElementById('radio-play-btn');
+  const radioIconPlay     = document.getElementById('radio-icon-play');
+  const radioIconStop     = document.getElementById('radio-icon-stop');
+  const radioPrevBtn      = document.getElementById('radio-prev');
+  const radioNextBtn      = document.getElementById('radio-next');
+  const radioVolSlider    = document.getElementById('radio-vol-slider');
+  const radioVolVal       = document.getElementById('radio-vol-val');
   const btnRadio          = document.getElementById('btn-radio');
 
   const tvOverlay         = document.getElementById('tv-overlay');
@@ -149,9 +157,14 @@ const RTV = (() => {
       radioAudio.src = '';
     }
     radioActive = null;
-    radioNowPlaying.style.display = 'none';
-    radioLiveBadge.style.display = 'none';
+    // Reset player UI
+    radioNowName.textContent = '— SELECT A STATION —';
+    radioNowMeta.textContent = 'RADIO ONLINE · MACAN';
     setStatus(radioStatus, 'IDLE');
+    if (radioLiveBadge)  radioLiveBadge.style.display = 'none';
+    if (radioVisBars)    radioVisBars.style.display = 'none';
+    if (radioIconPlay)   radioIconPlay.style.display = '';
+    if (radioIconStop)   radioIconStop.style.display = 'none';
     // Remove active highlight
     radioList.querySelectorAll('.rtv-item.active').forEach(el => el.classList.remove('active'));
     renderRadioList();
@@ -320,7 +333,7 @@ const RTV = (() => {
   function playRadioStation(station) {
     radioActive = station;
 
-    // Stop main audio player if playing (optional integration hook)
+    // Stop main audio player if playing
     if (typeof window.pauseMainPlayer === 'function') window.pauseMainPlayer();
 
     if (!radioAudio) radioAudio = createAudioEl();
@@ -328,17 +341,25 @@ const RTV = (() => {
     radioAudio.pause();
     radioAudio.src = '';
     setStatus(radioStatus, 'CONNECTING...');
-    radioNowPlaying.style.display = 'flex';
+
+    // Update center player UI
     radioNowName.textContent = station.name;
     radioNowMeta.textContent = [station.city, station.codec, station.bitrate ? station.bitrate + 'kbps' : ''].filter(Boolean).join(' · ') || '—';
+    if (radioLiveBadge) radioLiveBadge.style.display = 'none';
+    if (radioVisBars)   radioVisBars.style.display = 'none';
+    if (radioIconPlay)  radioIconPlay.style.display = 'none';
+    if (radioIconStop)  radioIconStop.style.display = '';
 
     radioAudio.src = station.url;
-    radioAudio.volume = getVolume();
+    radioAudio.volume = radioVolSlider ? parseInt(radioVolSlider.value) / 100 : getVolume();
     radioAudio.play().then(() => {
-      setStatus(radioStatus, 'PLAYING: ' + station.name);
-      radioLiveBadge.style.display = 'inline';
+      setStatus(radioStatus, '● LIVE — ' + station.name);
+      if (radioLiveBadge) radioLiveBadge.style.display = 'inline';
+      if (radioVisBars)   radioVisBars.style.display = 'flex';
     }).catch(err => {
       setStatus(radioStatus, 'ERROR: ' + err.message);
+      if (radioIconPlay)  radioIconPlay.style.display = '';
+      if (radioIconStop)  radioIconStop.style.display = 'none';
     });
 
     renderRadioList();
@@ -860,19 +881,20 @@ const RTV = (() => {
   // EVENT LISTENERS
   // ═══════════════════════════════════════════════════════════════
 
-  // Radio overlay
-  btnRadio.addEventListener('click', () => { radioOpen ? closeRadio() : openRadio(); });
+  // ── Radio modal ──────────────────────────────────────────────
+  if (btnRadio) btnRadio.addEventListener('click', () => { radioOpen ? closeRadio() : openRadio(); });
   document.getElementById('radio-close').addEventListener('click', closeRadio);
-  radioOverlay.addEventListener('click', e => { if (e.target === radioOverlay) closeRadio(); });
+  // Click outside modal panel closes it
+  radioOverlay.addEventListener('click', e => {
+    if (e.target === radioOverlay) closeRadio();
+  });
 
   document.getElementById('radio-refresh').addEventListener('click', () => fetchRadioStations(true));
-
   radioSearch.addEventListener('input', () => filterRadio(radioSearch.value));
 
   document.getElementById('radio-add-custom').addEventListener('click', () => {
     radioCustomRow.style.display = radioCustomRow.style.display === 'none' ? 'flex' : 'none';
   });
-
   document.getElementById('radio-custom-save').addEventListener('click', addRadioCustomStation);
   document.getElementById('radio-custom-cancel').addEventListener('click', () => {
     radioCustomRow.style.display = 'none';
@@ -882,7 +904,46 @@ const RTV = (() => {
   radioCustomUrl.addEventListener('keydown', e => { if (e.key === 'Enter') addRadioCustomStation(); });
   radioCustomName.addEventListener('keydown', e => { if (e.key === 'Enter') radioCustomUrl.focus(); });
 
-  document.getElementById('radio-stop').addEventListener('click', stopRadioStream);
+  // ── Radio player controls ──────────────────────────────────
+  // Play/Stop toggle button
+  if (radioPlayBtn) {
+    radioPlayBtn.addEventListener('click', () => {
+      if (radioActive) {
+        stopRadioStream();
+      } else if (radioFiltered.length > 0) {
+        playRadioStation(radioFiltered[0]);
+      }
+    });
+  }
+
+  // Previous station
+  if (radioPrevBtn) {
+    radioPrevBtn.addEventListener('click', () => {
+      if (!radioFiltered.length) return;
+      let idx = radioActive ? radioFiltered.findIndex(s => s.url === radioActive.url) : 0;
+      idx = (idx - 1 + radioFiltered.length) % radioFiltered.length;
+      playRadioStation(radioFiltered[idx]);
+    });
+  }
+
+  // Next station
+  if (radioNextBtn) {
+    radioNextBtn.addEventListener('click', () => {
+      if (!radioFiltered.length) return;
+      let idx = radioActive ? radioFiltered.findIndex(s => s.url === radioActive.url) : -1;
+      idx = (idx + 1) % radioFiltered.length;
+      playRadioStation(radioFiltered[idx]);
+    });
+  }
+
+  // Volume slider (radio-specific)
+  if (radioVolSlider) {
+    radioVolSlider.addEventListener('input', () => {
+      const v = parseInt(radioVolSlider.value) / 100;
+      if (radioVolVal) radioVolVal.textContent = radioVolSlider.value;
+      if (radioAudio) radioAudio.volume = v;
+    });
+  }
 
   // TV overlay
   btnTv.addEventListener('click', () => { tvOpen ? closeTv() : openTv(); });
@@ -918,12 +979,7 @@ const RTV = (() => {
   });
   tvCustomUrl.addEventListener('keydown', e => { if (e.key === 'Enter') addTvCustomChannel(); });
 
-  // Expose "Add URL" for TV via reload button (context-aware) 
-  // We use a separate button instead:
-  document.getElementById('tv-refresh').insertAdjacentHTML('afterend', '');
-  // Add a button for custom URL from JS since HTML already has reload
-  // Instead, let's wire tv-custom-url-row toggle via the M3U button's sibling
-  // Actually: add a dedicated "URL" button after the M3U button
+  // Add URL button for TV
   (() => {
     const addUrlBtn = document.createElement('button');
     addUrlBtn.className = 'rtv-action-btn';
@@ -938,29 +994,21 @@ const RTV = (() => {
     });
   })();
 
-  // Sync volume slider changes to streaming audio
+  // Sync main volume slider changes to TV audio (radio has own slider)
   const volSlider = document.getElementById('volume-slider');
   if (volSlider) {
     volSlider.addEventListener('input', () => {
       const v = parseInt(volSlider.value) / 100;
-      if (radioAudio) radioAudio.volume = v;
-      if (tvAudio)    tvAudio.volume = v;
+      if (tvAudio) tvAudio.volume = v;
     });
   }
 
-  // Intercept the vc-close button: when TV is playing, closing the video layer
-  // should stop the TV stream and restore the main layout — not just hide the layer.
+  // Intercept vc-close: when TV playing, stop stream cleanly
   const vcCloseBtn = document.getElementById('vc-close');
   if (vcCloseBtn) {
-    // We insert ourselves before the original handler via capture phase
     vcCloseBtn.addEventListener('click', () => {
-      if (tvActive) {
-        // Let stopTvStream handle everything cleanly
-        stopTvStream();
-      }
-      // The original vc-close handler in script.js will also fire and do its own cleanup,
-      // which is fine — it's idempotent (pause + remove active class).
-    }, true); // capture = true so we run before script.js's listener
+      if (tvActive) stopTvStream();
+    }, true);
   }
 
   // Init mouse-move channel switcher on video layer
