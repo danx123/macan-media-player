@@ -586,7 +586,7 @@
         <input type="text" id="tv-search" placeholder="SEARCH CHANNELS..." class="rtv-search"/>
       </div>
       <select id="tv-source-select" class="rtv-select">
-        <option value="https://iptv-org.github.io/iptv/countries/id.m3u">Github (ID)</option>
+        <option value="https://iptv-org.github.io/iptv/countries/id.m3u" selected>Github (ID)</option>
         <option value="https://iptv-org.github.io/iptv/index.m3u">Github (Global)</option>
         <option value="https://www.apsattv.com/vizio.m3u">Vizio TV</option>
         <option value="https://www.apsattv.com/localnow.m3u">Local Now</option>
@@ -876,6 +876,12 @@
 <!-- ═══════════ NAV MENU ══════════════════════════════════════ -->
 <div id="nav-menu-overlay"></div>
 <div id="nav-menu-panel">
+  <!-- Profile header -->
+  <div class="nm-profile-header">
+    <div id="nm-profile-block" class="nm-profile-block">
+      <!-- Populated by UserProfile.updateMenuHeader() -->
+    </div>
+  </div>
   <div class="nm-header">
     <span class="nm-title">MENU</span>
     <button class="nm-close-btn" id="nm-close-btn">✕</button>
@@ -940,6 +946,135 @@
   </div>
 </div>
 
+<!-- ═══════════ LISTEN STATISTICS OVERLAY ═══════════════════ -->
+<div id="listen-stats-overlay">
+  <div class="ls-panel">
+    <div class="ls-header">
+      <div class="ls-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="2">
+          <line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/>
+          <line x1="6" y1="20" x2="6" y2="14"/><line x1="2" y1="20" x2="22" y2="20"/>
+        </svg>
+        <h2>LISTEN STATISTICS</h2>
+      </div>
+      <button class="ls-close-btn" id="ls-close">✕</button>
+    </div>
+
+    <!-- Counter cards -->
+    <div class="ls-cards">
+      <div class="ls-card">
+        <div class="ls-card-label">SESSION</div>
+        <div class="ls-card-value" id="ls-session">0s</div>
+        <div class="ls-card-sub">Current session</div>
+      </div>
+      <div class="ls-card">
+        <div class="ls-card-label">TODAY</div>
+        <div class="ls-card-value" id="ls-today">0s</div>
+        <div class="ls-card-sub">Listening today</div>
+      </div>
+      <div class="ls-card ls-card-accent">
+        <div class="ls-card-label">THIS MONTH</div>
+        <div class="ls-card-value" id="ls-monthly">0s</div>
+        <div class="ls-card-sub">Monthly total</div>
+      </div>
+    </div>
+
+    <!-- Bar chart: last 7 days -->
+    <div class="ls-chart-section">
+      <div class="ls-chart-title">LAST 7 DAYS</div>
+      <canvas id="ls-chart" class="ls-chart"></canvas>
+    </div>
+
+    <!-- Footer: reset + tagline -->
+    <div class="ls-footer">
+      <div class="ls-tagline">Thanks for using Macan Media Player 🐯</div>
+      <button class="ls-reset-btn" id="ls-reset-btn">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="1 4 1 10 7 10"/>
+          <path d="M3.51 15a9 9 0 1 0 .49-3.51"/>
+        </svg>
+        RESET STATS
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ ACHIEVEMENTS OVERLAY ═════════════════════════ -->
+<div id="achievements-overlay">
+  <div class="ach-panel">
+    <div class="ach-header">
+      <div class="ach-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="2">
+          <circle cx="12" cy="8" r="7"/>
+          <polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/>
+        </svg>
+        <h2>ACHIEVEMENTS</h2>
+      </div>
+      <button class="ach-close-btn" id="ach-close">✕</button>
+    </div>
+
+    <!-- Progress bar -->
+    <div class="ach-progress-section">
+      <div class="ach-progress-label">
+        <span id="ach-count-unlocked">0</span>
+        <span> / </span>
+        <span id="ach-count-total">0</span>
+        <span> UNLOCKED</span>
+      </div>
+      <div class="ach-progress-track">
+        <div class="ach-progress-bar" id="ach-progress-bar"></div>
+      </div>
+    </div>
+
+    <!-- Badge grid -->
+    <div class="ach-grid" id="ach-grid"></div>
+
+    <div class="ach-footer">Thanks for using Macan Media Player 🐯</div>
+  </div>
+</div>
+
+<!-- ═══════════ USER PROFILE OVERLAY ══════════════════════════ -->
+<div id="user-profile-overlay">
+  <div class="up-panel">
+    <div class="up-header">
+      <h2>EDIT PROFILE</h2>
+      <button class="up-close-x" id="up-cancel-btn">✕</button>
+    </div>
+
+    <!-- Preview -->
+    <div class="up-preview-row">
+      <div id="up-avatar-preview"></div>
+      <div class="up-preview-right">
+        <div class="up-preview-name" id="up-preview-name">Listener</div>
+        <div class="up-preview-sub">MACAN LISTENER</div>
+      </div>
+    </div>
+
+    <!-- Name input -->
+    <div class="up-field">
+      <label class="up-label">DISPLAY NAME</label>
+      <input type="text" id="up-name-input" class="up-input" placeholder="Enter your name..." maxlength="24">
+    </div>
+
+    <!-- Emoji picker -->
+    <div class="up-field">
+      <label class="up-label">AVATAR</label>
+      <div class="up-emoji-grid" id="up-emoji-grid"></div>
+    </div>
+
+    <!-- Color picker -->
+    <div class="up-field">
+      <label class="up-label">ACCENT COLOR</label>
+      <div class="up-color-grid" id="up-color-grid"></div>
+    </div>
+
+    <!-- Actions -->
+    <div class="up-actions">
+      <button class="up-save-btn" id="up-save-btn">SAVE PROFILE</button>
+    </div>
+  </div>
+</div>
+
 <!-- ═══════════ SCRIPTS ═══════════════════════════════════ -->
 <script src="equalizer.js"></script>
 <script src="playlist-manager.js"></script>
@@ -947,6 +1082,9 @@
 <script src="converter.js"></script>
 <script src="about.js"></script>
 <script src="smart-playlist.js"></script>
+<script src="listen-stats.js"></script>
+<script src="achievements.js"></script>
+<script src="user-profile.js"></script>
 <script src="nav-menu.js"></script>
 <script src="script.js"></script>
 </body>
