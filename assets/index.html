@@ -1083,6 +1083,10 @@
 </div>
 
 <!-- ═══════════ SCRIPTS ═══════════════════════════════════ -->
+<!-- ─── Plugin Bridge Adapter ───────────────────────────
+     Loads FIRST so MacanBridge is available to all modules.
+     plugins.config.js loads AFTER script.js (last). -->
+<script src="plugin-bridge.js"></script>
 <script src="equalizer.js"></script>
 <script src="playlist-manager.js"></script>
 <script src="radio-tv.js"></script>
@@ -1095,5 +1099,6 @@
 <script src="user-profile.js"></script>
 <script src="nav-menu.js"></script>
 <script src="script.js"></script>
+<script src="plugins.config.js"></script>
 </body>
 </html>
