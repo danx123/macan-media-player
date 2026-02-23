@@ -1,0 +1,1104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MACAN // MEDIA PLAYER</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Bebas+Neue&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css?v=51b2968b7c19">
+</head>
+<body>
+
+<!-- NOISE -->
+<canvas id="noise-canvas"></canvas>
+
+<!-- BG VISUALIZER -->
+<div id="visualizer-bg"><canvas id="vis-canvas"></canvas></div>
+
+<!-- ART BLUR BG -->
+<div id="art-blur-bg"></div>
+
+<!-- ═══════════ HEADER ════════════════════════════════════ -->
+<header id="top-bar">
+  <div class="brand">
+    <!-- Burger menu button -->
+    <button id="btn-burger" class="burger-btn" title="Menu" aria-label="Open menu">
+      <span></span><span></span><span></span>
+    </button>
+    <svg width="26" height="26" viewBox="0 0 28 28" fill="none">
+      <polygon points="14,2 26,8 26,20 14,26 2,20 2,8" stroke="#E8FF00" stroke-width="1.5" fill="none"/>
+      <circle cx="14" cy="14" r="4" fill="#E8FF00"/>
+    </svg>
+    <div class="brand-text">
+      <span class="brand-name">MACAN</span>
+      <span class="brand-sub">MEDIA PLAYER</span>
+    </div>
+  </div>
+
+  <div class="header-center">
+    <div id="marquee-wrapper">
+      <div id="marquee-track">
+        <span id="marquee-text">— SELECT A TRACK TO BEGIN PLAYBACK —</span>
+        <span id="marquee-text-clone" aria-hidden="true">— SELECT A TRACK TO BEGIN PLAYBACK —</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="header-right">
+    <div id="clock-display">
+      <span id="clock-time">00:00:00</span>
+      <span id="clock-date">MON 00</span>
+    </div>
+    <button id="btn-about" title="About Macan Media Player">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/>
+        <line x1="12" y1="8" x2="12" y2="12"/>
+        <line x1="12" y1="16" x2="12.01" y2="16"/>
+      </svg>
+      ABOUT
+    </button>
+    <div class="wm-controls">
+      <button class="wm-btn" id="btn-minimize" title="Minimize">─</button>
+      <button class="wm-btn danger" id="btn-close" title="Close">✕</button>
+    </div>
+  </div>
+</header>
+
+<!-- ═══════════ MAIN LAYOUT ══════════════════════════════ -->
+<div id="main-layout">
+
+  <!-- ── LEFT: NOW PLAYING ── -->
+  <section id="now-playing-panel">
+
+    <div id="art-frame">
+      <div id="art-ring-outer"></div>
+      <div id="art-ring-inner"></div>
+      <div id="album-art-wrapper">
+        <img id="album-art" src="?v=51b2968b7c19" alt="Cover Art"/>
+        <div id="album-art-placeholder">
+          <svg width="72" height="72" viewBox="0 0 80 80" fill="none">
+            <circle cx="40" cy="40" r="38" stroke="#E8FF00" stroke-width="1" stroke-dasharray="4 4"/>
+            <circle cx="40" cy="40" r="18" stroke="#E8FF00" stroke-width="0.5" opacity="0.4"/>
+            <circle cx="40" cy="40" r="4" fill="#E8FF00" opacity="0.5"/>
+          </svg>
+          <p>NO MEDIA LOADED</p>
+        </div>
+      </div>
+    </div>
+
+    <div id="track-info">
+      <div id="track-title-scroll"><span id="track-title">—</span></div>
+      <div id="track-artist">UNKNOWN ARTIST</div>
+      <div id="track-meta-row">
+        <span id="track-format" class="meta-badge">—</span>
+        <span id="track-type" class="meta-badge">AUDIO</span>
+      </div>
+    </div>
+
+    <!-- MINI WAVEFORM VISUALIZER -->
+    <div id="mini-vis" title="Click to change visualizer style">
+      <canvas id="mini-canvas" width="320" height="44"></canvas>
+      <div id="vis-mode-label"></div>
+    </div>
+
+    <!-- SEEKBAR -->
+    <div id="progress-container">
+      <span id="time-current">0:00</span>
+      <div id="progress-bar" id="seekbar">
+        <div id="progress-track">
+          <div id="progress-fill"></div>
+          <div id="progress-thumb"></div>
+        </div>
+      </div>
+      <span id="time-total">0:00</span>
+    </div>
+
+    <!-- CONTROLS -->
+    <div id="controls">
+      <button id="btn-shuffle" class="ctrl-btn ctrl-secondary" title="Shuffle">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M16 3h5v5M4 20L21 3M16 21h5v-5M4 4l5 5"/>
+        </svg>
+      </button>
+      <button id="btn-prev" class="ctrl-btn ctrl-secondary" title="Previous">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <polygon points="19,20 9,12 19,4"/>
+          <line x1="5" y1="4" x2="5" y2="20"/>
+        </svg>
+      </button>
+      <button id="btn-play" class="ctrl-btn ctrl-primary" title="Play/Pause">
+        <svg id="icon-play" width="26" height="26" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+        <svg id="icon-pause" width="26" height="26" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+      </button>
+      <button id="btn-next" class="ctrl-btn ctrl-secondary" title="Next">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <polygon points="5,4 15,12 5,20"/>
+          <line x1="19" y1="4" x2="19" y2="20"/>
+        </svg>
+      </button>
+      <button id="btn-repeat" class="ctrl-btn ctrl-secondary" title="Repeat">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path d="M17 1l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 23l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/>
+        </svg>
+        <span id="repeat-badge" style="display:none">1</span>
+      </button>
+    </div>
+
+    <!-- VOLUME + ACTIONS -->
+    <div id="extra-controls">
+      <div id="volume-row">
+        <button class="vol-icon-btn" id="btn-mute" title="Mute">
+          <svg id="vol-icon-on" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+          </svg>
+          <svg id="vol-icon-off" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="display:none">
+            <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+            <line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>
+          </svg>
+        </button>
+        <input type="range" id="volume-slider" min="0" max="100" value="80">
+        <span id="volume-val">80</span>
+      </div>
+      <div id="action-row">
+        <button class="action-btn" id="btn-add-files">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="12" y1="18" x2="12" y2="12"/>
+            <line x1="9" y1="15" x2="15" y2="15"/>
+          </svg>
+          ADD FILES
+        </button>
+        <button class="action-btn" id="btn-add-folder">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          </svg>
+          ADD FOLDER
+        </button>
+        <button class="action-btn danger-btn" id="btn-clear">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+          </svg>
+          CLEAR
+        </button>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ── RIGHT: PLAYLIST ── -->
+  <section id="playlist-panel">
+    <div id="playlist-header">
+      <div class="pl-header-left">
+        <span class="pl-title">QUEUE</span>
+        <span id="pl-count" class="pl-count-badge">0 TRACKS</span>
+      </div>
+      <div class="pl-header-right">
+        <button class="pl-tool-btn" id="btn-equalizer" title="Equalizer">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/>
+            <line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/>
+            <line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/>
+            <line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/>
+            <line x1="17" y1="16" x2="23" y2="16"/>
+          </svg>
+          <span class="pl-btn-label">EQUALIZER</span>
+        </button>
+        <button class="pl-tool-btn" id="btn-playlist-manager" title="Playlist Manager">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+          </svg>
+          <span class="pl-btn-label">PLAYLISTS</span>
+        </button>
+        <button class="pl-tool-btn" id="btn-lyrics" title="Lyrics">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+          <span class="pl-btn-label">LYRICS</span>
+        </button>
+        <button class="pl-tool-btn" id="btn-radio" title="Radio Online">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="10" width="18" height="11" rx="2"/>
+            <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
+            <circle cx="12" cy="16" r="2"/>
+            <line x1="19" y1="10" x2="19" y2="10"/>
+          </svg>
+          <span class="pl-btn-label">RADIO</span>
+        </button>
+        <button class="pl-tool-btn" id="btn-tv" title="TV Online">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="7" width="20" height="15" rx="2"/>
+            <polyline points="17 2 12 7 7 2"/>
+          </svg>
+          <span class="pl-btn-label">TV</span>
+        </button>
+        <button class="pl-tool-btn" id="btn-converter">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+          <span class="pl-btn-label">CONVERT</span>
+        </button>
+        <button class="pl-tool-btn" id="btn-cache-manager">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <ellipse cx="12" cy="5" rx="9" ry="3"/>
+            <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+            <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+          </svg>
+          <span class="pl-btn-label">CACHE</span>
+        </button>
+
+        <div id="search-wrap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input type="text" id="search-input" placeholder="FILTER..."/>
+        </div>
+      </div>
+    </div>
+
+    <div id="playlist-body">
+      <div id="playlist-list"></div>
+      <div id="playlist-empty">
+        <svg width="56" height="56" viewBox="0 0 56 56" fill="none">
+          <rect x="8" y="14" width="40" height="5" rx="2" fill="#E8FF00" opacity="0.12"/>
+          <rect x="8" y="25" width="30" height="5" rx="2" fill="#E8FF00" opacity="0.08"/>
+          <rect x="8" y="36" width="35" height="5" rx="2" fill="#E8FF00" opacity="0.08"/>
+        </svg>
+        <p>QUEUE IS EMPTY</p>
+        <p class="empty-sub">ADD FILES OR A FOLDER TO BEGIN</p>
+      </div>
+    </div>
+
+    <div id="playlist-footer">
+      <span id="pl-duration-total">Total: —</span>
+      <span id="pl-status-text">IDLE</span>
+    </div>
+  </section>
+
+</div><!-- end main-layout -->
+
+<!-- ═══════════ HIDDEN AUDIO ════════════════════════════════ -->
+<audio id="audio-player" preload="auto"></audio>
+
+<!-- ═══════════ VIDEO FULLSCREEN LAYER ══════════════════════ -->
+<div id="video-layer">
+  <video id="video-player" preload="auto"></video>
+
+  <!-- Center play/pause overlay button (YouTube-style) -->
+  <div id="video-center-overlay" title="Click to play/pause">
+    <button id="video-center-btn" class="video-center-playpause">
+      <svg id="vcenter-icon-play" width="48" height="48" viewBox="0 0 24 24" fill="white"><polygon points="5,3 19,12 5,21"/></svg>
+      <svg id="vcenter-icon-pause" width="48" height="48" viewBox="0 0 24 24" fill="white" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+    </button>
+  </div>
+
+  <!-- YouTube-style overlay controls (autohide) -->
+  <div id="video-controls">
+    <!-- top gradient -->
+    <div class="vc-top-bar">
+      <div class="vc-title" id="vc-title-text">—</div>
+      <button class="vc-btn" id="vc-close">✕ CLOSE</button>
+    </div>
+
+    <!-- bottom controls -->
+    <div class="vc-bottom-bar">
+      <!-- Video seekbar -->
+      <div class="vc-seekbar-wrap">
+        <span class="vc-time" id="vc-time-current">0:00</span>
+        
+        <div class="vc-seekbar" id="vc-seekbar">
+          <div id="vc-preview-tooltip">
+            <img id="vc-preview-img" src="?v=51b2968b7c19" alt="">
+            <span id="vc-preview-time">00:00</span>
+          </div>
+          <div class="vc-seek-track">
+            <div class="vc-seek-fill" id="vc-seek-fill"></div>
+            <div class="vc-seek-thumb" id="vc-seek-thumb"></div>
+          </div>
+        </div>
+        
+        <span class="vc-time" id="vc-time-total">0:00</span>
+      </div>
+
+      <!-- Video control buttons -->
+      <div class="vc-btn-row">
+        <button class="vc-btn" id="vc-prev">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="19,20 9,12 19,4"/><line x1="5" y1="4" x2="5" y2="20"/>
+          </svg>
+        </button>
+        <button class="vc-btn vc-play-btn" id="vc-play">
+          <svg id="vc-icon-play" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+          <svg id="vc-icon-pause" width="22" height="22" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+        </button>
+        <button class="vc-btn" id="vc-next">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="5,4 15,12 5,20"/><line x1="19" y1="4" x2="19" y2="20"/>
+          </svg>
+        </button>
+        <div class="vc-vol-wrap">
+          <button class="vc-btn" id="vc-mute">
+            <svg id="vc-vol-on" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+            </svg>
+            <svg id="vc-vol-off" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none">
+              <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+              <line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>
+            </svg>
+          </button>
+          <input type="range" class="vc-vol-slider" id="vc-vol-slider" min="0" max="100" value="80">
+        </div>
+        <div class="vc-spacer"></div>
+        <button class="vc-btn" id="vc-subtitle" title="Toggle Subtitles" style="display:none">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="5" width="20" height="14" rx="2"/>
+            <line x1="6" y1="12" x2="12" y2="12"/>
+            <line x1="14" y1="12" x2="18" y2="12"/>
+            <line x1="6" y1="16" x2="9" y2="16"/>
+            <line x1="11" y1="16" x2="18" y2="16"/>
+          </svg>
+          <span class="vc-sub-label">CC</span>
+        </button>
+        <button class="vc-btn" id="vc-fullscreen" title="Toggle Fullscreen">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+          </svg>
+        </button>
+        <button class="vc-btn" id="vc-miniplayer" title="Mini Player">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="3" width="20" height="14" rx="2"/>
+            <rect x="12" y="11" width="8" height="6" rx="1" fill="currentColor" stroke="none" opacity="0.85"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ LYRICS OVERLAY ═════════════════════════════ -->
+<div id="lyrics-overlay" class="lyrics-overlay">
+  <div class="lyrics-panel">
+    <div class="lyrics-header">
+      <div class="lyrics-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <h2>LYRICS</h2>
+        <span id="lyrics-sync-badge" class="lyrics-badge" style="display:none">SYNCED</span>
+      </div>
+      <button class="lyrics-fs-btn" id="lyrics-fullscreen">FULLSCREEN MODE</button>
+      <button class="lyrics-close-btn" id="lyrics-close">✕</button>
+    </div>
+    <div class="lyrics-track-info">
+      <span id="lyrics-track-name">—</span>
+      <span id="lyrics-artist-name">—</span>
+    </div>
+    <div class="lyrics-body" id="lyrics-body">
+      <div class="lyrics-idle">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <p>PLAY A TRACK TO LOAD LYRICS</p>
+      </div>
+    </div>
+    <div class="lyrics-footer" id="lyrics-footer">
+      <span id="lyrics-status">IDLE</span>
+      <button class="lyrics-refetch-btn" id="lyrics-refetch" style="display:none">↺ RETRY</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- ═══════════ RADIO OVERLAY (Center Modal) ════════════════════ -->
+<div id="radio-overlay" class="radio-modal-overlay">
+  <div class="radio-modal">
+
+    <!-- Header -->
+    <div class="radio-modal-header">
+      <div class="radio-modal-header-left">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="2">
+          <rect x="3" y="10" width="18" height="11" rx="2"/>
+          <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
+          <circle cx="12" cy="16" r="2"/>
+        </svg>
+        <h2>RADIO ONLINE</h2>
+        <span id="radio-live-badge" class="radio-live-badge" style="display:none">&#9679; LIVE</span>
+      </div>
+      <button class="radio-modal-close" id="radio-close">&#x2715;</button>
+    </div>
+
+    <!-- Now Playing + Controls -->
+    <div class="radio-player-section">
+      <!-- Album art / station logo placeholder -->
+      <div class="radio-art-frame">
+        <div class="radio-art-rings">
+          <div class="radio-ring radio-ring-1"></div>
+          <div class="radio-ring radio-ring-2"></div>
+        </div>
+        <div class="radio-art-icon" id="radio-art-icon">
+          <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.5">
+            <rect x="3" y="10" width="18" height="11" rx="2"/>
+            <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
+            <circle cx="12" cy="16" r="2"/>
+          </svg>
+        </div>
+        <!-- Animated bars (visible when playing) -->
+        <div class="radio-vis-bars" id="radio-vis-bars" style="display:none">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+
+      <!-- Track info -->
+      <div class="radio-now-playing" id="radio-now-playing">
+        <div class="radio-now-name" id="radio-now-name">— SELECT A STATION —</div>
+        <div class="radio-now-meta" id="radio-now-meta">RADIO ONLINE · MACAN</div>
+        <div class="radio-now-status" id="radio-status">IDLE</div>
+      </div>
+
+      <!-- Playback controls -->
+      <div class="radio-controls">
+        <button class="radio-ctrl-btn" id="radio-prev" title="Previous station">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="19,20 9,12 19,4"/><line x1="5" y1="4" x2="5" y2="20"/>
+          </svg>
+        </button>
+        <button class="radio-ctrl-btn radio-ctrl-play" id="radio-play-btn" title="Play / Pause">
+          <svg id="radio-icon-play" width="28" height="28" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+          <svg id="radio-icon-stop" width="28" height="28" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+        <button class="radio-ctrl-btn" id="radio-next" title="Next station">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="5,4 15,12 5,20"/><line x1="19" y1="4" x2="19" y2="20"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Volume -->
+      <div class="radio-vol-row">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.6">
+          <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+        </svg>
+        <input type="range" id="radio-vol-slider" class="radio-vol-slider" min="0" max="100" value="80">
+        <span class="radio-vol-val" id="radio-vol-val">80</span>
+      </div>
+    </div>
+
+    <!-- Divider -->
+    <div class="radio-divider"></div>
+
+    <!-- Station list section -->
+    <div class="radio-list-section">
+      <!-- Search + actions -->
+      <div class="radio-search-row">
+        <div class="radio-search-wrap">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input type="text" id="radio-search" placeholder="SEARCH STATIONS..." class="radio-search-input"/>
+        </div>
+        <button class="radio-action-btn" id="radio-refresh" title="Refresh">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="23 4 23 10 17 10"/>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+          </svg>
+          REFRESH
+        </button>
+        <button class="radio-action-btn" id="radio-add-custom">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          ADD URL
+        </button>
+      </div>
+
+      <!-- Custom URL row -->
+      <div class="radio-custom-row" id="radio-custom-url-row" style="display:none">
+        <input type="text" id="radio-custom-name" placeholder="Station name..." class="radio-url-input"/>
+        <input type="text" id="radio-custom-url" placeholder="Stream URL (http://...)..." class="radio-url-input"/>
+        <button class="radio-action-btn radio-action-accent" id="radio-custom-save">SAVE &amp; PLAY</button>
+        <button class="radio-action-btn" id="radio-custom-cancel">CANCEL</button>
+      </div>
+
+      <!-- List header -->
+      <div class="radio-list-header">
+        <span>STATIONS</span>
+        <span id="radio-count" class="radio-count">— stations</span>
+      </div>
+
+      <!-- Station list -->
+      <div class="radio-list" id="radio-list">
+        <div class="rtv-empty-state">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
+            <rect x="3" y="10" width="18" height="11" rx="2"/>
+            <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
+            <circle cx="12" cy="16" r="2"/>
+          </svg>
+          <p>PRESS REFRESH TO LOAD STATIONS</p>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════ TV OVERLAY ═══════════════════════════════════════ -->
+<div id="tv-overlay" class="radio-tv-overlay">
+  <div class="rtv-panel">
+    <div class="rtv-header">
+      <div class="rtv-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="7" width="20" height="15" rx="2"/>
+          <polyline points="17 2 12 7 7 2"/>
+        </svg>
+        <h2>TV ONLINE</h2>
+        <span id="tv-live-badge" class="rtv-live-badge" style="display:none">&#9679; LIVE</span>
+      </div>
+      <button class="rtv-close-btn" id="tv-close">&#x2715;</button>
+    </div>
+
+    <div class="rtv-now-playing" id="tv-now-playing" style="display:none">
+      <div class="rtv-np-icon">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/>
+        </svg>
+      </div>
+      <div class="rtv-np-info">
+        <div class="rtv-np-name" id="tv-now-name">&#8212;</div>
+        <div class="rtv-np-meta" id="tv-now-meta">&#8212;</div>
+      </div>
+      <div class="rtv-np-vis" id="tv-vis-bars">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <button class="rtv-stop-btn" id="tv-stop">&#9632; STOP</button>
+    </div>
+
+    <div class="rtv-controls-row">
+      <div class="rtv-search-wrap">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input type="text" id="tv-search" placeholder="SEARCH CHANNELS..." class="rtv-search"/>
+      </div>
+      <select id="tv-source-select" class="rtv-select">
+        <option value="https://iptv-org.github.io/iptv/countries/id.m3u" selected>Github (ID)</option>
+        <option value="https://iptv-org.github.io/iptv/index.m3u">Github (Global)</option>
+        <option value="https://www.apsattv.com/vizio.m3u">Vizio TV</option>
+        <option value="https://www.apsattv.com/localnow.m3u">Local Now</option>
+        <option value="https://www.apsattv.com/lg.m3u">LG Channels</option>
+        <option value="https://www.apsattv.com/tablo.m3u">Tablo</option>
+        <option value="https://www.apsattv.com/xiaomi.m3u">Xiaomi</option>
+        <option value="https://www.apsattv.com/firetv.m3u">Fire TV</option>
+        <option value="https://www.apsattv.com/xumo.m3u">Xumo</option>
+        <option value="https://www.apsattv.com/rok.m3u">The Roku Channel</option>
+        <option value="https://www.apsattv.com/distro.m3u">Distro</option>
+        <option value="https://www.apsattv.com/tclplus.m3u">TCL TV Plus</option>
+      </select>
+      <button class="rtv-action-btn" id="tv-load-m3u" title="Load local M3U file">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+        </svg>
+        M3U
+      </button>
+      <button class="rtv-action-btn" id="tv-refresh">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"/>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+        RELOAD
+      </button>
+    </div>
+
+    <div class="rtv-custom-url-row" id="tv-custom-url-row" style="display:none">
+      <input type="text" id="tv-custom-url" placeholder="Stream URL or .m3u URL..." class="rtv-url-input" style="flex:2"/>
+      <button class="rtv-action-btn accent" id="tv-custom-play">PLAY URL</button>
+      <button class="rtv-action-btn" id="tv-custom-cancel">CANCEL</button>
+    </div>
+
+    <div class="rtv-list-header">
+      <span>CHANNELS</span>
+      <span class="rtv-count" id="tv-count">&#8212; channels</span>
+    </div>
+
+    <div class="rtv-list" id="tv-list">
+      <div class="rtv-empty-state">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
+          <rect x="2" y="7" width="20" height="15" rx="2"/>
+          <polyline points="17 2 12 7 7 2"/>
+        </svg>
+        <p>SELECT A SOURCE AND PRESS RELOAD</p>
+      </div>
+    </div>
+
+    <div class="rtv-footer">
+      <span id="tv-status">IDLE</span>
+    </div>
+  </div>
+</div>
+
+<!-- hidden file input for M3U -->
+<input type="file" id="tv-m3u-file-input" accept=".m3u,.m3u8" style="display:none">
+
+
+<!-- ═══════════ MINI PLAYER (floating draggable video overlay) ═ -->
+<div id="mini-player" class="mini-player" style="display:none">
+  <div class="mp-drag-handle" id="mp-drag-handle"></div>
+  <video id="mp-video" class="mp-video"></video>
+  <div class="mp-controls">
+    <div class="mp-info">
+      <div class="mp-title" id="mp-title">—</div>
+    </div>
+    <div class="mp-btn-row">
+      <button class="mp-btn" id="mp-prev" title="Previous">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+          <polygon points="19,20 9,12 19,4"/><rect x="5" y="4" width="2" height="16"/>
+        </svg>
+      </button>
+      <button class="mp-btn mp-play-btn" id="mp-play" title="Play/Pause">
+        <svg id="mp-icon-play" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+        <svg id="mp-icon-pause" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="display:none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+      </button>
+      <button class="mp-btn" id="mp-next" title="Next">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+          <polygon points="5,4 15,12 5,20"/><rect x="17" y="4" width="2" height="16"/>
+        </svg>
+      </button>
+      <button class="mp-btn mp-expand" id="mp-expand" title="Expand to fullscreen">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/>
+          <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
+        </svg>
+      </button>
+      <button class="mp-btn mp-close" id="mp-close" title="Close video">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+  <div class="mp-resize-handle" id="mp-resize-handle"></div>
+</div>
+
+<!-- ═══════════ CACHE MANAGER OVERLAY ══════════════════════════ -->
+<div id="cache-manager-overlay" class="cache-manager-overlay">
+  <div class="cm-panel">
+    <div class="cm-header">
+      <h2>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <ellipse cx="12" cy="5" rx="9" ry="3"/>
+          <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+          <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+        </svg>
+        CACHE MANAGER
+      </h2>
+      <button class="cm-close-btn" id="cm-close">&#x2715;</button>
+    </div>
+
+    <div class="cm-body">
+      <div class="cm-entry">
+        <div class="cm-entry-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="3" width="20" height="14" rx="2"/>
+            <path d="M8 21h8M12 17v4"/>
+          </svg>
+        </div>
+        <div class="cm-entry-info">
+          <div class="cm-entry-name">WEBVIEW2 PROFILE</div>
+          <div class="cm-entry-desc">Browser cache, cookies, IndexedDB, service workers</div>
+        </div>
+        <span class="cm-entry-size loading" id="cm-size-webview2">—</span>
+        <button class="cm-entry-clear" id="cm-clear-webview2">CLEAR</button>
+      </div>
+
+      <div class="cm-entry">
+        <div class="cm-entry-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </div>
+        <div class="cm-entry-info">
+          <div class="cm-entry-name">ALBUM ART CACHE</div>
+          <div class="cm-entry-desc">Downloaded cover art images from online sources</div>
+        </div>
+        <span class="cm-entry-size loading" id="cm-size-albumart">—</span>
+        <button class="cm-entry-clear" id="cm-clear-albumart">CLEAR</button>
+      </div>
+
+      <div class="cm-entry">
+        <div class="cm-entry-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        </div>
+        <div class="cm-entry-info">
+          <div class="cm-entry-name">LYRICS CACHE</div>
+          <div class="cm-entry-desc">Cached lyrics fetched from online services</div>
+        </div>
+        <span class="cm-entry-size loading" id="cm-size-lyrics">—</span>
+        <button class="cm-entry-clear" id="cm-clear-lyrics">CLEAR</button>
+      </div>
+
+      <div class="cm-entry">
+        <div class="cm-entry-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="7" width="20" height="15" rx="2"/>
+            <polyline points="17 2 12 7 7 2"/>
+          </svg>
+        </div>
+        <div class="cm-entry-info">
+          <div class="cm-entry-name">VIDEO THUMBNAIL CACHE</div>
+          <div class="cm-entry-desc">In-memory preview frames (cleared on restart)</div>
+        </div>
+        <span class="cm-entry-size loading" id="cm-size-videothumb">—</span>
+        <button class="cm-entry-clear" id="cm-clear-videothumb">CLEAR</button>
+      </div>
+    </div>
+
+    <div class="cm-footer">
+      <span class="cm-total">TOTAL: <strong id="cm-total-size">—</strong></span>
+      <div style="display:flex;gap:8px;">
+        <button class="cm-btn-refresh" id="cm-refresh">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:inline;vertical-align:middle;margin-right:5px;">
+            <polyline points="23 4 23 10 17 10"/>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+          </svg>
+          REFRESH
+        </button>
+        <button class="cm-btn-clearall" id="cm-clear-all">🗑 CLEAR ALL</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ ABOUT OVERLAY ══════════════════════════════════ -->
+<div id="about-overlay" class="about-overlay">
+  <div class="about-panel">
+
+    <!-- Header -->
+    <div class="about-header">
+      <button class="about-close-btn" id="about-close">&#x2715;</button>
+    </div>
+
+    <!-- Hero / Branding -->
+    <div class="about-hero">
+      <div class="about-logo-ring">
+        <svg width="52" height="52" viewBox="0 0 28 28" fill="none">
+          <polygon points="14,2 26,8 26,20 14,26 2,20 2,8" stroke="#E8FF00" stroke-width="1.5" fill="none"/>
+          <circle cx="14" cy="14" r="4" fill="#E8FF00"/>
+        </svg>
+      </div>
+      <div class="about-title-block">
+        <h1 class="about-app-name">MACAN</h1>
+        <span class="about-app-sub">MEDIA PLAYER</span>
+      </div>
+      <div class="about-version-badge">
+        <span class="about-ver-label">VERSION</span>
+        <span class="about-ver-num" id="about-ver-num">—</span>
+      </div>
+    </div>
+
+    <!-- Description -->
+    <div class="about-desc">
+      <p>
+        Macan Media Player is a lightweight, high-fidelity desktop media player built for
+        audiophiles and power users who demand full control over their listening experience.
+        Engineered with a focus on performance and clarity, it supports a wide range of
+        audio and video formats, real-time parametric equalization, synchronized lyrics,
+        online radio and TV streaming, and advanced playlist management — all within a
+        single, distraction-free interface.
+      </p>
+      <p>
+        Macan is designed to get out of your way and let the music speak for itself.
+      </p>
+    </div>
+
+    <!-- Divider -->
+    <div class="about-divider"></div>
+
+    <!-- Meta info grid -->
+    <div class="about-meta-grid">
+      <div class="about-meta-item">
+        <span class="about-meta-label">DEVELOPER</span>
+        <span class="about-meta-val">Macan Angkasa</span>
+      </div>
+      <div class="about-meta-item">
+        <span class="about-meta-label">PLATFORM</span>
+        <span class="about-meta-val">Windows · pywebview + EdgeWebView2</span>
+      </div>
+      <div class="about-meta-item">
+        <span class="about-meta-label">LICENSE</span>
+        <span class="about-meta-val">Proprietary — All Rights Reserved</span>
+      </div>
+      <div class="about-meta-item">
+        <span class="about-meta-label">REPOSITORY</span>
+        <a class="about-meta-link" id="about-repo-link" href="#">github.com/danx123/macan-media-player</a>
+      </div>
+    </div>
+
+    <div class="about-divider"></div>
+
+    <!-- Update checker -->
+    <div class="about-update-row">
+      <div class="about-update-info">
+        <span class="about-update-label">SOFTWARE UPDATE</span>
+        <span class="about-update-status" id="about-update-status">Click CHECK UPDATE to check for the latest release.</span>
+      </div>
+      <button class="about-update-btn" id="about-check-update">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"/>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+        CHECK UPDATE
+      </button>
+    </div>
+
+    <!-- Update progress bar (hidden by default) -->
+    <div class="about-update-progress" id="about-update-progress" style="display:none">
+      <div class="about-update-bar" id="about-update-bar"></div>
+    </div>
+
+    <!-- Footer -->
+    <div class="about-footer">
+      <span>© 2026 Macan Angkasa — All Rights Reserved.</span>
+      <span class="about-footer-build" id="about-footer-build"></span>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════ NAV MENU ══════════════════════════════════════ -->
+<div id="nav-menu-overlay"></div>
+<div id="nav-menu-panel">
+  <!-- Profile header -->
+  <div class="nm-profile-header">
+    <div id="nm-profile-block" class="nm-profile-block">
+      <!-- Populated by UserProfile.updateMenuHeader() -->
+    </div>
+  </div>
+  <div class="nm-header">
+    <span class="nm-title">MENU</span>
+    <button class="nm-close-btn" id="nm-close-btn">✕</button>
+  </div>
+  <div id="nav-menu-list"></div>
+</div>
+
+<!-- ═══════════ SMART PLAYLIST OVERLAY ════════════════════════ -->
+<div id="smart-playlist-overlay">
+  <div class="sp-panel">
+    <div class="sp-header">
+      <div class="sp-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26"/>
+        </svg>
+        <h2>SMART PLAYLIST</h2>
+        <span class="sp-count-badge" id="sp-count">0 TRACKS</span>
+      </div>
+      <button class="sp-close-btn" id="smart-playlist-close">✕</button>
+    </div>
+
+    <div class="sp-subheader">
+      <span class="sp-sub-label">TOP 25 MOST PLAYED</span>
+    </div>
+
+    <div class="sp-tabs-row">
+      <div class="sp-tabs">
+        <button class="sp-tab active" id="sp-tab-audio">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/>
+          </svg>
+          AUDIO
+        </button>
+        <button class="sp-tab" id="sp-tab-video">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="7" width="20" height="15" rx="2"/>
+            <polyline points="17 2 12 7 7 2"/>
+          </svg>
+          VIDEO
+        </button>
+      </div>
+      <!-- LOAD button — pushes top-25 to queue and starts playback -->
+      <button class="sp-load-btn" id="sp-load-btn" style="display:none" title="Load this Smart Playlist into the queue and play">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        LOAD TO QUEUE
+      </button>
+    </div>
+
+    <div class="sp-list" id="sp-list"></div>
+
+    <div class="sp-empty" id="sp-empty" style="display:none">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.2">
+        <polygon points="12,2 15.09,8.26 22,9.27 17,14.14 18.18,21.02 12,17.77 5.82,21.02 7,14.14 2,9.27 8.91,8.26"/>
+      </svg>
+      <p>NO PLAY HISTORY YET</p>
+      <p class="sp-empty-sub">TRACKS APPEAR HERE AFTER YOU PLAY THEM</p>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ SETTINGS OVERLAY ═══════════════════════════ -->
+<div id="settings-overlay">
+  <div id="settings-panel" class="st-panel">
+    <!-- built dynamically by Settings._buildPanel() -->
+  </div>
+</div>
+
+<!-- ═══════════ LISTEN STATISTICS OVERLAY ═══════════════════ -->
+<div id="listen-stats-overlay">
+  <div class="ls-panel">
+    <div class="ls-header">
+      <div class="ls-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="2">
+          <line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/>
+          <line x1="6" y1="20" x2="6" y2="14"/><line x1="2" y1="20" x2="22" y2="20"/>
+        </svg>
+        <h2>LISTEN STATISTICS</h2>
+      </div>
+      <button class="ls-close-btn" id="ls-close">✕</button>
+    </div>
+
+    <!-- Counter cards -->
+    <div class="ls-cards">
+      <div class="ls-card">
+        <div class="ls-card-label">SESSION</div>
+        <div class="ls-card-value" id="ls-session">0s</div>
+        <div class="ls-card-sub">Current session</div>
+      </div>
+      <div class="ls-card">
+        <div class="ls-card-label">TODAY</div>
+        <div class="ls-card-value" id="ls-today">0s</div>
+        <div class="ls-card-sub">Listening today</div>
+      </div>
+      <div class="ls-card ls-card-accent">
+        <div class="ls-card-label">THIS MONTH</div>
+        <div class="ls-card-value" id="ls-monthly">0s</div>
+        <div class="ls-card-sub">Monthly total</div>
+      </div>
+    </div>
+
+    <!-- Bar chart: last 7 days -->
+    <div class="ls-chart-section">
+      <div class="ls-chart-title">LAST 7 DAYS</div>
+      <canvas id="ls-chart" class="ls-chart"></canvas>
+    </div>
+
+    <!-- Footer: reset + tagline -->
+    <div class="ls-footer">
+      <div class="ls-tagline">Thanks for using Macan Media Player 🐯</div>
+      <button class="ls-reset-btn" id="ls-reset-btn">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="1 4 1 10 7 10"/>
+          <path d="M3.51 15a9 9 0 1 0 .49-3.51"/>
+        </svg>
+        RESET STATS
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ ACHIEVEMENTS OVERLAY ═════════════════════════ -->
+<div id="achievements-overlay">
+  <div class="ach-panel">
+    <div class="ach-header">
+      <div class="ach-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="2">
+          <circle cx="12" cy="8" r="7"/>
+          <polyline points="8.21 13.89 7 23 12 20 17 23 15.79 13.88"/>
+        </svg>
+        <h2>ACHIEVEMENTS</h2>
+      </div>
+      <button class="ach-close-btn" id="ach-close">✕</button>
+    </div>
+
+    <!-- Progress bar -->
+    <div class="ach-progress-section">
+      <div class="ach-progress-label">
+        <span id="ach-count-unlocked">0</span>
+        <span> / </span>
+        <span id="ach-count-total">0</span>
+        <span> UNLOCKED</span>
+      </div>
+      <div class="ach-progress-track">
+        <div class="ach-progress-bar" id="ach-progress-bar"></div>
+      </div>
+    </div>
+
+    <!-- Badge grid -->
+    <div class="ach-grid" id="ach-grid"></div>
+
+    <div class="ach-footer">Thanks for using Macan Media Player 🐯</div>
+  </div>
+</div>
+
+<!-- ═══════════ USER PROFILE OVERLAY ══════════════════════════ -->
+<div id="user-profile-overlay">
+  <div class="up-panel">
+    <div class="up-header">
+      <h2>EDIT PROFILE</h2>
+      <button class="up-close-x" id="up-cancel-btn">✕</button>
+    </div>
+
+    <!-- Preview -->
+    <div class="up-preview-row">
+      <div id="up-avatar-preview"></div>
+      <div class="up-preview-right">
+        <div class="up-preview-name" id="up-preview-name">Listener</div>
+        <div class="up-preview-sub">MACAN LISTENER</div>
+      </div>
+    </div>
+
+    <!-- Name input -->
+    <div class="up-field">
+      <label class="up-label">DISPLAY NAME</label>
+      <input type="text" id="up-name-input" class="up-input" placeholder="Enter your name..." maxlength="24">
+    </div>
+
+    <!-- Emoji picker -->
+    <div class="up-field">
+      <label class="up-label">AVATAR</label>
+      <div class="up-emoji-grid" id="up-emoji-grid"></div>
+    </div>
+
+    <!-- Color picker -->
+    <div class="up-field">
+      <label class="up-label">ACCENT COLOR</label>
+      <div class="up-color-grid" id="up-color-grid"></div>
+    </div>
+
+    <!-- Actions -->
+    <div class="up-actions">
+      <button class="up-save-btn" id="up-save-btn">SAVE PROFILE</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ SCRIPTS ═══════════════════════════════════ -->
+<!-- ─── Plugin Bridge Adapter ───────────────────────────
+     Loads FIRST so MacanBridge is available to all modules.
+     plugins.config.js loads AFTER script.js (last). -->
+<script src="plugin-bridge.js?v=51b2968b7c19"></script>
+<script src="equalizer.js?v=51b2968b7c19"></script>
+<script src="playlist-manager.js?v=51b2968b7c19"></script>
+<script src="radio-tv.js?v=51b2968b7c19"></script>
+<script src="converter.js?v=51b2968b7c19"></script>
+<script src="about.js?v=51b2968b7c19"></script>
+<script src="smart-playlist.js?v=51b2968b7c19"></script>
+<script src="settings.js?v=51b2968b7c19"></script>
+<script src="listen-stats.js?v=51b2968b7c19"></script>
+<script src="achievements.js?v=51b2968b7c19"></script>
+<script src="user-profile.js?v=51b2968b7c19"></script>
+<script src="nav-menu.js?v=51b2968b7c19"></script>
+<script src="script.js?v=51b2968b7c19"></script>
+<script src="plugins.config.js?v=51b2968b7c19"></script>
+</body>
+</html>
