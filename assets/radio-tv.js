@@ -352,6 +352,7 @@ const RTV = (() => {
 
     radioAudio.src = station.url;
     radioAudio.volume = radioVolSlider ? parseInt(radioVolSlider.value) / 100 : getVolume();
+    if (window.AchievementSystem) AchievementSystem.record('radioPlayed');
     radioAudio.play().then(() => {
       setStatus(radioStatus, '● LIVE — ' + station.name);
       if (radioLiveBadge) radioLiveBadge.style.display = 'inline';
@@ -495,6 +496,7 @@ const RTV = (() => {
 
   function playTvChannel(channel) {
     tvActive = channel;
+    if (window.AchievementSystem) AchievementSystem.record('tvWatched');
 
     const videoLayer   = document.getElementById('video-layer');
     const videoPlayer  = document.getElementById('video-player');
@@ -676,12 +678,12 @@ const RTV = (() => {
         setStatus(tvStatus, `${tvChannels.length + tvCustom.length} channels (cached)`);
       } else {
         // auto-fetch default source (Indonesia IPTV)
-        const lastSrc = loadJSON(STORAGE_TV_LAST_SRC) || tvSourceSelect.value;
-        if (lastSrc) {
-          // set selector to match saved
-          tvSourceSelect.value = lastSrc;
-          fetchTvChannels(lastSrc);
-        }
+        const DEFAULT_TV_SRC = 'https://iptv-org.github.io/iptv/countries/id.m3u';
+        const lastSrc = loadJSON(STORAGE_TV_LAST_SRC) || DEFAULT_TV_SRC;
+        // Ensure dropdown reflects the source (fallback to default if stored value not in list)
+        const optExists = [...tvSourceSelect.options].some(o => o.value === lastSrc);
+        tvSourceSelect.value = optExists ? lastSrc : DEFAULT_TV_SRC;
+        fetchTvChannels(tvSourceSelect.value);
       }
     }
   }
