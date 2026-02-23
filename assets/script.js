@@ -2325,8 +2325,9 @@ async function loadTrack(index, autoplay = true) {
   const track = S.playlist[index];
   const isVid  = track.is_video;
 
-  // Record play count for smart playlist
-  if (track.path && window.SmartPlaylist) SmartPlaylist.recordPlay(track.path);
+  // Record play count + snapshot metadata for Smart Playlist
+  // Pass full track object so name/artist/album survives queue clear
+  if (track.path && window.SmartPlaylist) SmartPlaylist.recordPlay(track.path, track);
 
   // Record play for achievements
   if (window.AchievementSystem) {
@@ -2679,6 +2680,8 @@ function applyArt(src) {
     artPlaceholder.classList.add('hidden');
     artBlurBg.style.backgroundImage = `url(${src})`;
     artBlurBg.style.opacity = '0.38';
+    // Dynamic Aura: extract dominant color from loaded art
+    if (window.Settings) Settings.onArtLoaded(albumArt);
   };
 
   // Cache art into track object so playlist thumbnails stay updated
@@ -3074,6 +3077,7 @@ async function clearPlaylist() {
   albumArt.src = ''; albumArt.classList.remove('loaded');
   artPlaceholder.classList.remove('hidden');
   artBlurBg.style.opacity = '0';
+  if (window.Settings) Settings.onArtCleared();
   marqueeText.textContent = marqueeClone.textContent = '— SELECT A TRACK TO BEGIN PLAYBACK —';
   S.lyricsData = null;
   if (S.lyricsOpen) showLyricsIdle();
