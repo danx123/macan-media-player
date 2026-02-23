@@ -6,7 +6,10 @@ A sleek, fullscreen desktop media player built with Python and pywebview. Macan 
 
 ## Screenshot
 <img width="1365" height="767" alt="Screenshot 2026-02-23 054127" src="https://github.com/user-attachments/assets/aae76730-65c3-43e6-b282-478be79cfdd1" />
-<img width="1365" height="767" alt="Screenshot 2026-02-23 054135" src="https://github.com/user-attachments/assets/903fcbf0-8c01-4a15-9023-991c0f8d038d" />
+<img width="1365" height="767" alt="Screenshot 2026-02-23 153450" src="https://github.com/user-attachments/assets/121d901b-032e-40c3-956d-30cb72e8833e" />
+<img width="1365" height="767" alt="Screenshot 2026-02-23 153459" src="https://github.com/user-attachments/assets/93e9fdf2-0e1a-45c7-a239-3159554db777" />
+<img width="1365" height="767" alt="Screenshot 2026-02-23 153521" src="https://github.com/user-attachments/assets/2d4caeee-4f6b-4689-887e-ff2fe862ccea" />
+<img width="1365" height="767" alt="Screenshot 2026-02-23 153510" src="https://github.com/user-attachments/assets/1d1ca4fe-bba0-4511-b716-be89d172d4e4" />
 <img width="1365" height="767" alt="Screenshot 2026-02-23 054143" src="https://github.com/user-attachments/assets/2c29ed7a-da1c-4999-945c-74b123cd3b99" />
 <img width="1365" height="767" alt="Screenshot 2026-02-23 054223" src="https://github.com/user-attachments/assets/94ce25e5-7309-4ed2-8ebe-0406632d77ad" />
 <img width="1365" height="767" alt="Screenshot 2026-02-18 044825" src="https://github.com/user-attachments/assets/10399916-24fb-42da-971d-f39da5c141f6" />
