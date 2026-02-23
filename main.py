@@ -343,7 +343,8 @@ class MacanMediaAPI:
         # FIX: Lock to prevent concurrent save_app_state / _save_settings calls
         # from multiple JS threads (pywebview calls each JS→Python bridge on its
         # own thread, so parallel invocations are possible).
-        self._settings_lock = threading.Lock()
+        self._settings_lock   = threading.Lock()
+        self._plugin_handlers = {}   # 'plugin_id:action' → callable
         self._load_settings()
         app_data = self._get_app_data()
         self._art_cache   = AlbumArtCache(app_data)
@@ -364,6 +365,42 @@ class MacanMediaAPI:
 
     def minimize_app(self):
         self._window.minimize()
+
+    # ─── PLUGIN BRIDGE ───────────────────────────────────────────────────────
+
+    def register_plugin_handler(self, plugin_id: str, action: str, handler):
+        """
+        Register a Python-side handler callable by a JS plugin via plugin_request().
+
+        Usage (in main.py, after api = MacanMediaAPI()):
+            api.register_plugin_handler('my-plugin', 'fetch_data', my_fn)
+
+        The handler receives a single dict argument (the payload from JS)
+        and must return a JSON-serialisable value.
+        """
+        key = f"{plugin_id}:{action}"
+        self._plugin_handlers[key] = handler
+        print(f"[PluginBridge] Handler registered: {key}")
+
+    def plugin_request(self, plugin_id: str, action: str, payload: dict = None):
+        """
+        Generic Python route called by MacanBridge.py(pluginId, action, payload).
+
+        Routes the call to the handler registered with register_plugin_handler().
+        Returns a dict:
+          { 'ok': True,  'result': <value> }   on success
+          { 'ok': False, 'error':  <message> }  on failure / unknown action
+        """
+        key = f"{plugin_id}:{action}"
+        handler = self._plugin_handlers.get(key)
+        if handler is None:
+            return {'ok': False, 'error': f"No handler registered for '{key}'"}
+        try:
+            result = handler(payload or {})
+            return {'ok': True, 'result': result}
+        except Exception as e:
+            print(f"[PluginBridge] Handler '{key}' raised: {e}")
+            return {'ok': False, 'error': str(e)}
 
     def toggle_fullscreen(self):
         self._window.toggle_fullscreen()
@@ -2384,6 +2421,7 @@ def main():
     _hash_file   = os.path.join(webview_storage, 'asset_hash.txt')
     _assets_dir  = os.path.join(base_dir, 'assets')
     _current_hash = _hash_assets(_assets_dir)
+    _ver_tag      = _current_hash[:12]   # short tag used in ?v= query strings
 
     _stored_hash = ''
     try:
@@ -2404,6 +2442,46 @@ def main():
             print(f'[Macan] Warning: could not write asset_hash.txt: {_e}')
     else:
         print(f'[Macan] Assets unchanged (hash {_current_hash[:8]!r}) — WebView2 cache kept')
+
+    # ── Cache-bust: rewrite asset URLs in index.html with absolute file:// paths ─
+    # Problem: WebView2 caches JS/CSS aggressively. Disk-cache clearing alone is
+    # not always sufficient because compiled bytecode can survive in-process.
+    # Solution: inject ?v=<hash> into asset URLs so WebView2 treats updated files
+    # as new resources it has never seen. We must also convert relative paths to
+    # absolute file:// URLs because the busted HTML is served from the assets dir
+    # itself — relative paths remain valid that way.
+    #
+    # The busted file is written INSIDE the assets folder so that relative
+    # src/href paths (script.js, style.css, etc.) still resolve correctly.
+    import re as _re
+    _orig_html  = os.path.join(_assets_dir, 'index.html')
+    _bust_html  = os.path.join(_assets_dir, 'index.live.html')
+    try:
+        with open(_orig_html, 'r', encoding='utf-8') as _f:
+            _html_content = _f.read()
+
+        def _inject_ver(m):
+            attr, url = m.group(1), m.group(2)
+            # Skip external / data / blob URLs — only touch local relative paths
+            if url.startswith(('http', 'data:', 'blob:', '//', '#', 'file:')):
+                return m.group(0)
+            # Strip any previous ?v= tag cleanly
+            base = _re.sub(r'[?&]v=[^&"#]*', '', url).rstrip('?&')
+            sep  = '&' if '?' in base else '?'
+            return f'{attr}"{base}{sep}v={_ver_tag}"'
+
+        _html_content = _re.sub(
+            r'(src=|href=)"([^"]*)"',
+            _inject_ver,
+            _html_content
+        )
+        with open(_bust_html, 'w', encoding='utf-8') as _f:
+            _f.write(_html_content)
+        entry_point = _bust_html
+        print(f'[Macan] Cache-bust HTML written to assets/ (v={_ver_tag})')
+    except Exception as _e:
+        print(f'[Macan] Warning: cache-bust HTML failed, using original: {_e}')
+        # entry_point stays as the original index.html — safe fallback
 
     window = webview.create_window(
         title='Macan Media Player',
