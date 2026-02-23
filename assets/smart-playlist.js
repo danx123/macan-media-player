@@ -58,6 +58,7 @@ const SmartPlaylist = (() => {
     if (typeof loadTrack === 'function' && S.playlist.length > 0) {
       loadTrack(0, true);
     }
+    if (window.AchievementSystem) AchievementSystem.record('smartLoaded');
 
     // Brief success feedback then close
     const btn = document.getElementById('sp-load-btn');
