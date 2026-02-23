@@ -52,6 +52,11 @@ const NavMenu = (() => {
       action: () => document.getElementById('btn-cache-manager')?.click(),
     },
     {
+      id: 'nm-settings', label: 'SETTINGS',
+      icon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 1.4 13.5L18 16"/><path d="M4.93 4.93a10 10 0 0 0-1.4 13.5L6 16"/><path d="M12 2v2M12 20v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M2 12h2M20 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>',
+      action: () => window.Settings?.open(),
+    },
+    {
       id: 'nm-stats', label: 'LISTEN STATISTICS',
       icon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/><line x1="2" y1="20" x2="22" y2="20"/></svg>',
       action: () => window.ListenStats?.open(),
