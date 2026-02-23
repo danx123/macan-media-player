@@ -459,7 +459,44 @@ function initMediaSessionHandlers() {
     }
   }
 
+  // Fix: Override 'pause' handler to apply fade-out before pausing
+  try {
+    navigator.mediaSession.setActionHandler('pause', () => {
+      const p = activePlayer();
+      if (!p.paused) {
+        if (S.fadeEnabled && S._fadeGain && audioContext && !p.isVideo) {
+          doFadeOut(() => {
+            p.pause();
+            if (S._fadeGain) S._fadeGain.gain.setValueAtTime(0.0001, audioContext.currentTime);
+          });
+        } else {
+          p.pause();
+        }
+      }
+    });
+  } catch (_) {}
+
   console.log('[SMTC] Media Session handlers registered');
+}
+
+// ─── SMTC HEARTBEAT ───────────────────────────────────────────
+// Pushes metadata + position to SMTC every 5s, independent of
+// timeupdate. Keeps OS overlay / taskbar thumbnail current when
+// the window is minimized and DOM events may be throttled.
+let _smtcHeartbeatId = null;
+function startSmtcHeartbeat() {
+  if (_smtcHeartbeatId) return;
+  _smtcHeartbeatId = setInterval(() => {
+    if (!('mediaSession' in navigator)) return;
+    const track = S.playlist[S.currentIndex];
+    if (!track) return;
+    // Re-push full metadata if title has drifted after track switch while minimized
+    const currentTitle = navigator.mediaSession.metadata?.title;
+    if (currentTitle !== (track.name || '—')) {
+      updateMediaSession(track, track.cover_art || null);
+    }
+    syncMediaSessionState();
+  }, 5000);
 }
 
 
@@ -804,6 +841,7 @@ playlistManager.onLoad(async (name) => {
     _rebuildTotalDuration();
     updatePlaylistMeta();
     setStatus(`LOADED "${name}" — ${playlist.length} TRACK(S)`);
+    window.MacanBridge?.emit('queue:add', { tracks: playlist });
     loadTrack(0);
   } catch (e) {
     console.error('[MACAN] onLoad error:', e);
@@ -1369,6 +1407,7 @@ window.addEventListener('load', () => {
 
   // Init SMTC (Media Session API) handlers
   initMediaSessionHandlers();
+  startSmtcHeartbeat();
 
   // ─── STATE RESTORE ──────────────────────────────────────────
   // FIX: Use event-driven readiness instead of a fragile setTimeout.
@@ -2325,6 +2364,9 @@ async function loadTrack(index, autoplay = true) {
   const track = S.playlist[index];
   const isVid  = track.is_video;
 
+  // Bridge: notify plugins of track change
+  window.MacanBridge?.emit('track:load', track);
+
   // Record play count + snapshot metadata for Smart Playlist
   // Pass full track object so name/artist/album survives queue clear
   if (track.path && window.SmartPlaylist) SmartPlaylist.recordPlay(track.path, track);
@@ -2682,6 +2724,8 @@ function applyArt(src) {
     artBlurBg.style.opacity = '0.38';
     // Dynamic Aura: extract dominant color from loaded art
     if (window.Settings) Settings.onArtLoaded(albumArt);
+    // Bridge: art loaded
+    window.MacanBridge?.emit('art:load', { src, track: S.playlist[S.currentIndex] || null });
   };
 
   // Cache art into track object so playlist thumbnails stay updated
@@ -2739,6 +2783,12 @@ function onPlayState(playing) {
     if (playing) ListenStats.startTracking();
     else         ListenStats.stopTracking();
   }
+
+  // Bridge: notify plugins of play/pause state change
+  const _bridgeTrack = S.playlist[S.currentIndex] || null;
+  const _bridgeTime  = (() => { try { return activePlayer().currentTime; } catch { return 0; } })();
+  if (playing) window.MacanBridge?.emit('player:play',  { track: _bridgeTrack, currentTime: _bridgeTime });
+  else         window.MacanBridge?.emit('player:pause', { track: _bridgeTrack, currentTime: _bridgeTime });
 }
 
 // ─── METADATA / TIME ──────────────────────────────────────────
@@ -2810,11 +2860,20 @@ function onTimeUpdate() {
   if (!S._smtcSyncMs || now - S._smtcSyncMs > 1000) {
     S._smtcSyncMs = now;
     syncMediaSessionState();
+    // Bridge: seek position update (same 1s throttle, no extra overhead)
+    window.MacanBridge?.emit('player:seek', {
+      currentTime: cur,
+      duration:    S.duration,
+      percent:     pct,
+    });
   }
 }
 
 // ─── TRACK END ────────────────────────────────────────────────
 function onEnded() {
+  // Bridge: notify plugins track finished naturally
+  window.MacanBridge?.emit('player:end', { track: S.playlist[S.currentIndex] || null });
+
   if (S.repeatMode === 'one') {
     const p = activePlayer(); p.currentTime = 0; doPlay(p); return;
   }
@@ -2833,8 +2892,20 @@ function togglePlayPause() {
   ensureAudioCtx();
 
   const p = activePlayer();
-  if (p.paused) doPlay(p);
-  else p.pause();
+  if (p.paused) {
+    doPlay(p);
+  } else {
+    // Fade out then pause — only for audio tracks, not video
+    if (S.fadeEnabled && S._fadeGain && audioContext && !p.isVideo) {
+      doFadeOut(() => {
+        p.pause();
+        // Reset gain so next doFadeIn starts from silence correctly
+        if (S._fadeGain) S._fadeGain.gain.setValueAtTime(0.0001, audioContext.currentTime);
+      });
+    } else {
+      p.pause();
+    }
+  }
 }
 
 function prevTrack() {
@@ -3005,6 +3076,7 @@ window.onTrackBatchReady = function(tracks, done) {
       updatePlaylistMeta();
       if (S.currentIndex < 0 && S.playlist.length > 0) loadTrack(0);
       setStatus(`LOADED ${S.playlist.length} TRACK(S)`);
+      window.MacanBridge?.emit('queue:add', { tracks: S.playlist });
     }
     return;
   }
@@ -3039,6 +3111,7 @@ window.onTrackBatchReady = function(tracks, done) {
     updatePlaylistMeta();
     if (S.currentIndex < 0 && S.playlist.length > 0) loadTrack(0);
     setStatus(`LOADED ${S.playlist.length} TRACK(S)`);
+    window.MacanBridge?.emit('queue:add', { tracks: S.playlist });
   } else {
     setStatus(`LOADING... ${S.playlist.length} tracks`);
   }
@@ -3078,6 +3151,9 @@ async function clearPlaylist() {
   artPlaceholder.classList.remove('hidden');
   artBlurBg.style.opacity = '0';
   if (window.Settings) Settings.onArtCleared();
+  // Bridge: art and queue cleared
+  window.MacanBridge?.emit('art:clear',   null);
+  window.MacanBridge?.emit('queue:clear', null);
   marqueeText.textContent = marqueeClone.textContent = '— SELECT A TRACK TO BEGIN PLAYBACK —';
   S.lyricsData = null;
   if (S.lyricsOpen) showLyricsIdle();
