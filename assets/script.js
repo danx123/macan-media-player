@@ -814,6 +814,7 @@ playlistManager.onLoad(async (name) => {
 btnEqualizer.addEventListener('click', () => {
   // AudioContext init deferred to actual playback — UI is already available
   equalizerUI.toggle();
+  if (window.AchievementSystem) AchievementSystem.record('eqOpened');
 });
 
 btnPlaylistManager.addEventListener('click', () => {
@@ -1128,6 +1129,7 @@ function toggleLyrics() {
 
 function openLyrics() {
   lyricsOverlay.classList.add('active');
+  if (window.AchievementSystem) AchievementSystem.record('lyricsOpened');
   S.lyricsOpen = true;
   btnLyrics.classList.add('active');
 
@@ -2326,6 +2328,12 @@ async function loadTrack(index, autoplay = true) {
   // Record play count for smart playlist
   if (track.path && window.SmartPlaylist) SmartPlaylist.recordPlay(track.path);
 
+  // Record play for achievements
+  if (window.AchievementSystem) {
+    AchievementSystem.record('totalPlays');
+    if (track.is_video) AchievementSystem.record('videosPlayed');
+  }
+
   // Stop both players first
   audio.pause(); video.pause();
 
@@ -2722,6 +2730,12 @@ function onPlayState(playing) {
 
   // Sync mini player play state
   MiniPlayer.syncMiniPlayState(playing);
+
+  // ── Listen Statistics & Achievements ──────────────────────
+  if (window.ListenStats) {
+    if (playing) ListenStats.startTracking();
+    else         ListenStats.stopTracking();
+  }
 }
 
 // ─── METADATA / TIME ──────────────────────────────────────────
@@ -2965,6 +2979,7 @@ async function openFiles() {
 }
 
 async function openFolder() {
+  if (window.AchievementSystem) AchievementSystem.record('foldersOpened');
   if (!pw()) { setStatus('pywebview required'); return; }
   setStatus('SCANNING FOLDER...');
   try {
