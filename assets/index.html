@@ -251,6 +251,15 @@
           <span class="pl-btn-label">CACHE</span>
         </button>
 
+        <button class="pl-tool-btn" id="btn-plugin-manager" title="Plugin Manager">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/>
+            <line x1="16" y1="8" x2="2" y2="22"/>
+            <line x1="17.5" y1="15" x2="9" y2="15"/>
+          </svg>
+          <span class="pl-btn-label">PLUGINS</span>
+        </button>
+
         <div id="search-wrap">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -774,6 +783,51 @@
         <button class="cm-btn-clearall" id="cm-clear-all">🗑 CLEAR ALL</button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ═══════════ PLUGIN MANAGER OVERLAY ═════════════════════════ -->
+<div id="plugin-manager-overlay" class="plgm-overlay">
+  <div class="plgm-panel">
+
+    <div class="plgm-header">
+      <div class="plgm-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/>
+          <line x1="16" y1="8" x2="2" y2="22"/>
+          <line x1="17.5" y1="15" x2="9" y2="15"/>
+        </svg>
+        <h2>PLUGIN MANAGER</h2>
+      </div>
+      <button class="plgm-close-btn" id="pm-close">&#x2715;</button>
+    </div>
+
+    <div class="plgm-body">
+      <!-- Empty state -->
+      <div id="pm-empty" class="plgm-empty" style="display:none">
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.2">
+          <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/>
+          <line x1="16" y1="8" x2="2" y2="22"/>
+          <line x1="17.5" y1="15" x2="9" y2="15"/>
+        </svg>
+        <p>No plugins installed.</p>
+        <p class="plgm-empty-sub">Click <strong>+ ADD PLUGIN</strong> to install a .js plugin file.</p>
+      </div>
+
+      <!-- Plugin list (populated by JS) -->
+      <div id="pm-list" class="plgm-list"></div>
+    </div>
+
+    <div class="plgm-footer">
+      <span class="plgm-footer-note">Changes take effect after restarting the app.</span>
+      <button class="plgm-add-btn" id="pm-add-btn">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        ADD PLUGIN
+      </button>
+    </div>
+
   </div>
 </div>
 
