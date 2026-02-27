@@ -23,6 +23,7 @@ const Settings = (() => {
       'btn-tv':             true,
       'btn-converter':      true,
       'btn-cache-manager':  true,
+      'btn-plugin-manager': true,
     },
     // Dynamic Aura
     dynamicAura: false,
@@ -37,6 +38,7 @@ const Settings = (() => {
     'btn-tv':              'TV Online',
     'btn-converter':       'Converter',
     'btn-cache-manager':   'Cache Manager',
+    'btn-plugin-manager':  'Plugin Manager',
   };
 
   let isOpen = false;
