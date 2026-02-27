@@ -1093,6 +1093,183 @@ document.getElementById('lyrics-close').addEventListener('click', () => closeLyr
   if (btnClose) btnClose.addEventListener('click', closeCacheManager);
   overlay.addEventListener('click', e => { if (e.target === overlay) closeCacheManager(); });
 })();
+// ── Plugin Manager ───────────────────────────────────────────────────────────
+(function _initPluginManager() {
+  const overlay  = document.getElementById('plugin-manager-overlay');
+  const btnOpen  = document.getElementById('btn-plugin-manager');
+  const btnClose = document.getElementById('pm-close');
+  const btnAdd   = document.getElementById('pm-add-btn');
+  const listEl   = document.getElementById('pm-list');
+  const emptyEl  = document.getElementById('pm-empty');
+  if (!overlay || !btnOpen) return;
+
+  let _plugins = [];   // last fetched list
+
+  // ── Render ──────────────────────────────────────────────────────────────
+  function render(plugins) {
+    _plugins = plugins;
+    listEl.innerHTML = '';
+
+    if (!plugins.length) {
+      emptyEl.style.display = 'flex';
+      listEl.style.display  = 'none';
+      return;
+    }
+
+    emptyEl.style.display = 'none';
+    listEl.style.display  = '';
+
+    plugins.forEach(p => {
+      const row = document.createElement('div');
+      row.className = 'plgm-row' + (p.enabled ? '' : ' plgm-row-disabled');
+      row.dataset.filename = p.filename;
+
+      // Icon
+      const iconWrap = document.createElement('div');
+      iconWrap.className = 'plgm-row-icon';
+      iconWrap.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/><line x1="16" y1="8" x2="2" y2="22"/><line x1="17.5" y1="15" x2="9" y2="15"/></svg>';
+
+      const info = document.createElement('div');
+      info.className = 'plgm-row-info';
+
+      const nameSpan = document.createElement('div');
+      nameSpan.className   = 'plgm-row-name';
+      nameSpan.textContent = p.filename.replace(/\.js$/, '');
+
+      const metaSpan = document.createElement('div');
+      metaSpan.className   = 'plgm-row-meta';
+      metaSpan.textContent = p.size_str;
+
+      info.appendChild(nameSpan);
+      info.appendChild(metaSpan);
+
+      const badge = document.createElement('span');
+      badge.className   = 'plgm-badge ' + (p.enabled ? 'plgm-badge-on' : 'plgm-badge-off');
+      badge.textContent = p.enabled ? 'ENABLED' : 'DISABLED';
+
+      const actions = document.createElement('div');
+      actions.className = 'plgm-row-actions';
+
+      const toggleBtn = document.createElement('button');
+      toggleBtn.className   = 'plgm-btn plgm-btn-toggle';
+      toggleBtn.textContent = p.enabled ? 'DISABLE' : 'ENABLE';
+      toggleBtn.addEventListener('click', () => togglePlugin(p.filename, !p.enabled, toggleBtn));
+
+      const removeBtn = document.createElement('button');
+      removeBtn.className   = 'plgm-btn plgm-btn-remove';
+      removeBtn.textContent = 'REMOVE';
+      removeBtn.addEventListener('click', () => removePlugin(p.filename, removeBtn));
+
+      actions.appendChild(toggleBtn);
+      actions.appendChild(removeBtn);
+
+      row.appendChild(iconWrap);
+      row.appendChild(info);
+      row.appendChild(badge);
+      row.appendChild(actions);
+      listEl.appendChild(row);
+    });
+  }
+
+  // ── Load plugins from Python ─────────────────────────────────────────────
+  async function loadPlugins() {
+    if (!pw()) { render([]); return; }
+    try {
+      const list = await pywebview.api.pm_list_plugins();
+      render(list);
+    } catch (e) {
+      console.warn('[PluginManager] pm_list_plugins error:', e);
+      render([]);
+    }
+  }
+
+  // ── Toggle enable/disable ────────────────────────────────────────────────
+  async function togglePlugin(filename, enable, btn) {
+    if (!pw()) return;
+    const orig = btn.textContent;
+    btn.disabled    = true;
+    btn.textContent = '…';
+    try {
+      const r = await pywebview.api.pm_set_enabled(filename, enable);
+      if (r.ok) {
+        await loadPlugins();
+      } else {
+        console.warn('[PluginManager] pm_set_enabled error:', r.error);
+        btn.textContent = 'ERROR';
+        setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+        return;
+      }
+    } catch (e) {
+      console.warn('[PluginManager] toggle error:', e);
+      btn.textContent = 'ERROR';
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+    }
+  }
+
+  // ── Remove plugin ────────────────────────────────────────────────────────
+  async function removePlugin(filename, btn) {
+    if (!pw()) return;
+    if (!confirm(`Remove plugin "${filename.replace(/\.js$/, '')}"?
+This cannot be undone.`)) return;
+    const orig = btn.textContent;
+    btn.disabled    = true;
+    btn.textContent = '…';
+    try {
+      const r = await pywebview.api.pm_remove_plugin(filename);
+      if (r.ok) {
+        await loadPlugins();
+      } else {
+        console.warn('[PluginManager] pm_remove_plugin error:', r.error);
+        btn.textContent = 'ERROR';
+        setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+      }
+    } catch (e) {
+      console.warn('[PluginManager] remove error:', e);
+      btn.textContent = 'ERROR';
+      setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+    }
+  }
+
+  // ── Add plugin ───────────────────────────────────────────────────────────
+  btnAdd.addEventListener('click', async () => {
+    if (!pw()) return;
+    btnAdd.disabled    = true;
+    btnAdd.textContent = '…';
+    try {
+      const r = await pywebview.api.pm_add_plugin();
+      if (r.ok) {
+        await loadPlugins();
+        setStatus('PLUGIN ADDED: ' + r.filename);
+      } else if (r.error !== 'cancelled') {
+        console.warn('[PluginManager] pm_add_plugin error:', r.error);
+      }
+    } catch (e) {
+      console.warn('[PluginManager] add error:', e);
+    } finally {
+      btnAdd.disabled    = false;
+      btnAdd.textContent = '+ ADD PLUGIN';
+    }
+  });
+
+  // ── Open / Close ─────────────────────────────────────────────────────────
+  function openPluginManager() {
+    overlay.classList.add('active');
+    loadPlugins();
+  }
+  function closePluginManager() {
+    overlay.classList.remove('active');
+  }
+
+  btnOpen.addEventListener('click', openPluginManager);
+  if (btnClose) btnClose.addEventListener('click', closePluginManager);
+  overlay.addEventListener('click', e => {
+    if (e.target === overlay) closePluginManager();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && overlay.classList.contains('active')) closePluginManager();
+  });
+})();
+
 let _lyricsFullscreen = false;
 let _lyricsEscHintTimer = null;
 
