@@ -6,7 +6,7 @@
 <title>MACAN // MEDIA PLAYER</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Bebas+Neue&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=51b2968b7c19">
+<link rel="stylesheet" href="style.css?v=72854ebd75c5">
 </head>
 <body>
 
@@ -75,7 +75,7 @@
       <div id="art-ring-outer"></div>
       <div id="art-ring-inner"></div>
       <div id="album-art-wrapper">
-        <img id="album-art" src="?v=51b2968b7c19" alt="Cover Art"/>
+        <img id="album-art" src="?v=72854ebd75c5" alt="Cover Art"/>
         <div id="album-art-placeholder">
           <svg width="72" height="72" viewBox="0 0 80 80" fill="none">
             <circle cx="40" cy="40" r="38" stroke="#E8FF00" stroke-width="1" stroke-dasharray="4 4"/>
@@ -251,6 +251,15 @@
           <span class="pl-btn-label">CACHE</span>
         </button>
 
+        <button class="pl-tool-btn" id="btn-plugin-manager" title="Plugin Manager">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/>
+            <line x1="16" y1="8" x2="2" y2="22"/>
+            <line x1="17.5" y1="15" x2="9" y2="15"/>
+          </svg>
+          <span class="pl-btn-label">PLUGINS</span>
+        </button>
+
         <div id="search-wrap">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -312,7 +321,7 @@
         
         <div class="vc-seekbar" id="vc-seekbar">
           <div id="vc-preview-tooltip">
-            <img id="vc-preview-img" src="?v=51b2968b7c19" alt="">
+            <img id="vc-preview-img" src="?v=72854ebd75c5" alt="">
             <span id="vc-preview-time">00:00</span>
           </div>
           <div class="vc-seek-track">
@@ -777,6 +786,51 @@
   </div>
 </div>
 
+<!-- ═══════════ PLUGIN MANAGER OVERLAY ═════════════════════════ -->
+<div id="plugin-manager-overlay" class="plgm-overlay">
+  <div class="plgm-panel">
+
+    <div class="plgm-header">
+      <div class="plgm-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/>
+          <line x1="16" y1="8" x2="2" y2="22"/>
+          <line x1="17.5" y1="15" x2="9" y2="15"/>
+        </svg>
+        <h2>PLUGIN MANAGER</h2>
+      </div>
+      <button class="plgm-close-btn" id="pm-close">&#x2715;</button>
+    </div>
+
+    <div class="plgm-body">
+      <!-- Empty state -->
+      <div id="pm-empty" class="plgm-empty" style="display:none">
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" opacity="0.2">
+          <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z"/>
+          <line x1="16" y1="8" x2="2" y2="22"/>
+          <line x1="17.5" y1="15" x2="9" y2="15"/>
+        </svg>
+        <p>No plugins installed.</p>
+        <p class="plgm-empty-sub">Click <strong>+ ADD PLUGIN</strong> to install a .js plugin file.</p>
+      </div>
+
+      <!-- Plugin list (populated by JS) -->
+      <div id="pm-list" class="plgm-list"></div>
+    </div>
+
+    <div class="plgm-footer">
+      <span class="plgm-footer-note">Changes take effect after restarting the app.</span>
+      <button class="plgm-add-btn" id="pm-add-btn">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        ADD PLUGIN
+      </button>
+    </div>
+
+  </div>
+</div>
+
 <!-- ═══════════ ABOUT OVERLAY ══════════════════════════════════ -->
 <div id="about-overlay" class="about-overlay">
   <div class="about-panel">
@@ -1086,19 +1140,19 @@
 <!-- ─── Plugin Bridge Adapter ───────────────────────────
      Loads FIRST so MacanBridge is available to all modules.
      plugins.config.js loads AFTER script.js (last). -->
-<script src="plugin-bridge.js?v=51b2968b7c19"></script>
-<script src="equalizer.js?v=51b2968b7c19"></script>
-<script src="playlist-manager.js?v=51b2968b7c19"></script>
-<script src="radio-tv.js?v=51b2968b7c19"></script>
-<script src="converter.js?v=51b2968b7c19"></script>
-<script src="about.js?v=51b2968b7c19"></script>
-<script src="smart-playlist.js?v=51b2968b7c19"></script>
-<script src="settings.js?v=51b2968b7c19"></script>
-<script src="listen-stats.js?v=51b2968b7c19"></script>
-<script src="achievements.js?v=51b2968b7c19"></script>
-<script src="user-profile.js?v=51b2968b7c19"></script>
-<script src="nav-menu.js?v=51b2968b7c19"></script>
-<script src="script.js?v=51b2968b7c19"></script>
-<script src="plugins.config.js?v=51b2968b7c19"></script>
+<script src="plugin-bridge.js?v=72854ebd75c5"></script>
+<script src="equalizer.js?v=72854ebd75c5"></script>
+<script src="playlist-manager.js?v=72854ebd75c5"></script>
+<script src="radio-tv.js?v=72854ebd75c5"></script>
+<script src="converter.js?v=72854ebd75c5"></script>
+<script src="about.js?v=72854ebd75c5"></script>
+<script src="smart-playlist.js?v=72854ebd75c5"></script>
+<script src="settings.js?v=72854ebd75c5"></script>
+<script src="listen-stats.js?v=72854ebd75c5"></script>
+<script src="achievements.js?v=72854ebd75c5"></script>
+<script src="user-profile.js?v=72854ebd75c5"></script>
+<script src="nav-menu.js?v=72854ebd75c5"></script>
+<script src="script.js?v=72854ebd75c5"></script>
+<script src="plugins.config.js?v=72854ebd75c5"></script>
 </body>
 </html>
