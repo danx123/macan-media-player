@@ -293,8 +293,96 @@ class LyricCache:
         except Exception as e:
             print(f"[LyricDB] Error: {e}")
 
+    def read_embedded(self, path: str) -> dict | None:
+        """
+        Read lyrics embedded in the audio file's metadata tags.
+        Supports: MP3 (USLT/SYLT ID3), FLAC (LYRICS/UNSYNCEDLYRICS vorbis),
+                  M4A/MP4 (©lyr), OGG/Opus (LYRICS vorbis comment).
+        Returns {content, is_synced} or None.
+        """
+        import re as _re
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            # ── MP3 / ID3 ──────────────────────────────────────────────────
+            if ext in ('.mp3', '.aiff', '.aif'):
+                from mutagen.id3 import ID3, USLT, SYLT
+                try:
+                    tags = ID3(path)
+                except Exception:
+                    return None
+
+                # SYLT — synchronised lyrics (timestamp per syllable/line)
+                sylt_keys = [k for k in tags.keys() if k.startswith('SYLT')]
+                if sylt_keys:
+                    sylt = tags[sylt_keys[0]]
+                    lines = []
+                    for text, ts in sylt.text:
+                        mm = ts // 60000
+                        ss = (ts % 60000) / 1000
+                        lines.append(f'[{mm:02d}:{ss:05.2f}]{text}')
+                    content = '\n'.join(lines)
+                    if content.strip():
+                        return {'content': content, 'is_synced': True}
+
+                # USLT — unsynchronised lyrics (plain text block)
+                uslt_keys = [k for k in tags.keys() if k.startswith('USLT')]
+                if uslt_keys:
+                    content = str(tags[uslt_keys[0]])
+                    if content.strip():
+                        # Check if user embedded LRC timestamps in USLT
+                        is_synced = bool(_re.search(r'\[\d+:\d+', content))
+                        return {'content': content, 'is_synced': is_synced}
+
+            # ── FLAC ───────────────────────────────────────────────────────
+            elif ext == '.flac':
+                from mutagen.flac import FLAC
+                try:
+                    tags = FLAC(path)
+                except Exception:
+                    return None
+                # Try LYRICS first (LRC-format common in FLAC), then UNSYNCEDLYRICS
+                for key in ('LYRICS', 'UNSYNCEDLYRICS', 'lyrics', 'unsyncedlyrics'):
+                    val = tags.get(key)
+                    if val and val[0].strip():
+                        content   = val[0]
+                        is_synced = bool(_re.search(r'\[\d+:\d+', content))
+                        return {'content': content, 'is_synced': is_synced}
+
+            # ── M4A / MP4 (iTunes/AAC) ─────────────────────────────────────
+            elif ext in ('.m4a', '.mp4', '.aac', '.m4b', '.m4p'):
+                from mutagen.mp4 import MP4
+                try:
+                    tags = MP4(path)
+                except Exception:
+                    return None
+                val = tags.get('\xa9lyr')   # ©lyr tag
+                if val and val[0].strip():
+                    content   = val[0]
+                    is_synced = bool(_re.search(r'\[\d+:\d+', content))
+                    return {'content': content, 'is_synced': is_synced}
+
+            # ── OGG / Opus / Vorbis ────────────────────────────────────────
+            elif ext in ('.ogg', '.opus', '.oga'):
+                import mutagen
+                try:
+                    tags = mutagen.File(path)
+                except Exception:
+                    return None
+                if tags is None:
+                    return None
+                for key in ('LYRICS', 'lyrics', 'UNSYNCEDLYRICS', 'unsyncedlyrics'):
+                    val = tags.get(key)
+                    if val and str(val[0]).strip():
+                        content   = str(val[0])
+                        is_synced = bool(_re.search(r'\[\d+:\d+', content))
+                        return {'content': content, 'is_synced': is_synced}
+
+        except Exception as e:
+            print(f'[Lyrics] Embedded read error ({ext}): {e}')
+        return None
+
     def fetch_online(self, artist, title, duration=None):
-        """Fetch from LRCLIB, save to DB, return dict or None."""
+        """Fetch from LRCLIB with Musixmatch fallback, save to DB, return dict or None."""
         try:
             clean_artist = artist.split("feat")[0].split("(")[0].strip()
             clean_title  = title.split("(")[0].strip()
@@ -313,8 +401,84 @@ class LyricCache:
                     if results and isinstance(results, list):
                         return self._process(artist, title, results[0])
         except Exception as e:
-            print(f"[LyricDB] Fetch error: {e}")
+            print(f"[LyricDB] LRCLIB fetch error: {e}")
+
+        # ── Musixmatch fallback ───────────────────────────────────────────
+        try:
+            result = self._fetch_musixmatch(artist, title)
+            if result:
+                return result
+        except Exception as e:
+            print(f"[LyricDB] Musixmatch fetch error: {e}")
+
         return None
+
+    def _fetch_musixmatch(self, artist: str, title: str) -> dict | None:
+        """
+        Scrape lyrics from Musixmatch public embed endpoint.
+        No API key required — uses the public lyrics.musixmatch.com embed page.
+        Falls back gracefully if blocked or rate-limited.
+        """
+        import re as _re
+        clean_artist = artist.split("feat")[0].split("(")[0].strip()
+        clean_title  = title.split("(")[0].strip()
+
+        # Slug: lowercase, replace spaces/specials with hyphens
+        def _slug(s):
+            s = s.lower().strip()
+            s = _re.sub(r"[^a-z0-9\s-]", "", s)
+            s = _re.sub(r"[\s-]+", "-", s).strip("-")
+            return s
+
+        artist_slug = _slug(clean_artist)
+        title_slug  = _slug(clean_title)
+        url = f"https://www.musixmatch.com/lyrics/{artist_slug}/{title_slug}"
+
+        try:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+            resp = requests.get(url, headers=headers, timeout=12)
+            if resp.status_code != 200:
+                return None
+
+            html = resp.text
+            # Extract lyrics from span.lyrics__content__ok or data-lyrics-type spans
+            spans = _re.findall(
+                r'<span[^>]*class="[^"]*lyrics__content[^"]*"[^>]*>(.*?)</span>',
+                html, _re.DOTALL
+            )
+            if not spans:
+                # Newer Musixmatch markup
+                spans = _re.findall(
+                    r'<p[^>]*data-testid="lyrics-line"[^>]*>(.*?)</p>',
+                    html, _re.DOTALL
+                )
+            if not spans:
+                return None
+
+            # Strip HTML tags from each span, join with newlines
+            def _strip(s):
+                return _re.sub(r'<[^>]+>', '', s).strip()
+
+            lines = [_strip(s) for s in spans if _strip(s)]
+            if not lines:
+                return None
+
+            content = "\n".join(lines)
+            # Musixmatch always returns plain (unsynced) lyrics
+            self.save(artist, title, content, False)
+            print(f"[LyricDB] Musixmatch: found lyrics for '{clean_artist} - {clean_title}'")
+            return {"content": content, "is_synced": False}
+
+        except Exception as e:
+            print(f"[LyricDB] Musixmatch scrape error: {e}")
+            return None
 
     def _process(self, artist, title, data):
         content = None
@@ -404,185 +568,6 @@ class MacanMediaAPI:
 
     def toggle_fullscreen(self):
         self._window.toggle_fullscreen()
-
-    # ─── PLUGIN MANAGER ──────────────────────────────────────────────────────
-    # Plugins live in  assets/plugins/  as single .js files.
-    # State (enabled/disabled) is persisted in settings under 'plugin_states'.
-    # A plugin is "installed" if its .js file exists in the plugins folder.
-    # A plugin is "enabled"   if it is listed in plugins.config.js AND not
-    #   explicitly disabled in plugin_states.
-    # The manager rewrites plugins.config.js on every enable/disable/remove.
-
-    def _plugins_dir(self) -> str:
-        """Return absolute path to assets/plugins/ directory."""
-        base = os.path.dirname(os.path.abspath(__file__))
-        d    = os.path.join(base, 'assets', 'plugins')
-        os.makedirs(d, exist_ok=True)
-        return d
-
-    def _plugins_config_path(self) -> str:
-        base = os.path.dirname(os.path.abspath(__file__))
-        return os.path.join(base, 'assets', 'plugins.config.js')
-
-    def _read_plugin_states(self) -> dict:
-        """Return { filename: bool(enabled) } from settings."""
-        with self._settings_lock:
-            return dict(self.settings.get('plugin_states', {}))
-
-    def _write_plugin_states(self, states: dict):
-        """Persist plugin states to settings."""
-        with self._settings_lock:
-            self.settings['plugin_states'] = states
-            self._save_settings_locked()
-
-    def _rewrite_config(self, states: dict):
-        """
-        Rewrite assets/plugins.config.js so only enabled plugins are loaded.
-        The file is a simple script that loads each plugin synchronously.
-        """
-        plugins_dir    = self._plugins_dir()
-        config_path    = self._plugins_config_path()
-        enabled_files  = []
-
-        for fname in sorted(os.listdir(plugins_dir)):
-            if not fname.endswith('.js'):
-                continue
-            if states.get(fname, True):   # default: enabled
-                enabled_files.append(fname)
-
-        lines = [
-            '// AUTO-GENERATED by Plugin Manager - do not edit by hand.\n',
-            '// To manage plugins, use the Plugin Manager panel in the app.\n',
-            '(function _loadPlugins() {\n',
-        ]
-        for fname in enabled_files:
-            lines.append(
-                f"  var s=document.createElement('script');"
-                f"s.src='plugins/{fname}';s.async=false;"
-                f"document.head.appendChild(s);\n"
-            )
-        lines.append('})();\n')
-
-        try:
-            with open(config_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-        except Exception as e:
-            print(f'[PluginManager] Failed to write config: {e}')
-
-    def pm_list_plugins(self) -> list:
-        """
-        Return a list of plugin descriptors for every .js file in assets/plugins/.
-
-        Each descriptor:
-          { 'filename': str, 'enabled': bool, 'size_str': str }
-        """
-        plugins_dir = self._plugins_dir()
-        states      = self._read_plugin_states()
-        result      = []
-
-        for fname in sorted(os.listdir(plugins_dir)):
-            if not fname.endswith('.js'):
-                continue
-            fpath   = os.path.join(plugins_dir, fname)
-            size_b  = os.path.getsize(fpath)
-            if size_b >= 1048576:
-                size_str = f'{size_b/1048576:.1f} MB'
-            elif size_b >= 1024:
-                size_str = f'{size_b/1024:.1f} KB'
-            else:
-                size_str = f'{size_b} B'
-
-            result.append({
-                'filename': fname,
-                'enabled':  states.get(fname, True),
-                'size_str': size_str,
-            })
-
-        return result
-
-    def pm_set_enabled(self, filename: str, enabled: bool) -> dict:
-        """
-        Enable or disable a plugin by filename.
-        Rewrites plugins.config.js immediately.
-        Returns { 'ok': True } or { 'ok': False, 'error': str }.
-        """
-        plugins_dir = self._plugins_dir()
-        fpath       = os.path.join(plugins_dir, filename)
-        if not os.path.isfile(fpath):
-            return {'ok': False, 'error': f'Plugin not found: {filename}'}
-        if not filename.endswith('.js') or '/' in filename or '\\' in filename:
-            return {'ok': False, 'error': 'Invalid filename'}
-
-        states          = self._read_plugin_states()
-        states[filename] = bool(enabled)
-        self._write_plugin_states(states)
-        self._rewrite_config(states)
-        print(f'[PluginManager] {filename} → {"enabled" if enabled else "disabled"}')
-        return {'ok': True}
-
-    def pm_remove_plugin(self, filename: str) -> dict:
-        """
-        Permanently delete a plugin file from assets/plugins/.
-        Returns { 'ok': True } or { 'ok': False, 'error': str }.
-        """
-        if not filename.endswith('.js') or '/' in filename or '\\' in filename:
-            return {'ok': False, 'error': 'Invalid filename'}
-
-        plugins_dir = self._plugins_dir()
-        fpath       = os.path.join(plugins_dir, filename)
-        if not os.path.isfile(fpath):
-            return {'ok': False, 'error': f'Plugin not found: {filename}'}
-
-        try:
-            os.remove(fpath)
-            # Clean up state entry
-            states = self._read_plugin_states()
-            states.pop(filename, None)
-            self._write_plugin_states(states)
-            self._rewrite_config(states)
-            print(f'[PluginManager] Removed: {filename}')
-            return {'ok': True}
-        except Exception as e:
-            return {'ok': False, 'error': str(e)}
-
-    def pm_add_plugin(self) -> dict:
-        """
-        Open a file picker so the user can select a .js plugin file.
-        Copies the selected file into assets/plugins/.
-        Returns { 'ok': True, 'filename': str } or { 'ok': False, 'error': str }.
-        """
-        try:
-            paths = self._window.create_file_dialog(
-                dialog_type=webview.OPEN_DIALOG,
-                file_types=('JavaScript Plugin (*.js)',),
-                allow_multiple=False,
-            )
-        except Exception as e:
-            return {'ok': False, 'error': str(e)}
-
-        if not paths:
-            return {'ok': False, 'error': 'cancelled'}
-
-        src_path  = paths[0]
-        filename  = os.path.basename(src_path)
-        if not filename.endswith('.js'):
-            return {'ok': False, 'error': 'Only .js files are supported'}
-
-        dest_dir  = self._plugins_dir()
-        dest_path = os.path.join(dest_dir, filename)
-
-        try:
-            import shutil
-            shutil.copy2(src_path, dest_path)
-            # New plugins are enabled by default
-            states           = self._read_plugin_states()
-            states[filename] = True
-            self._write_plugin_states(states)
-            self._rewrite_config(states)
-            print(f'[PluginManager] Added: {filename}')
-            return {'ok': True, 'filename': filename}
-        except Exception as e:
-            return {'ok': False, 'error': str(e)}
 
     # ─── DIALOG & FILE BROWSING ───────────────────────────────────────────────
 
@@ -2226,8 +2211,16 @@ class MacanMediaAPI:
 
     def get_lyrics(self, path, artist, title, duration=None):
         """Get lyrics for a track.
-        Priority: 1) Local .lrc file → 2) Local DB → 3) Online fetch
-        Returns {content, is_synced} or None."""
+        Priority:
+          1) Embedded metadata (USLT/SYLT/©lyr/vorbis LYRICS)
+          2) Local .lrc sidecar file
+          3) Local SQLite DB (previously fetched)
+          4) LRCLIB online (synced preferred)
+          5) Musixmatch online fallback (plain lyrics)
+        Returns {content, is_synced} or None.
+        """
+        import re as _re
+
         # Normalise inputs — use tag data as fallback
         if not artist or not title:
             p = Path(path)
@@ -2235,33 +2228,44 @@ class MacanMediaAPI:
             artist = artist or meta.get('artist') or ''
             title  = title  or meta.get('title')  or p.stem
 
-        # 1. Local .lrc file — same folder, same stem as the audio file
-        #    e.g. /music/song.mp3 → /music/song.lrc
+        # 1. Embedded metadata lyrics (highest priority — offline, zero latency)
+        try:
+            embedded = self._lyric_cache.read_embedded(path)
+            if embedded:
+                print(f"[Lyrics] Found embedded lyrics in: {Path(path).name}")
+                # Cache to DB so future loads skip the file read
+                if artist and title:
+                    self._lyric_cache.save(
+                        artist, title,
+                        embedded['content'], embedded['is_synced']
+                    )
+                return embedded
+        except Exception as e:
+            print(f"[Lyrics] Embedded read error: {e}")
+
+        # 2. Local .lrc sidecar — same folder, same stem as the audio file
         try:
             lrc_path = Path(path).with_suffix('.lrc')
             if lrc_path.exists():
                 lrc_text = lrc_path.read_text(encoding='utf-8', errors='replace').strip()
                 if lrc_text:
                     print(f"[Lyrics] Found local .lrc: {lrc_path.name}")
-                    # Detect if it has timestamp tags → synced
-                    import re as _re
                     is_synced = bool(_re.search(r'\[\d+:\d+', lrc_text))
-                    # Save to DB so future lookups skip disk read
                     if artist and title:
                         self._lyric_cache.save(artist, title, lrc_text, is_synced)
-                    return {"content": lrc_text, "is_synced": is_synced}
+                    return {'content': lrc_text, 'is_synced': is_synced}
         except Exception as e:
             print(f"[Lyrics] .lrc read error: {e}")
 
         if not artist or not title:
             return None
 
-        # 2. Local DB
+        # 3. Local SQLite DB (previously fetched online result)
         cached = self._lyric_cache.get(artist, title)
         if cached:
             return cached
 
-        # 3. Online fetch (synchronous — called from JS, runs in thread)
+        # 4 + 5. Online fetch — LRCLIB first, Musixmatch fallback (inside fetch_online)
         result = self._lyric_cache.fetch_online(artist, title, duration)
         return result
 
