@@ -9,9 +9,9 @@
 const MacanWrapped = (() => {
 
   // ── Storage key — must match listen-stats.js ────────────────
-  // listen-stats.js stores: { daily: { 'YYYY-MM-DD': seconds }, tracks: { 'artist - title': { plays, art } } }
-  const LS_KEY    = 'macan_listen_data';
-  const TRACK_KEY = 'macan_track_plays';   // { 'artist|||title': { plays, art, artist, title } }
+  // listen-stats.js stores daily data under 'macan_listen_daily'
+  const LS_DAILY_KEY = 'macan_listen_daily';  // { 'YYYY-MM-DD': seconds }
+  const TRACK_KEY    = 'macan_track_plays';   // { 'artist|||title': { plays, art, artist, title } }
 
   // ── Period definitions ──────────────────────────────────────
   const PERIODS = [
@@ -25,9 +25,9 @@ const MacanWrapped = (() => {
   let _canvasEl     = null;
 
   // ── Read listen-stats localStorage data ────────────────────
-  function _getListenData() {
+  function _getDailyData() {
     try {
-      return JSON.parse(localStorage.getItem(LS_KEY) || '{}');
+      return JSON.parse(localStorage.getItem(LS_DAILY_KEY) || '{}');
     } catch { return {}; }
   }
 
@@ -37,10 +37,35 @@ const MacanWrapped = (() => {
     } catch { return {}; }
   }
 
+  // ── Record a track play (called externally from script.js) ──
+  function recordTrackPlay(track) {
+    if (!track || !track.name) return;
+    const key  = `${track.artist || ''}|||${track.name}`;
+    const data = _getTrackData();
+    const existing = data[key] || { plays: 0, artist: track.artist || '', title: track.name, art: null };
+    existing.plays = (existing.plays || 0) + 1;
+    // Store cover art if available in track object
+    if (track.cover_art && !existing.art) {
+      existing.art = track.cover_art;
+    }
+    data[key] = existing;
+    try { localStorage.setItem(TRACK_KEY, JSON.stringify(data)); } catch {}
+  }
+
+  // ── Update art for a track (called when art is loaded) ──────
+  function updateTrackArt(track, artSrc) {
+    if (!track || !track.name || !artSrc) return;
+    const key  = `${track.artist || ''}|||${track.name}`;
+    const data = _getTrackData();
+    if (data[key]) {
+      data[key].art = artSrc;
+      try { localStorage.setItem(TRACK_KEY, JSON.stringify(data)); } catch {}
+    }
+  }
+
   // ── Compute stats for a given period (last N days) ──────────
   function _computeStats(days) {
-    const data     = _getListenData();
-    const daily    = data.daily || {};
+    const daily    = _getDailyData();   // { 'YYYY-MM-DD': seconds }
     const now      = new Date();
     const cutoff   = new Date(now - days * 86400000);
 
@@ -79,6 +104,55 @@ const MacanWrapped = (() => {
     return m > 0 ? `${h}h ${m}m` : `${h}h`;
   }
 
+  // ── Fetch cover art from iTunes Search API ──────────────────
+  async function _fetchItunesArt(artist, title) {
+    if (!artist && !title) return null;
+    const q = encodeURIComponent(`${artist} ${title}`.trim());
+    try {
+      const res = await fetch(`https://itunes.apple.com/search?term=${q}&media=music&limit=1&entity=song`);
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data.results && data.results[0] && data.results[0].artworkUrl100) {
+        // Use larger art (600px)
+        return data.results[0].artworkUrl100.replace('100x100bb', '300x300bb');
+      }
+    } catch {}
+    return null;
+  }
+
+  // ── Load image (with optional iTunes fallback) ───────────────
+  async function _loadTrackArt(track) {
+    // First try existing art from metadata
+    if (track.art) {
+      return new Promise(resolve => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload  = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = track.art;
+      });
+    }
+    // Fallback: fetch from iTunes
+    const artUrl = await _fetchItunesArt(track.artist, track.title);
+    if (artUrl) {
+      // Cache art back to localStorage
+      const key  = `${track.artist || ''}|||${track.title || ''}`;
+      const data = _getTrackData();
+      if (data[key]) {
+        data[key].art = artUrl;
+        try { localStorage.setItem(TRACK_KEY, JSON.stringify(data)); } catch {}
+      }
+      return new Promise(resolve => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload  = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = artUrl;
+      });
+    }
+    return null;
+  }
+
   // ── Build the wrapped canvas ────────────────────────────────
   async function _drawCanvas(period, stats) {
     const W = 540, H = 760;
@@ -100,48 +174,36 @@ const MacanWrapped = (() => {
 
     // ── Cover art collage (top 6, mosaic grid) ──────────────
     const COLLAGE_H = 280;
-    const arts = stats.topTracks.filter(t => t.art).slice(0, 6);
+    const arts = stats.topTracks.slice(0, 6);
 
-    if (arts.length >= 3) {
+    // Load images (with iTunes fallback for missing art)
+    const loadedImgs = await Promise.all(arts.map(t => _loadTrackArt(t)));
+    const validImgs = loadedImgs.filter(Boolean);
+
+    if (validImgs.length >= 3) {
       // 3 columns × 2 rows
       const cw = W / 3, ch = COLLAGE_H / 2;
-      await Promise.all(arts.map((t, i) => {
-        return new Promise(resolve => {
-          const img = new Image();
-          img.onload = () => {
-            const col = i % 3, row = Math.floor(i / 3);
-            ctx.save();
-            ctx.globalAlpha = 0.85;
-            // Cover-fit
-            const scale = Math.max(cw / img.width, ch / img.height);
-            const sw = img.width * scale, sh = img.height * scale;
-            const sx = col * cw + (cw - sw) / 2;
-            const sy = row * ch + (ch - sh) / 2;
-            ctx.drawImage(img, sx, sy, sw, sh);
-            ctx.restore();
-            resolve();
-          };
-          img.onerror = resolve;
-          img.src = t.art;
-        });
-      }));
-    } else if (arts.length === 1) {
-      // Single art, full width blurred bg
-      await new Promise(resolve => {
-        const img = new Image();
-        img.onload = () => {
-          ctx.save();
-          ctx.filter = 'blur(12px)';
-          ctx.globalAlpha = 0.5;
-          ctx.drawImage(img, -20, -20, W + 40, COLLAGE_H + 40);
-          ctx.filter = 'none';
-          ctx.globalAlpha = 1;
-          ctx.restore();
-          resolve();
-        };
-        img.onerror = resolve;
-        img.src = arts[0].art;
+      validImgs.slice(0, 6).forEach((img, i) => {
+        const col = i % 3, row = Math.floor(i / 3);
+        ctx.save();
+        ctx.globalAlpha = 0.85;
+        const scale = Math.max(cw / img.width, ch / img.height);
+        const sw = img.width * scale, sh = img.height * scale;
+        const sx = col * cw + (cw - sw) / 2;
+        const sy = row * ch + (ch - sh) / 2;
+        ctx.drawImage(img, sx, sy, sw, sh);
+        ctx.restore();
       });
+    } else if (validImgs.length === 1) {
+      // Single art, full width blurred bg
+      const img = validImgs[0];
+      ctx.save();
+      ctx.filter = 'blur(12px)';
+      ctx.globalAlpha = 0.5;
+      ctx.drawImage(img, -20, -20, W + 40, COLLAGE_H + 40);
+      ctx.filter = 'none';
+      ctx.globalAlpha = 1;
+      ctx.restore();
     } else {
       // No art — gradient placeholder
       const grd = ctx.createLinearGradient(0, 0, W, COLLAGE_H);
@@ -475,7 +537,7 @@ const MacanWrapped = (() => {
     _lsObserver.observe(_lsOverlay, { attributes: true, attributeFilter: ['class'] });
   }
 
-  return { open, close };
+  return { open, close, recordTrackPlay, updateTrackArt };
 })();
 
 window.MacanWrapped = MacanWrapped;
