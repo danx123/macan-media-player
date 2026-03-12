@@ -7,21 +7,28 @@ const RTV = (() => {
   // ─── Storage Keys ──────────────────────────────────────────────
   const STORAGE_RADIO_CACHE   = 'macan_radio_cache';
   const STORAGE_RADIO_CUSTOM  = 'macan_radio_custom';
+  const STORAGE_RADIO_FAVS    = 'macan_radio_favs';
+  const STORAGE_RADIO_VOL     = 'macan_radio_vol';
   const STORAGE_TV_CHANNELS   = 'macan_tv_channels';
   const STORAGE_TV_CUSTOM     = 'macan_tv_custom';
+  const STORAGE_TV_FAVS       = 'macan_tv_favs';
   const STORAGE_TV_LAST_SRC   = 'macan_tv_last_source';
 
   // ─── State ─────────────────────────────────────────────────────
   let radioStations   = [];   // all stations (cached + custom)
   let radioCustom     = [];   // user-added custom stations
+  let radioFavs       = [];   // favorited station URLs
   let radioFiltered   = [];   // after search filter
   let radioActive     = null; // { name, url, city }
   let radioAudio      = null; // HTMLAudioElement for streaming
+  let radioShowFavs   = false; // filter: show only favorites
 
   let tvChannels      = [];
   let tvCustom        = [];
+  let tvFavs          = [];   // favorited channel URLs
   let tvFiltered      = [];
   let tvActive        = null;
+  let tvShowFavs      = false; // filter: show only favorites
   let tvAudio         = null; // audio element for TV audio-only streams
   let tvVideoEl       = null; // video element for TV (reuse existing #video-player)
 
@@ -80,6 +87,34 @@ const RTV = (() => {
 
   function saveJSON(key, data) {
     try { localStorage.setItem(key, JSON.stringify(data)); } catch {}
+  }
+
+  // ─── Favorites helpers ─────────────────────────────────────────
+  function loadRadioFavs()  { radioFavs = loadJSON(STORAGE_RADIO_FAVS, []); }
+  function saveRadioFavs()  { saveJSON(STORAGE_RADIO_FAVS, radioFavs); }
+  function isRadioFav(url)  { return radioFavs.includes(url); }
+  function toggleRadioFav(url) {
+    if (isRadioFav(url)) radioFavs = radioFavs.filter(u => u !== url);
+    else radioFavs.unshift(url);
+    saveRadioFavs();
+  }
+
+  function loadTvFavs()     { tvFavs = loadJSON(STORAGE_TV_FAVS, []); }
+  function saveTvFavs()     { saveJSON(STORAGE_TV_FAVS, tvFavs); }
+  function isTvFav(url)     { return tvFavs.includes(url); }
+  function toggleTvFav(url) {
+    if (isTvFav(url)) tvFavs = tvFavs.filter(u => u !== url);
+    else tvFavs.unshift(url);
+    saveTvFavs();
+  }
+
+  // ─── Volume save/restore ────────────────────────────────────────
+  function loadRadioVol() {
+    const saved = localStorage.getItem(STORAGE_RADIO_VOL);
+    return saved !== null ? parseInt(saved) : 80;
+  }
+  function saveRadioVol(val) {
+    try { localStorage.setItem(STORAGE_RADIO_VOL, val); } catch {}
   }
 
   function setStatus(el, text) {
@@ -256,13 +291,20 @@ const RTV = (() => {
 
   function mergeAndRenderRadio() {
     loadRadioCustom();
+    loadRadioFavs();
     const all = [
       ...radioCustom.map(s => ({ ...s, _custom: true })),
       ...radioStations,
     ];
-    radioFiltered = all;
+    // If showing only favorites, put favs first
+    if (radioShowFavs) {
+      radioFiltered = all.filter(s => isRadioFav(s.url));
+    } else {
+      radioFiltered = all;
+    }
     renderRadioList();
     radioCount.textContent = `${all.length} stations`;
+    _updateRadioFavBtn();
   }
 
   function filterRadio(query) {
@@ -271,9 +313,10 @@ const RTV = (() => {
       ...radioCustom.map(s => ({ ...s, _custom: true })),
       ...radioStations,
     ];
+    let pool = radioShowFavs ? all.filter(s => isRadioFav(s.url)) : all;
     radioFiltered = q
-      ? all.filter(s => s.name.toLowerCase().includes(q) || (s.city || '').toLowerCase().includes(q) || (s.tags || '').toLowerCase().includes(q))
-      : all;
+      ? pool.filter(s => s.name.toLowerCase().includes(q) || (s.city || '').toLowerCase().includes(q) || (s.tags || '').toLowerCase().includes(q))
+      : pool;
     renderRadioList();
     radioCount.textContent = `${radioFiltered.length} stations`;
   }
@@ -286,13 +329,14 @@ const RTV = (() => {
           <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
           <circle cx="12" cy="16" r="2"/>
         </svg>
-        <p>NO STATIONS FOUND</p></div>`;
+        <p>${radioShowFavs ? 'NO FAVORITES YET — PRESS ★ ON ANY STATION' : 'NO STATIONS FOUND'}</p></div>`;
       return;
     }
 
     const frag = document.createDocumentFragment();
     radioFiltered.forEach((station, idx) => {
       const isActive = radioActive && radioActive.url === station.url;
+      const isFav = isRadioFav(station.url);
       const item = document.createElement('div');
       item.className = 'rtv-item' + (isActive ? ' active' : '');
       item.dataset.idx = idx;
@@ -307,6 +351,7 @@ const RTV = (() => {
           ${meta ? `<div class="rtv-item-meta">${escapeHtml(meta)}</div>` : ''}
         </div>
         ${station._custom ? '<span class="rtv-item-badge">CUSTOM</span>' : ''}
+        <button class="rtv-item-fav ${isFav ? 'is-fav' : ''}" title="${isFav ? 'Remove from favorites' : 'Add to favorites'}">★</button>
         <button class="rtv-item-play" title="Play">
           ${isActive
             ? '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>'
@@ -318,6 +363,15 @@ const RTV = (() => {
       item.addEventListener('click', (e) => {
         if (e.target.closest('.rtv-item-del')) {
           deleteRadioCustom(station.url);
+          return;
+        }
+        if (e.target.closest('.rtv-item-fav')) {
+          toggleRadioFav(station.url);
+          const btn = e.target.closest('.rtv-item-fav');
+          const nowFav = isRadioFav(station.url);
+          btn.classList.toggle('is-fav', nowFav);
+          btn.title = nowFav ? 'Remove from favorites' : 'Add to favorites';
+          _updateRadioFavBtn();
           return;
         }
         playRadioStation(station);
@@ -351,7 +405,7 @@ const RTV = (() => {
     if (radioIconStop)  radioIconStop.style.display = '';
 
     radioAudio.src = station.url;
-    radioAudio.volume = radioVolSlider ? parseInt(radioVolSlider.value) / 100 : getVolume();
+    radioAudio.volume = radioVolSlider ? parseInt(radioVolSlider.value) / 100 : loadRadioVol() / 100;
     if (window.AchievementSystem) AchievementSystem.record('radioPlayed');
     radioAudio.play().then(() => {
       setStatus(radioStatus, '● LIVE — ' + station.name);
@@ -428,13 +482,15 @@ const RTV = (() => {
 
   function mergeAndRenderTv() {
     loadTvCustom();
+    loadTvFavs();
     const all = [
       ...tvCustom.map(c => ({ ...c, _custom: true })),
       ...tvChannels,
     ];
-    tvFiltered = all;
+    tvFiltered = tvShowFavs ? all.filter(c => isTvFav(c.url)) : all;
     renderTvList();
     tvCount.textContent = `${all.length} channels`;
+    _updateTvFavBtn();
   }
 
   function filterTv(query) {
@@ -443,7 +499,8 @@ const RTV = (() => {
       ...tvCustom.map(c => ({ ...c, _custom: true })),
       ...tvChannels,
     ];
-    tvFiltered = q ? all.filter(c => c.name.toLowerCase().includes(q)) : all;
+    let pool = tvShowFavs ? all.filter(c => isTvFav(c.url)) : all;
+    tvFiltered = q ? pool.filter(c => c.name.toLowerCase().includes(q)) : pool;
     renderTvList();
     tvCount.textContent = `${tvFiltered.length} channels`;
   }
@@ -455,13 +512,14 @@ const RTV = (() => {
           <rect x="2" y="7" width="20" height="15" rx="2"/>
           <polyline points="17 2 12 7 7 2"/>
         </svg>
-        <p>NO CHANNELS FOUND</p></div>`;
+        <p>${tvShowFavs ? 'NO FAVORITES YET — PRESS ★ ON ANY CHANNEL' : 'NO CHANNELS FOUND'}</p></div>`;
       return;
     }
 
     const frag = document.createDocumentFragment();
     tvFiltered.forEach((ch, idx) => {
       const isActive = tvActive && tvActive.url === ch.url;
+      const isFav = isTvFav(ch.url);
       const item = document.createElement('div');
       item.className = 'rtv-item' + (isActive ? ' active' : '');
 
@@ -471,6 +529,7 @@ const RTV = (() => {
           <div class="rtv-item-name">${escapeHtml(ch.name)}</div>
         </div>
         ${ch._custom ? '<span class="rtv-item-badge">CUSTOM</span>' : ''}
+        <button class="rtv-item-fav ${isFav ? 'is-fav' : ''}" title="${isFav ? 'Remove from favorites' : 'Add to favorites'}">★</button>
         <button class="rtv-item-play" title="Watch/Play">
           ${isActive
             ? '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>'
@@ -482,6 +541,15 @@ const RTV = (() => {
       item.addEventListener('click', (e) => {
         if (e.target.closest('.rtv-item-del')) {
           deleteTvCustom(ch.url);
+          return;
+        }
+        if (e.target.closest('.rtv-item-fav')) {
+          toggleTvFav(ch.url);
+          const btn = e.target.closest('.rtv-item-fav');
+          const nowFav = isTvFav(ch.url);
+          btn.classList.toggle('is-fav', nowFav);
+          btn.title = nowFav ? 'Remove from favorites' : 'Add to favorites';
+          _updateTvFavBtn();
           return;
         }
         playTvChannel(ch);
@@ -883,6 +951,28 @@ const RTV = (() => {
   // EVENT LISTENERS
   // ═══════════════════════════════════════════════════════════════
 
+  // ─── Helper: update radio volume slider fill color ──────────────
+  function _updateRadioVolFill(val) {
+    if (!radioVolSlider) return;
+    const pct = val + '%';
+    radioVolSlider.style.background = `linear-gradient(to right, var(--accent, #E8FF00) 0%, var(--accent, #E8FF00) ${pct}, var(--elevated, rgba(255,255,255,0.1)) ${pct})`;
+  }
+
+  // ─── Helper: update favorites filter button state ───────────────
+  function _updateRadioFavBtn() {
+    const btn = document.getElementById('radio-favs-btn');
+    if (!btn) return;
+    btn.classList.toggle('active', radioShowFavs);
+    btn.title = radioShowFavs ? 'Show all stations' : 'Show favorites only';
+  }
+
+  function _updateTvFavBtn() {
+    const btn = document.getElementById('tv-favs-btn');
+    if (!btn) return;
+    btn.classList.toggle('active', tvShowFavs);
+    btn.title = tvShowFavs ? 'Show all channels' : 'Show favorites only';
+  }
+
   // ── Radio modal ──────────────────────────────────────────────
   if (btnRadio) btnRadio.addEventListener('click', () => { radioOpen ? closeRadio() : openRadio(); });
   document.getElementById('radio-close').addEventListener('click', closeRadio);
@@ -893,6 +983,26 @@ const RTV = (() => {
 
   document.getElementById('radio-refresh').addEventListener('click', () => fetchRadioStations(true));
   radioSearch.addEventListener('input', () => filterRadio(radioSearch.value));
+
+  // ── Inject "FAVORITES" filter button for Radio ─────────────────
+  (() => {
+    const refreshBtn = document.getElementById('radio-refresh');
+    if (refreshBtn && !document.getElementById('radio-favs-btn')) {
+      const favBtn = document.createElement('button');
+      favBtn.className = 'radio-action-btn';
+      favBtn.id = 'radio-favs-btn';
+      favBtn.title = 'Show favorites only';
+      favBtn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+      </svg>FAVS`;
+      favBtn.addEventListener('click', () => {
+        radioShowFavs = !radioShowFavs;
+        filterRadio(radioSearch.value);
+        _updateRadioFavBtn();
+      });
+      refreshBtn.after(favBtn);
+    }
+  })();
 
   document.getElementById('radio-add-custom').addEventListener('click', () => {
     radioCustomRow.style.display = radioCustomRow.style.display === 'none' ? 'flex' : 'none';
@@ -940,10 +1050,20 @@ const RTV = (() => {
 
   // Volume slider (radio-specific)
   if (radioVolSlider) {
+    // Restore saved volume
+    const savedVol = loadRadioVol();
+    radioVolSlider.value = savedVol;
+    if (radioVolVal) radioVolVal.textContent = savedVol;
+
+    // Update fill gradient on load
+    _updateRadioVolFill(savedVol);
+
     radioVolSlider.addEventListener('input', () => {
-      const v = parseInt(radioVolSlider.value) / 100;
-      if (radioVolVal) radioVolVal.textContent = radioVolSlider.value;
-      if (radioAudio) radioAudio.volume = v;
+      const val = parseInt(radioVolSlider.value);
+      if (radioVolVal) radioVolVal.textContent = val;
+      if (radioAudio) radioAudio.volume = val / 100;
+      saveRadioVol(val);
+      _updateRadioVolFill(val);
     });
   }
 
@@ -957,6 +1077,26 @@ const RTV = (() => {
   document.getElementById('tv-refresh').addEventListener('click', () => {
     fetchTvChannels(tvSourceSelect.value);
   });
+
+  // ── Inject "FAVORITES" filter button for TV ─────────────────────
+  (() => {
+    const tvRefreshBtn = document.getElementById('tv-refresh');
+    if (tvRefreshBtn && !document.getElementById('tv-favs-btn')) {
+      const favBtn = document.createElement('button');
+      favBtn.className = 'rtv-action-btn';
+      favBtn.id = 'tv-favs-btn';
+      favBtn.title = 'Show favorites only';
+      favBtn.innerHTML = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+      </svg>FAVS`;
+      favBtn.addEventListener('click', () => {
+        tvShowFavs = !tvShowFavs;
+        filterTv(tvSearch.value);
+        _updateTvFavBtn();
+      });
+      tvRefreshBtn.after(favBtn);
+    }
+  })();
 
   tvSourceSelect.addEventListener('change', () => {
     fetchTvChannels(tvSourceSelect.value);
