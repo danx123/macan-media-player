@@ -2548,6 +2548,9 @@ async function loadTrack(index, autoplay = true) {
   // Pass full track object so name/artist/album survives queue clear
   if (track.path && window.SmartPlaylist) SmartPlaylist.recordPlay(track.path, track);
 
+  // Record track play for Wrapped stats
+  if (window.MacanWrapped) MacanWrapped.recordTrackPlay(track);
+
   // Record play for achievements
   if (window.AchievementSystem) {
     AchievementSystem.record('totalPlays');
@@ -2911,6 +2914,9 @@ function applyArt(src) {
     const wasNew = !track.cover_art;
     track.cover_art = src;
     thumbCache.set(track.path, src);
+
+    // Update Wrapped art cache
+    if (window.MacanWrapped) MacanWrapped.updateTrackArt(track, src);
 
     // Update SMTC with newly received cover art
     updateMediaSession(track, src);
