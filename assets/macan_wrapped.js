@@ -181,12 +181,17 @@ const MacanWrapped = (() => {
     const validImgs = loadedImgs.filter(Boolean);
 
     if (validImgs.length >= 3) {
-      // 3 columns × 2 rows
-      const cw = W / 3, ch = COLLAGE_H / 2;
-      validImgs.slice(0, 6).forEach((img, i) => {
-        const col = i % 3, row = Math.floor(i / 3);
+      // 3 columns × up to 2 rows (max 6 images)
+      const cols = 3;
+      const rows = Math.min(2, Math.ceil(validImgs.length / cols));
+      const cw = W / cols, ch = COLLAGE_H / rows;
+      validImgs.slice(0, cols * rows).forEach((img, i) => {
+        const col = i % cols, row = Math.floor(i / cols);
         ctx.save();
-        ctx.globalAlpha = 0.85;
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        ctx.rect(col * cw, row * ch, cw, ch);
+        ctx.clip();
         const scale = Math.max(cw / img.width, ch / img.height);
         const sw = img.width * scale, sh = img.height * scale;
         const sx = col * cw + (cw - sw) / 2;
@@ -194,15 +199,35 @@ const MacanWrapped = (() => {
         ctx.drawImage(img, sx, sy, sw, sh);
         ctx.restore();
       });
+    } else if (validImgs.length === 2) {
+      // 2 columns side by side
+      const cw = W / 2, ch = COLLAGE_H;
+      validImgs.forEach((img, i) => {
+        ctx.save();
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        ctx.rect(i * cw, 0, cw, ch);
+        ctx.clip();
+        const scale = Math.max(cw / img.width, ch / img.height);
+        const sw = img.width * scale, sh = img.height * scale;
+        const sx = i * cw + (cw - sw) / 2;
+        const sy = (ch - sh) / 2;
+        ctx.drawImage(img, sx, sy, sw, sh);
+        ctx.restore();
+      });
     } else if (validImgs.length === 1) {
-      // Single art, full width blurred bg
+      // Single art — full width, sharp, centered cover-fit
       const img = validImgs[0];
       ctx.save();
-      ctx.filter = 'blur(12px)';
-      ctx.globalAlpha = 0.5;
-      ctx.drawImage(img, -20, -20, W + 40, COLLAGE_H + 40);
-      ctx.filter = 'none';
-      ctx.globalAlpha = 1;
+      ctx.globalAlpha = 0.92;
+      ctx.beginPath();
+      ctx.rect(0, 0, W, COLLAGE_H);
+      ctx.clip();
+      const scale = Math.max(W / img.width, COLLAGE_H / img.height);
+      const sw = img.width * scale, sh = img.height * scale;
+      const sx = (W - sw) / 2;
+      const sy = (COLLAGE_H - sh) / 2;
+      ctx.drawImage(img, sx, sy, sw, sh);
       ctx.restore();
     } else {
       // No art — gradient placeholder
