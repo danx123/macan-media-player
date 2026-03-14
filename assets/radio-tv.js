@@ -5,10 +5,11 @@
 
 const RTV = (() => {
   // ─── Storage Keys ──────────────────────────────────────────────
-  const STORAGE_RADIO_CACHE   = 'macan_radio_cache';
+  const STORAGE_RADIO_CACHE   = 'macan_radio_cache';     // legacy (ID)
   const STORAGE_RADIO_CUSTOM  = 'macan_radio_custom';
   const STORAGE_RADIO_FAVS    = 'macan_radio_favs';
   const STORAGE_RADIO_VOL     = 'macan_radio_vol';
+  const STORAGE_RADIO_COUNTRY = 'macan_radio_country';   // last selected country code
   const STORAGE_TV_CHANNELS   = 'macan_tv_channels';
   const STORAGE_TV_CUSTOM     = 'macan_tv_custom';
   const STORAGE_TV_FAVS       = 'macan_tv_favs';
@@ -22,6 +23,7 @@ const RTV = (() => {
   let radioActive     = null; // { name, url, city }
   let radioAudio      = null; // HTMLAudioElement for streaming
   let radioShowFavs   = false; // filter: show only favorites
+  let radioCountry    = 'ID'; // active country code (ISO 3166-1 alpha-2)
 
   let tvChannels      = [];
   let tvCustom        = [];
@@ -59,6 +61,7 @@ const RTV = (() => {
   const radioNextBtn      = document.getElementById('radio-next');
   const radioVolSlider    = document.getElementById('radio-vol-slider');
   const radioVolVal       = document.getElementById('radio-vol-val');
+  const radioCountrySelect = document.getElementById('radio-country-select');
   const btnRadio          = document.getElementById('btn-radio');
 
   const tvOverlay         = document.getElementById('tv-overlay');
@@ -115,6 +118,110 @@ const RTV = (() => {
   }
   function saveRadioVol(val) {
     try { localStorage.setItem(STORAGE_RADIO_VOL, val); } catch {}
+  }
+
+  // ─── Country list (ISO 3166-1 alpha-2, sorted by name) ─────────
+  const RADIO_COUNTRIES = [
+    { code: 'AF', name: 'Afghanistan' },
+    { code: 'DZ', name: 'Algeria' },
+    { code: 'AR', name: 'Argentina' },
+    { code: 'AU', name: 'Australia' },
+    { code: 'AT', name: 'Austria' },
+    { code: 'BD', name: 'Bangladesh' },
+    { code: 'BY', name: 'Belarus' },
+    { code: 'BE', name: 'Belgium' },
+    { code: 'BA', name: 'Bosnia and Herzegovina' },
+    { code: 'BR', name: 'Brazil' },
+    { code: 'BG', name: 'Bulgaria' },
+    { code: 'CA', name: 'Canada' },
+    { code: 'CL', name: 'Chile' },
+    { code: 'CN', name: 'China' },
+    { code: 'CO', name: 'Colombia' },
+    { code: 'HR', name: 'Croatia' },
+    { code: 'CZ', name: 'Czech Republic' },
+    { code: 'DK', name: 'Denmark' },
+    { code: 'EG', name: 'Egypt' },
+    { code: 'FI', name: 'Finland' },
+    { code: 'FR', name: 'France' },
+    { code: 'DE', name: 'Germany' },
+    { code: 'GH', name: 'Ghana' },
+    { code: 'GR', name: 'Greece' },
+    { code: 'HU', name: 'Hungary' },
+    { code: 'IN', name: 'India' },
+    { code: 'ID', name: 'Indonesia' },
+    { code: 'IR', name: 'Iran' },
+    { code: 'IQ', name: 'Iraq' },
+    { code: 'IE', name: 'Ireland' },
+    { code: 'IL', name: 'Israel' },
+    { code: 'IT', name: 'Italy' },
+    { code: 'JP', name: 'Japan' },
+    { code: 'JO', name: 'Jordan' },
+    { code: 'KZ', name: 'Kazakhstan' },
+    { code: 'KE', name: 'Kenya' },
+    { code: 'KR', name: 'South Korea' },
+    { code: 'KW', name: 'Kuwait' },
+    { code: 'LB', name: 'Lebanon' },
+    { code: 'LY', name: 'Libya' },
+    { code: 'MY', name: 'Malaysia' },
+    { code: 'MX', name: 'Mexico' },
+    { code: 'MA', name: 'Morocco' },
+    { code: 'NL', name: 'Netherlands' },
+    { code: 'NZ', name: 'New Zealand' },
+    { code: 'NG', name: 'Nigeria' },
+    { code: 'NO', name: 'Norway' },
+    { code: 'PK', name: 'Pakistan' },
+    { code: 'PE', name: 'Peru' },
+    { code: 'PH', name: 'Philippines' },
+    { code: 'PL', name: 'Poland' },
+    { code: 'PT', name: 'Portugal' },
+    { code: 'QA', name: 'Qatar' },
+    { code: 'RO', name: 'Romania' },
+    { code: 'RU', name: 'Russia' },
+    { code: 'SA', name: 'Saudi Arabia' },
+    { code: 'RS', name: 'Serbia' },
+    { code: 'SG', name: 'Singapore' },
+    { code: 'ZA', name: 'South Africa' },
+    { code: 'ES', name: 'Spain' },
+    { code: 'SE', name: 'Sweden' },
+    { code: 'CH', name: 'Switzerland' },
+    { code: 'SY', name: 'Syria' },
+    { code: 'TW', name: 'Taiwan' },
+    { code: 'TH', name: 'Thailand' },
+    { code: 'TN', name: 'Tunisia' },
+    { code: 'TR', name: 'Turkey' },
+    { code: 'UA', name: 'Ukraine' },
+    { code: 'AE', name: 'United Arab Emirates' },
+    { code: 'GB', name: 'United Kingdom' },
+    { code: 'US', name: 'United States' },
+    { code: 'UZ', name: 'Uzbekistan' },
+    { code: 'VE', name: 'Venezuela' },
+    { code: 'VN', name: 'Vietnam' },
+  ];
+
+  // ─── Per-country cache key ──────────────────────────────────────
+  function _radioCacheKey(code) {
+    return `macan_radio_cache_${code.toUpperCase()}`;
+  }
+
+  function _loadRadioCountryCache(code) {
+    return loadJSON(_radioCacheKey(code), []);
+  }
+
+  function _saveRadioCountryCache(code, data) {
+    saveJSON(_radioCacheKey(code), data);
+  }
+
+  // ─── Populate country dropdown ──────────────────────────────────
+  function _buildCountrySelect() {
+    if (!radioCountrySelect) return;
+    radioCountrySelect.innerHTML = '';
+    RADIO_COUNTRIES.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.code;
+      opt.textContent = `${c.name}`;
+      if (c.code === radioCountry) opt.selected = true;
+      radioCountrySelect.appendChild(opt);
+    });
   }
 
   function setStatus(el, text) {
@@ -251,7 +358,8 @@ const RTV = (() => {
 
   async function fetchRadioStations(forceRefresh = false) {
     loadRadioCustom();
-    const cached = loadJSON(STORAGE_RADIO_CACHE, []);
+    const code   = radioCountry;
+    const cached = _loadRadioCountryCache(code);
 
     if (!forceRefresh && cached.length > 0) {
       radioStations = cached;
@@ -263,7 +371,7 @@ const RTV = (() => {
     showLoading(radioList, 'FETCHING STATIONS FROM RADIO-BROWSER.INFO...');
     setStatus(radioStatus, 'CONNECTING TO RADIO-BROWSER.INFO...');
 
-    const RADIO_API = 'https://de2.api.radio-browser.info/json/stations/bycountrycodeexact/ID';
+    const RADIO_API = `https://de2.api.radio-browser.info/json/stations/bycountrycodeexact/${code}`;
     try {
       const res = await fetch(RADIO_API);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -280,7 +388,7 @@ const RTV = (() => {
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
 
-      saveJSON(STORAGE_RADIO_CACHE, radioStations);
+      _saveRadioCountryCache(code, radioStations);
       mergeAndRenderRadio();
       setStatus(radioStatus, `${radioStations.length + radioCustom.length} stations loaded`);
     } catch (err) {
@@ -699,10 +807,15 @@ const RTV = (() => {
     // Close TV if open
     if (tvOpen) closeTv();
 
+    // Restore saved country (default: ID)
+    const savedCountry = localStorage.getItem(STORAGE_RADIO_COUNTRY);
+    if (savedCountry) radioCountry = savedCountry;
+    _buildCountrySelect();
+
     // Load cached stations if list is empty
     if (radioFiltered.length === 0) {
       loadRadioCustom();
-      const cached = loadJSON(STORAGE_RADIO_CACHE, []);
+      const cached = _loadRadioCountryCache(radioCountry);
       if (cached.length > 0) {
         radioStations = cached;
         mergeAndRenderRadio();
@@ -983,6 +1096,20 @@ const RTV = (() => {
 
   document.getElementById('radio-refresh').addEventListener('click', () => fetchRadioStations(true));
   radioSearch.addEventListener('input', () => filterRadio(radioSearch.value));
+
+  // ── Country selector ────────────────────────────────────────
+  if (radioCountrySelect) {
+    radioCountrySelect.addEventListener('change', () => {
+      radioCountry = radioCountrySelect.value;
+      try { localStorage.setItem(STORAGE_RADIO_COUNTRY, radioCountry); } catch {}
+      radioStations = [];
+      radioFiltered = [];
+      radioShowFavs = false;
+      _updateRadioFavBtn();
+      radioSearch.value = '';
+      fetchRadioStations(false);
+    });
+  }
 
   // ── Inject "FAVORITES" filter button for Radio ─────────────────
   (() => {
