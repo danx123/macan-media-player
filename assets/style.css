@@ -2811,16 +2811,6 @@ video::cue {
 .rtv-action-btn.accent:hover {
   background: rgba(232,255,0,0.18);
 }
-.rtv-action-btn.active,
-.radio-action-btn.active {
-  background: var(--accent-dim, rgba(232,255,0,0.12));
-  border-color: rgba(232,255,0,0.4);
-  color: var(--accent, #E8FF00);
-}
-.rtv-action-btn.active:hover,
-.radio-action-btn.active:hover {
-  background: rgba(232,255,0,0.18);
-}
 
 .rtv-select {
   background: var(--surface);
@@ -3040,39 +3030,6 @@ video::cue {
   border-color: rgba(255,45,85,0.4);
   color: var(--red);
   background: var(--red-dim);
-}
-
-/* favorite button */
-.rtv-item-fav {
-  width: 20px; height: 20px;
-  border-radius: 2px;
-  background: none;
-  border: 1px solid transparent;
-  color: var(--text-lo);
-  display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-  opacity: 0;
-  cursor: pointer;
-  transition: all 0.15s;
-  font-size: 11px;
-  padding: 0;
-}
-.rtv-item:hover .rtv-item-fav {
-  opacity: 1;
-}
-.rtv-item-fav.is-fav {
-  opacity: 1;
-  color: #E8FF00;
-}
-.rtv-item-fav:hover {
-  border-color: rgba(232,255,0,0.3);
-  color: #E8FF00;
-  background: rgba(232,255,0,0.08);
-}
-.rtv-item-fav.is-fav:hover {
-  border-color: rgba(255,45,85,0.4);
-  color: var(--red, #ff2d55);
-  background: var(--red-dim, rgba(255,45,85,0.08));
 }
 
 /* custom/saved badge */
@@ -4798,46 +4755,18 @@ video::cue {
   height: 3px;
   -webkit-appearance: none;
   appearance: none;
-  background: var(--elevated, rgba(255,255,255,0.1));
+  background: rgba(255,255,255,0.1);
   border-radius: 2px;
   outline: none;
   cursor: pointer;
-  vertical-align: middle;
-}
-.radio-vol-slider::-webkit-slider-runnable-track {
-  height: 3px;
-  border-radius: 2px;
-  background: transparent;
 }
 .radio-vol-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
-  appearance: none;
-  width: 13px;
-  height: 13px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
-  background: var(--accent, #E8FF00);
+  background: #E8FF00;
   cursor: pointer;
-  box-shadow: 0 0 8px var(--accent-glow, rgba(232,255,0,0.5));
-  margin-top: -5px;
-  transition: transform 0.15s, box-shadow 0.15s;
-}
-.radio-vol-slider:hover::-webkit-slider-thumb {
-  transform: scale(1.2);
-  box-shadow: 0 0 12px var(--accent, #E8FF00);
-}
-.radio-vol-slider::-moz-range-track {
-  height: 3px;
-  border-radius: 2px;
-  background: var(--elevated, rgba(255,255,255,0.1));
-}
-.radio-vol-slider::-moz-range-thumb {
-  width: 13px;
-  height: 13px;
-  border-radius: 50%;
-  border: none;
-  background: var(--accent, #E8FF00);
-  cursor: pointer;
-  box-shadow: 0 0 8px var(--accent-glow, rgba(232,255,0,0.5));
 }
 .radio-vol-val {
   font-family: 'Space Mono', monospace;
@@ -4861,6 +4790,46 @@ video::cue {
   flex-direction: column;
   overflow: hidden;
   padding-bottom: 8px;
+}
+
+.radio-country-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 22px 4px;
+  flex-shrink: 0;
+}
+.radio-country-select {
+  flex: 1;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 4px;
+  color: rgba(255,255,255,0.75);
+  font-family: 'Space Mono', monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.5px;
+  padding: 6px 10px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='rgba(255,255,255,0.3)'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+}
+.radio-country-select:hover,
+.radio-country-select:focus {
+  border-color: rgba(232,255,0,0.35);
+  color: #E8FF00;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23E8FF00'/%3E%3C/svg%3E");
+}
+.radio-country-select option {
+  background: #111;
+  color: rgba(255,255,255,0.85);
+  font-family: 'Space Mono', monospace;
+  font-size: 0.62rem;
 }
 
 .radio-search-row {
