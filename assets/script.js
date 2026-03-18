@@ -33,13 +33,17 @@ const S = {
   lyricsData:   null,     // { content, is_synced, lines }
   lyricsActiveLine: -1,
   // Fade & Normalization
-  fadeEnabled:  true,
-  fadeDuration: 1200,     // ms
+  fadeEnabled:    true,
+  fadeDuration:   1200,     // ms — simple fade in/out duration
+  crossfadeEnabled: false,  // true = crossfade between tracks
+  crossfadeDuration: 3000,  // ms — crossfade overlap duration
   normEnabled:  false,    // ReplayGain normalization
   targetLUFS:   -14,      // target normalization level (dB)
   _fadeTimer:   null,
   _fadeGain:    null,     // Web Audio GainNode for fading
   _gainNode:    null,     // Web Audio GainNode for normalization
+  _xfadeAudio:  null,     // secondary HTMLAudioElement for crossfade
+  _xfadeTimer:  null,     // crossfade schedule timer
   // State persistence — debounce + in-flight lock
   _stateSaveTimer: null,
   _saveLock:    false,    // FIX: prevent concurrent save_app_state calls
@@ -1637,6 +1641,8 @@ async function _doStateRestore() {
       if (state.fadeEnabled  !== undefined) S.fadeEnabled  = state.fadeEnabled;
       if (state.fadeDuration !== undefined) S.fadeDuration = state.fadeDuration;
       if (state.normEnabled  !== undefined) S.normEnabled  = state.normEnabled;
+      if (state.crossfadeEnabled  !== undefined) S.crossfadeEnabled  = state.crossfadeEnabled;
+      if (state.crossfadeDuration !== undefined) S.crossfadeDuration = state.crossfadeDuration;
 
       // FIX: Store EQ bands as pending — AudioContext may not exist yet.
       // If AudioContext is already initialized (e.g. user had interacted before
@@ -2530,89 +2536,157 @@ function pinVcControls(on) {
 async function loadTrack(index, autoplay = true) {
   if (index < 0 || index >= S.playlist.length) return;
 
-  // Fade out current track before switching
-  if (S.fadeEnabled && S.isPlaying && S._fadeGain && audioContext) {
-    await new Promise(resolve => {
-      doFadeOut(resolve);
-    });
+  const track  = S.playlist[index];
+  const isVid  = track.is_video;
+  const wasPlaying = S.isPlaying;
+
+  // ── Crossfade path (audio only, not video) ─────────────────
+  if (S.crossfadeEnabled && wasPlaying && S.isPlaying && !isVid
+      && S.currentIndex >= 0 && !S.playlist[S.currentIndex]?.is_video
+      && audioContext) {
+    _doCrossfade(index, track, autoplay);
+    return;
+  }
+
+  // ── Normal path: fade out then switch ──────────────────────
+  if (S.fadeEnabled && wasPlaying && S._fadeGain && audioContext && !isVid) {
+    await new Promise(resolve => doFadeOut(resolve));
   }
 
   S.currentIndex = index;
-  const track = S.playlist[index];
-  const isVid  = track.is_video;
+  _onTrackStart(track);
 
-  // Bridge: notify plugins of track change
-  window.MacanBridge?.emit('track:load', track);
-
-  // Record play count + snapshot metadata for Smart Playlist
-  // Pass full track object so name/artist/album survives queue clear
-  if (track.path && window.SmartPlaylist) SmartPlaylist.recordPlay(track.path, track);
-
-  // Record track play for Wrapped stats
-  if (window.MacanWrapped) MacanWrapped.recordTrackPlay(track);
-
-  // Record play for achievements
-  if (window.AchievementSystem) {
-    AchievementSystem.record('totalPlays');
-    if (track.is_video) AchievementSystem.record('videosPlayed');
-  }
-
-  // Stop both players first
+  // Stop both players
   audio.pause(); video.pause();
-
-  // Reset src cleanly
-  audio.src = '';
-  video.src = '';
+  audio.src = ''; video.src = '';
 
   updateTrackInfo(track);
   updatePlaylistHighlight(index);
   setStatus(`LOADING — ${track.name}`);
-
-  // Update mini player title if it's currently showing
   if (MiniPlayer.isActive()) MiniPlayer.updateMiniInfo();
-
-  // Apply ReplayGain normalization gain
   applyNormalization(track);
 
-  // Start with whatever URL was stored in the playlist
-  let srcUrl = track.url || '';
-
-  if (pw() && track.path) {
-    try {
-      const resolvedUrl = await pywebview.api.get_file_url(track.path);
-      if (resolvedUrl) {
-        srcUrl = resolvedUrl;
-        track.url = resolvedUrl;
-      }
-    } catch(e) {
-      console.warn('[MACAN] get_file_url failed, using stored url:', e);
-    }
-  }
-
-  if (!srcUrl) {
-    setStatus('ERROR — NO VALID URL FOR TRACK');
-    return;
-  }
+  const srcUrl = await _resolveUrl(track);
+  if (!srcUrl) { setStatus('ERROR — NO VALID URL FOR TRACK'); return; }
 
   if (isVid) {
     videoLayer.classList.add('active');
     $('main-layout').style.display = 'none';
     $('vc-title-text').textContent = track.name.toUpperCase();
-    video.src = srcUrl;
-    video.load();
+    video.src = srcUrl; video.load();
     if (autoplay) doPlay(video);
-    // Load .srt subtitle if available
     _loadSubtitle(track.path || '');
   } else {
     _clearSubtitleTracks();
     videoLayer.classList.remove('active');
     $('main-layout').style.display = '';
-    audio.src = srcUrl;
-    audio.load();
+    audio.src = srcUrl; audio.load();
     if (autoplay) doPlay(audio);
   }
 
   scheduleStateSave();
+}
+
+// ─── CROSSFADE ────────────────────────────────────────────────
+async function _doCrossfade(index, track, autoplay) {
+  // Cancel any in-flight crossfade
+  clearTimeout(S._xfadeTimer);
+  if (S._xfadeAudio) {
+    S._xfadeAudio.pause();
+    S._xfadeAudio.src = '';
+  }
+
+  S.currentIndex = index;
+  _onTrackStart(track);
+  updateTrackInfo(track);
+  updatePlaylistHighlight(index);
+  setStatus(`LOADING — ${track.name}`);
+  if (MiniPlayer.isActive()) MiniPlayer.updateMiniInfo();
+  applyNormalization(track);
+
+  const srcUrl = await _resolveUrl(track);
+  if (!srcUrl) { setStatus('ERROR — NO VALID URL FOR TRACK'); return; }
+
+  const dur = S.crossfadeDuration / 1000;
+
+  // Incoming audio element
+  const incoming = new Audio();
+  incoming.volume = 0;
+  incoming.src = srcUrl;
+  incoming.load();
+  S._xfadeAudio = incoming;
+
+  // Fade out the current (outgoing) audio
+  if (S._fadeGain && audioContext) {
+    const now = audioContext.currentTime;
+    S._fadeGain.gain.cancelScheduledValues(now);
+    S._fadeGain.gain.setValueAtTime(S._fadeGain.gain.value || 1.0, now);
+    S._fadeGain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+  }
+
+  // Ramp incoming volume up via DOM property (not Web Audio — keeps it simple)
+  incoming.play().then(() => {
+    setStatus(`PLAYING — ${track.name}`);
+    let elapsed = 0;
+    const step  = 50; // ms
+    const ramp  = setInterval(() => {
+      elapsed += step;
+      incoming.volume = Math.min(1, elapsed / S.crossfadeDuration) * (S.volume / 100);
+      if (elapsed >= S.crossfadeDuration) {
+        clearInterval(ramp);
+        incoming.volume = S.volume / 100;
+        // Swap: stop old audio, rewire incoming as main audio element
+        audio.pause();
+        audio.src = '';
+        audio.src = srcUrl;
+        audio.currentTime = incoming.currentTime;
+        audio.volume = S.volume / 100;
+        incoming.pause();
+        incoming.src = '';
+        S._xfadeAudio = null;
+        // Reset fade gain
+        if (S._fadeGain && audioContext) {
+          S._fadeGain.gain.cancelScheduledValues(audioContext.currentTime);
+          S._fadeGain.gain.setValueAtTime(1.0, audioContext.currentTime);
+        }
+        doPlay(audio);
+      }
+    }, step);
+    S._xfadeTimer = ramp;
+  }).catch(() => {
+    // Fallback to normal load on play error
+    audio.src = srcUrl; audio.load();
+    if (autoplay) doPlay(audio);
+  });
+
+  scheduleStateSave();
+}
+
+// ─── SHARED HELPERS ───────────────────────────────────────────
+/** Resolve a track's playback URL via Python API. */
+async function _resolveUrl(track) {
+  let srcUrl = track.url || '';
+  if (pw() && track.path) {
+    try {
+      const resolved = await pywebview.api.get_file_url(track.path);
+      if (resolved) { srcUrl = resolved; track.url = resolved; }
+    } catch(e) {
+      console.warn('[MACAN] get_file_url failed:', e);
+    }
+  }
+  return srcUrl;
+}
+
+/** Common side-effects run whenever a new track starts. */
+function _onTrackStart(track) {
+  S._xfadeFired = false;   // reset crossfade trigger flag for new track
+  window.MacanBridge?.emit('track:load', track);
+  if (track.path && window.SmartPlaylist) SmartPlaylist.recordPlay(track.path, track);
+  if (window.MacanWrapped) MacanWrapped.recordTrackPlay(track);
+  if (window.AchievementSystem) {
+    AchievementSystem.record('totalPlays');
+    if (track.is_video) AchievementSystem.record('videosPlayed');
+  }
 }
 
 // ─── SUBTITLE (SRT) SUPPORT ───────────────────────────────────
@@ -3028,9 +3102,18 @@ function onTimeUpdate() {
     highlightCurrentLyricLine();
   }
 
-  // FIX: Periodic state save every ~10s using wall-clock time (not
-  // currentTime which can be 0 after a track change) to prevent
-  // triggering a save while a previous one is still in-flight.
+  // ── Crossfade trigger: fire nextTrack() before the track ends ──
+  if (S.crossfadeEnabled && S.isPlaying && S.duration > 0
+      && !S.playlist[S.currentIndex]?.is_video) {
+    const remaining = S.duration - cur;
+    const xfSecs    = S.crossfadeDuration / 1000;
+    if (remaining > 0 && remaining <= xfSecs && !S._xfadeFired) {
+      S._xfadeFired = true;
+      nextTrack();
+    }
+  }
+
+  // FIX: Periodic state save every ~10s using wall-clock time
   const now = Date.now();
   if (!S._lastStateSaveWallMs || now - S._lastStateSaveWallMs > 10000) {
     if (!S._saveLock) {
@@ -3043,7 +3126,6 @@ function onTimeUpdate() {
   if (!S._smtcSyncMs || now - S._smtcSyncMs > 1000) {
     S._smtcSyncMs = now;
     syncMediaSessionState();
-    // Bridge: seek position update (same 1s throttle, no extra overhead)
     window.MacanBridge?.emit('player:seek', {
       currentTime: cur,
       duration:    S.duration,
@@ -3099,6 +3181,20 @@ function prevTrack() {
 }
 
 function nextTrack() {
+  // ── Check Up Next queue first ──────────────────────────────
+  if (window.Queue && Queue.length > 0) {
+    const queued = Queue.shift();
+    // Find in main playlist or inject after current
+    let idx = S.playlist.findIndex(t => t.path && t.path === queued.path);
+    if (idx < 0) {
+      // Not in main playlist — inject temporarily after current
+      S.playlist.splice(S.currentIndex + 1, 0, queued);
+      idx = S.currentIndex + 1;
+    }
+    loadTrack(idx, true);
+    return;
+  }
+
   if (!S.playlist.length) return;
   let next;
   if (S.isShuffle) {
@@ -3156,6 +3252,8 @@ async function persistAppState() {
       fadeEnabled:   S.fadeEnabled,
       fadeDuration:  S.fadeDuration,
       normEnabled:   S.normEnabled,
+      crossfadeEnabled:  S.crossfadeEnabled,
+      crossfadeDuration: S.crossfadeDuration,
       // equalizerUI is always available (created at script load against the stub).
       // equalizer (real Web Audio) may still be null if user hasn't played yet —
       // fall back to stub values so we don't overwrite a valid saved EQ state.
@@ -3590,6 +3688,21 @@ function showContextMenu(x, y, track) {
       </svg>
       Play Now
     </div>
+    <div class="ctx-separator"></div>
+    <div class="ctx-item ctx-playnext" data-action="playnext">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polygon points="5,4 15,12 5,20"/><line x1="19" y1="4" x2="19" y2="20"/>
+      </svg>
+      Play Next
+    </div>
+    <div class="ctx-item ctx-addqueue" data-action="addqueue">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
+        <line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/>
+        <line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
+      </svg>
+      Add to Queue
+    </div>
     ${isAudio ? `
     <div class="ctx-separator"></div>
     <div class="ctx-item ctx-edittags" data-action="edittags">
@@ -3623,6 +3736,16 @@ function showContextMenu(x, y, track) {
   menu.querySelector('[data-action="play"]').addEventListener('click', () => {
     const idx = S.playlist.indexOf(track);
     if (idx >= 0) loadTrack(idx, true);
+    closeContextMenu();
+  });
+  menu.querySelector('[data-action="playnext"]').addEventListener('click', () => {
+    if (window.Queue) Queue.addPlayNext(track);
+    setStatus(`PLAY NEXT — ${track.name}`);
+    closeContextMenu();
+  });
+  menu.querySelector('[data-action="addqueue"]').addEventListener('click', () => {
+    if (window.Queue) Queue.add(track);
+    setStatus(`ADDED TO QUEUE — ${track.name}`);
     closeContextMenu();
   });
   if (isAudio) {
