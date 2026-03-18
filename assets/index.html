@@ -197,6 +197,15 @@
         <span id="pl-count" class="pl-count-badge">0 TRACKS</span>
       </div>
       <div class="pl-header-right">
+        <button class="pl-tool-btn" id="btn-up-next" title="Up Next Queue">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
+            <line x1="8" y1="18" x2="16" y2="18"/>
+            <polygon points="19 15 22 18 19 21" fill="currentColor" stroke="none"/>
+          </svg>
+          <span class="pl-btn-label">UP NEXT</span>
+          <span id="queue-badge" class="queue-badge" style="display:none"></span>
+        </button>
         <button class="pl-tool-btn" id="btn-equalizer" title="Equalizer">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/>
@@ -423,6 +432,50 @@
 </div>
 
 
+<!-- ═══════════ QUEUE PANEL (Up Next) ══════════════════════════ -->
+<div id="queue-panel-overlay" class="queue-panel-overlay">
+  <div id="queue-panel" class="queue-panel">
+
+    <!-- Header -->
+    <div class="queue-panel-header">
+      <div class="queue-panel-header-left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="2">
+          <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
+          <line x1="8" y1="18" x2="16" y2="18"/>
+          <polygon points="19 15 22 18 19 21" fill="#E8FF00" stroke="none"/>
+        </svg>
+        <h2>UP NEXT</h2>
+        <span id="queue-count" class="queue-count-label"></span>
+      </div>
+      <div class="queue-panel-header-right">
+        <button class="queue-action-btn" id="queue-clear-btn" title="Clear queue">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+          </svg>
+          CLEAR
+        </button>
+        <button class="queue-close-btn" id="queue-close-btn">&#x2715;</button>
+      </div>
+    </div>
+
+    <!-- Empty state -->
+    <div id="queue-empty" class="queue-empty-state">
+      <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.18">
+        <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
+        <line x1="8" y1="18" x2="16" y2="18"/>
+        <polygon points="19 15 22 18 19 21"/>
+      </svg>
+      <p>QUEUE IS EMPTY</p>
+      <span>Right-click a track to add it</span>
+    </div>
+
+    <!-- Queue list -->
+    <div id="queue-list" class="queue-list"></div>
+
+  </div>
+</div>
+
 <!-- ═══════════ RADIO OVERLAY (Center Modal) ════════════════════ -->
 <div id="radio-overlay" class="radio-modal-overlay">
   <div class="radio-modal">
@@ -503,16 +556,6 @@
 
     <!-- Station list section -->
     <div class="radio-list-section">
-      <!-- Country selector row -->
-      <div class="radio-country-row">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.5">
-          <circle cx="12" cy="12" r="10"/>
-          <line x1="2" y1="12" x2="22" y2="12"/>
-          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
-        </svg>
-        <select id="radio-country-select" class="radio-country-select"></select>
-      </div>
-
       <!-- Search + actions -->
       <div class="radio-search-row">
         <div class="radio-search-wrap">
@@ -1159,6 +1202,7 @@
 <script src="achievements.js"></script>
 <script src="user-profile.js"></script>
 <script src="nav-menu.js"></script>
+<script src="queue.js"></script>
 <script src="script.js"></script>
 <script src="macan_jokes.js"></script>
 <script src="macan_wrapped.js"></script>
