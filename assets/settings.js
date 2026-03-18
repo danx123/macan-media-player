@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// MACAN MEDIA PLAYER — SETTINGS MODULE  (Patch 10)
+// MACAN MEDIA PLAYER — SETTINGS MODULE  (Patch 17)
 //
 // Features:
 //   1. CUSTOMIZE BUTTONS — show/hide toolbar buttons individually
@@ -16,6 +16,7 @@ const Settings = (() => {
   const DEFAULTS = {
     // Toolbar buttons visibility
     buttons: {
+      'btn-up-next':        true,
       'btn-equalizer':      true,
       'btn-playlist-manager': true,
       'btn-lyrics':         true,
@@ -31,6 +32,7 @@ const Settings = (() => {
 
   // Button display labels for the settings UI
   const BUTTON_LABELS = {
+    'btn-up-next':         'Up Next Queue',
     'btn-equalizer':       'Equalizer',
     'btn-playlist-manager':'Playlists',
     'btn-lyrics':          'Lyrics',
@@ -49,7 +51,13 @@ const Settings = (() => {
   function _load() {
     try {
       const saved = JSON.parse(localStorage.getItem(SK));
-      return _deepMerge(JSON.parse(JSON.stringify(DEFAULTS)), saved || {});
+      const merged = _deepMerge(JSON.parse(JSON.stringify(DEFAULTS)), saved || {});
+      // Migration: ensure any new button keys from DEFAULTS are present
+      // (users upgrading from older versions won't have them in localStorage)
+      Object.keys(DEFAULTS.buttons).forEach(id => {
+        if (merged.buttons[id] === undefined) merged.buttons[id] = true;
+      });
+      return merged;
     } catch { return JSON.parse(JSON.stringify(DEFAULTS)); }
   }
   function _save(s) {
@@ -230,6 +238,37 @@ const Settings = (() => {
 
         '<div class="st-divider"></div>' +
 
+        // Section: Crossfade — values read from S (Python DB is source of truth)
+        (() => {
+          const xfOn  = (typeof S !== 'undefined') ? S.crossfadeEnabled  : false;
+          const xfDur = (typeof S !== 'undefined') ? S.crossfadeDuration : 3000;
+          return (
+            '<div class="st-section">' +
+              '<div class="st-section-title-row">' +
+                '<div>' +
+                  '<div class="st-section-title">CROSSFADE</div>' +
+                  '<div class="st-section-desc">Smoothly blend between tracks instead of stopping and starting.</div>' +
+                '</div>' +
+                '<label class="st-toggle">' +
+                  '<input type="checkbox" id="st-crossfade-toggle"' + (xfOn ? ' checked' : '') + '>' +
+                  '<span class="st-toggle-track"><span class="st-toggle-thumb"></span></span>' +
+                '</label>' +
+              '</div>' +
+              '<div class="st-slider-row" id="st-crossfade-dur-row" style="' +
+                (xfOn ? '' : 'opacity:0.38;pointer-events:none') + '">' +
+                '<span class="st-slider-label">DURATION</span>' +
+                '<input type="range" class="st-slider" id="st-crossfade-dur" ' +
+                  'min="1000" max="8000" step="500" value="' + xfDur + '">' +
+                '<span class="st-slider-val" id="st-crossfade-dur-val">' +
+                  (xfDur / 1000).toFixed(1) + 's' +
+                '</span>' +
+              '</div>' +
+            '</div>'
+          );
+        })() +
+
+        '<div class="st-divider"></div>' +
+
         // Section: Dynamic Aura
         '<div class="st-section">' +
           '<div class="st-section-title-row">' +
@@ -291,6 +330,34 @@ const Settings = (() => {
         }
       }
     });
+
+    // Crossfade toggle + slider — sync to S and persist via Python DB
+    const xfToggle  = panel.querySelector('#st-crossfade-toggle');
+    const xfDurRow  = panel.querySelector('#st-crossfade-dur-row');
+    const xfSlider  = panel.querySelector('#st-crossfade-dur');
+    const xfVal     = panel.querySelector('#st-crossfade-dur-val');
+    if (xfToggle) {
+      xfToggle.addEventListener('change', () => {
+        if (typeof S !== 'undefined') {
+          S.crossfadeEnabled = xfToggle.checked;
+          if (typeof scheduleStateSave === 'function') scheduleStateSave();
+        }
+        if (xfDurRow) {
+          xfDurRow.style.opacity       = xfToggle.checked ? '' : '0.38';
+          xfDurRow.style.pointerEvents = xfToggle.checked ? '' : 'none';
+        }
+      });
+    }
+    if (xfSlider && xfVal) {
+      xfSlider.addEventListener('input', () => {
+        const ms = parseInt(xfSlider.value);
+        xfVal.textContent = (ms / 1000).toFixed(1) + 's';
+        if (typeof S !== 'undefined') {
+          S.crossfadeDuration = ms;
+          if (typeof scheduleStateSave === 'function') scheduleStateSave();
+        }
+      });
+    }
   }
 
   function _updateAuraSwatch() {
