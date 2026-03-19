@@ -303,13 +303,39 @@ function initAudioContext() {
   S._fadeGain = audioContext.createGain();
   S._fadeGain.gain.value = 1.0;
 
-  // Connect chain: source → EQ → normGain → fadeGain → destination
+  // Connect chain: source → EQ → normGain → fadeGain → analyser → destination
   if (!audioSource) {
-    audioSource = audioContext.createMediaElementSource(audioPlayer);
-    audioSource.connect(equalizer.input);
-    equalizer.connect(S._gainNode);
-    S._gainNode.connect(S._fadeGain);
-    S._fadeGain.connect(audioContext.destination);
+    try {
+      audioSource = audioContext.createMediaElementSource(audio);
+
+      // ── Analyser tap (post-EQ, post-gain) ─────────────────────────
+      // Placed AFTER fadeGain so visualizer reflects EQ + normalization.
+      // fftSize 2048 → 1024 frequency bins (0–22kHz), good resolution
+      // without hurting perf. smoothingTimeConstant handled manually in
+      // getFreqData() with exponential moving average for tighter control.
+      S.analyser = audioContext.createAnalyser();
+      S.analyser.fftSize = 2048;
+      S.analyser.smoothingTimeConstant = 0.0; // we do our own smoothing
+
+      audioSource.connect(equalizer.input);
+      equalizer.connect(S._gainNode);
+      S._gainNode.connect(S._fadeGain);
+      S._fadeGain.connect(S.analyser);
+      S.analyser.connect(audioContext.destination);
+
+      console.log('[MACAN] AudioContext chain: audio → EQ → normGain → fadeGain → analyser → dest');
+      console.log(`[MACAN] Analyser ready: fftSize=${S.analyser.fftSize}, bins=${S.analyser.frequencyBinCount}`);
+
+      // Switch mini visualizer to live mode now that analyser is ready
+      initLiveMiniVis();
+
+      // ── Art ring bass pulse ────────────────────────────────────────
+      _startArtRingPulse();
+
+    } catch(e) {
+      console.error('[MACAN] createMediaElementSource failed:', e.name, e.message);
+      // Analyser stays null — visualizers fall back to idle animation gracefully
+    }
   }
 
   // Apply the preset that was selected in the stub (or restored from DB)
@@ -334,8 +360,118 @@ function initAudioContext() {
 }
 
 
-// ═══════════════════════════════════════════════════════════════
-// SMTC — System Media Transport Controls
+// ─── ART RING BASS PULSE ──────────────────────────────────────
+// Drives #art-ring-outer rotation speed and album art scale with
+// real-time bass energy from the analyser. Runs only while analyser
+// is active; gracefully falls back to CSS animation when not playing.
+//
+// KEY: CSS `animation: ring-rotate` controls transform on this element.
+// We must disable it before setting inline style.transform, otherwise
+// the CSS animation wins and JS-driven rotation is invisible.
+let _artRingAnimId  = null;
+let _artRingAngle   = 0;
+let _artBassSmooth  = 0;
+let _artRingJsMode  = false; // true = JS driving rotation, CSS animation disabled
+
+function _startArtRingPulse() {
+  if (_artRingAnimId) return;
+  const ringOuter = document.getElementById('art-ring-outer');
+  const artImg    = document.getElementById('album-art');
+  const BASS_BINS = 6; // log-scale bins 0–5 ≈ 20Hz–120Hz
+
+  function pulse() {
+    _artRingAnimId = requestAnimationFrame(pulse);
+
+    if (!S.analyser || !S.isPlaying) {
+      // ── Playback stopped / no analyser — restore CSS animation ──
+      if (_artRingJsMode) {
+        _artRingJsMode = false;
+        if (ringOuter) {
+          ringOuter.style.animation  = '';    // restore CSS animation
+          ringOuter.style.transform  = '';
+          ringOuter.style.opacity    = '';
+          ringOuter.style.filter     = '';
+        }
+      }
+      _artBassSmooth *= 0.88;
+      if (artImg) artImg.style.transform = '';
+      return;
+    }
+
+    // ── Analyser active — disable CSS animation, JS drives rotation ──
+    if (!_artRingJsMode) {
+      _artRingJsMode = true;
+      if (ringOuter) {
+        // Grab current CSS-animated angle so we don't jump on handoff
+        const computed = getComputedStyle(ringOuter).transform;
+        if (computed && computed !== 'none') {
+          // Extract rotation angle from matrix(cos, sin, -sin, cos, 0, 0)
+          const m = computed.match(/matrix\(([^,]+),([^,]+)/);
+          if (m) {
+            _artRingAngle = Math.round(
+              Math.atan2(parseFloat(m[2]), parseFloat(m[1])) * (180 / Math.PI)
+            );
+          }
+        }
+        ringOuter.style.animation = 'none'; // kill CSS animation
+      }
+    }
+
+    // Sample bass bins directly from analyser
+    const raw = new Uint8Array(S.analyser.frequencyBinCount);
+    S.analyser.getByteFrequencyData(raw);
+    let bassSum = 0;
+    for (let i = 0; i < BASS_BINS; i++) bassSum += raw[i];
+    const bassRaw = bassSum / (BASS_BINS * 255);
+
+    // Fast attack (0.5), slow decay (0.08)
+    if (bassRaw > _artBassSmooth) _artBassSmooth += (bassRaw - _artBassSmooth) * 0.5;
+    else                           _artBassSmooth += (bassRaw - _artBassSmooth) * 0.08;
+
+    const bass = _artBassSmooth;
+
+    // Rotation: 0.8 deg/frame baseline + up to 5 deg/frame on bass hits
+    _artRingAngle += 0.8 + bass * 5.0;
+
+    if (ringOuter) {
+      ringOuter.style.transform = `rotate(${_artRingAngle}deg)`;
+      // Opacity: 0.35 idle → 0.95 on kick
+      ringOuter.style.opacity   = (0.35 + bass * 0.60).toFixed(3);
+      // Glow: scales with bass up to 28px
+      const glow = Math.round(bass * 28);
+      ringOuter.style.filter    = glow > 2
+        ? `drop-shadow(0 0 ${glow}px rgba(232,255,0,${(0.3 + bass * 0.6).toFixed(2)}))`
+        : '';
+    }
+
+    // Album art subtle scale pulse — max 3%
+    if (artImg && artImg.classList.contains('loaded')) {
+      const scale = 1 + bass * 0.03;
+      artImg.style.transform = `scale(${scale.toFixed(4)})`;
+    }
+  }
+  pulse();
+}
+
+function _stopArtRingPulse() {
+  if (_artRingAnimId) {
+    cancelAnimationFrame(_artRingAnimId);
+    _artRingAnimId = null;
+  }
+  _artRingJsMode = false;
+  const ringOuter = document.getElementById('art-ring-outer');
+  const artImg    = document.getElementById('album-art');
+  if (ringOuter) {
+    ringOuter.style.animation = '';
+    ringOuter.style.transform = '';
+    ringOuter.style.opacity   = '';
+    ringOuter.style.filter    = '';
+  }
+  if (artImg) artImg.style.transform = '';
+}
+
+
+
 // Uses the W3C Media Session API (navigator.mediaSession).
 //
 // EdgeWebView2 requires these Chromium flags to be set BEFORE start:
@@ -1514,10 +1650,18 @@ async function fetchLyrics(track, forceRefetch = false) {
   }
 }
 
-// Initialize audio context on first user interaction
-btnPlay.addEventListener('click', () => {
+// Initialize audio context on first user interaction (browser autoplay policy
+// requires AudioContext to be created/resumed inside a user gesture).
+// We listen on the document level so ANY click/keydown counts — not just btnPlay.
+// This is important for restored sessions where audio may start before the user
+// explicitly clicks Play.
+function _initAudioCtxOnGesture() {
   initAudioContext();
-}, { once: true });
+  document.removeEventListener('click',   _initAudioCtxOnGesture);
+  document.removeEventListener('keydown', _initAudioCtxOnGesture);
+}
+document.addEventListener('click',   _initAudioCtxOnGesture);
+document.addEventListener('keydown', _initAudioCtxOnGesture);
 
 // ─── ACTIVE PLAYER helper ─────────────────────────────────────
 function activePlayer() {
@@ -1539,12 +1683,15 @@ window.addEventListener('load', () => {
   setupVideoControls();
   setupVideoContextMenu();
 
-  // Set default CORS settings just in case
-  //audio.crossOrigin = "anonymous";
-  //video.crossOrigin = "anonymous";
-
   audio.volume = S.volume / 100;
   video.volume = S.volume / 100;
+
+  // crossOrigin required for createMediaElementSource() — without this,
+  // Chromium blocks the Web Audio API tap even on http://127.0.0.1 URLs.
+  // Must be set BEFORE any src is assigned to take effect.
+  audio.crossOrigin = 'anonymous';
+  // Note: video intentionally NOT set — video visualizer not implemented.
+
   updateVolumeUI(S.volume);
   syncVcVolume(S.volume);
 
@@ -1774,33 +1921,51 @@ function initBgVis() {
     alpha: Math.random() * 0.4 + 0.1,
     pulse: Math.random() * Math.PI * 2,
     pulseSpeed: Math.random() * 0.02 + 0.005,
-    freq: Math.floor(Math.random() * 60),  // which freq bin drives this particle
+    freq: Math.floor(Math.random() * 128), // maps to smoothData[0..127] log-scale
   }));
 
   let phase = 0;
   let smoothData = new Float32Array(128).fill(0);
 
+  // Precompute log-scale bin mapping for 128 bars (same principle as mini vis)
+  const BG_BARS       = 128;
+  const BG_MIN_FREQ   = 20;
+  const BG_MAX_FREQ   = 20000;
+  const bgBarBins     = new Uint16Array(BG_BARS);
+  // Populated lazily once analyser is connected (sampleRate known then)
+  let bgBinsReady     = false;
+
+  function _ensureBgBins() {
+    if (bgBinsReady || !S.analyser) return;
+    const sr  = audioContext?.sampleRate || 44100;
+    const bc  = S.analyser.frequencyBinCount;
+    for (let i = 0; i < BG_BARS; i++) {
+      const f = BG_MIN_FREQ * Math.pow(BG_MAX_FREQ / BG_MIN_FREQ, i / (BG_BARS - 1));
+      bgBarBins[i] = Math.min(bc - 1, Math.round(f / (sr / 2) * bc));
+    }
+    bgBinsReady = true;
+  }
+
   function getFreqData() {
-    if (S.analyser && S.isPlaying) {
-      const raw = new Uint8Array(S.analyser.frequencyBinCount);
+    if (S.analyser) {
+      _ensureBgBins();
+      const bc  = S.analyser.frequencyBinCount;
+      const raw = new Uint8Array(bc);
       S.analyser.getByteFrequencyData(raw);
-      // Smooth with exponential moving average
+
+      // Map log-scale bins to smoothData[0..127]
       for (let i = 0; i < smoothData.length; i++) {
-        const target = raw[i] / 255;
-        smoothData[i] += (target - smoothData[i]) * 0.18;
-      }
-    } else if (S.isPlaying) {
-      // Simulated: sine waves per band
-      for (let i = 0; i < smoothData.length; i++) {
-        const target = Math.abs(Math.sin(i * 0.18 + phase * 1.8)) * 0.45 *
-                       Math.abs(Math.sin(i * 0.07 + phase * 0.7));
-        smoothData[i] += (target - smoothData[i]) * 0.12;
+        const bin    = bgBinsReady ? bgBarBins[i] : Math.floor(i / smoothData.length * bc * 0.65);
+        const target = raw[bin] / 255;
+        // Fast attack (0.3), slow decay (0.12) for natural feel
+        if (target > smoothData[i]) smoothData[i] += (target - smoothData[i]) * 0.3;
+        else                         smoothData[i] += (target - smoothData[i]) * 0.12;
       }
     } else {
-      // Idle: gentle breathing
+      // No analyser (AudioContext not yet init) — gentle idle breathing only
       for (let i = 0; i < smoothData.length; i++) {
-        const target = Math.abs(Math.sin(i * 0.12 + phase * 0.5)) * 0.12;
-        smoothData[i] += (target - smoothData[i]) * 0.06;
+        const target = Math.abs(Math.sin(i * 0.12 + phase * 0.5)) * 0.10;
+        smoothData[i] += (target - smoothData[i]) * 0.05;
       }
     }
     return smoothData;
@@ -1809,9 +1974,11 @@ function initBgVis() {
   function draw() {
     const W = visCanvas.width, H = visCanvas.height;
     const data = getFreqData();
-    const bass = (data[1] + data[2] + data[3]) / 3;
-    const mid  = (data[10] + data[15] + data[20]) / 3;
-    const isActive = S.isPlaying;
+    // Bass ≈ bins 1–5 (log-scale: ~20–100Hz), mid ≈ bins 20–30 (~500Hz–2kHz)
+    const bass = (data[1] + data[2] + data[3] + data[4] + data[5]) / 5;
+    const mid  = (data[20] + data[24] + data[28]) / 3;
+    // isActive: real analyser data available (not just simulated idle breathing)
+    const isActive = !!(S.analyser && S.isPlaying);
 
     ctx.clearRect(0, 0, W, H);
 
@@ -2026,103 +2193,137 @@ function initIdleMiniVis() {
 function initLiveMiniVis() {
   if (miniAnimId) cancelAnimationFrame(miniAnimId);
   const ctx = miniCanvas.getContext('2d');
-  let smoothed  = new Float32Array(48).fill(0);
-  let peaks     = new Float32Array(48).fill(0);
-  let peakDecay = new Float32Array(48).fill(0);
-  let waveSm    = new Float32Array(256).fill(128);
+
+  // ── Perceptual log-scale frequency mapping ─────────────────────────────
+  // With fftSize=2048, frequencyBinCount=1024, each bin = ~21.5Hz (at 44100Hz SR).
+  // Human hearing is logarithmic — linear bin mapping wastes most bars on
+  // high frequencies we can't differentiate. Map 48 bars → log-scale bins
+  // covering 20Hz–20kHz perceptually.
+  const BARS         = 48;
+  const MIN_FREQ     = 20;
+  const MAX_FREQ     = 20000;
+  const SAMPLE_RATE  = audioContext?.sampleRate || 44100;
+  const BIN_COUNT    = S.analyser ? S.analyser.frequencyBinCount : 512;
+
+  // Precompute which FFT bin each bar maps to (log scale)
+  const barBins = new Uint16Array(BARS);
+  for (let i = 0; i < BARS; i++) {
+    const f = MIN_FREQ * Math.pow(MAX_FREQ / MIN_FREQ, i / (BARS - 1));
+    barBins[i] = Math.min(BIN_COUNT - 1, Math.round(f / (SAMPLE_RATE / 2) * BIN_COUNT));
+  }
+
+  let smoothed  = new Float32Array(BARS).fill(0);
+  let peaks     = new Float32Array(BARS).fill(0);
+  let peakDecay = new Float32Array(BARS).fill(0);
 
   function frame() {
     miniAnimId = requestAnimationFrame(frame);
     if (!S.analyser) { initIdleMiniVis(); return; }
+
     const W = miniCanvas.width, H = miniCanvas.height;
     const mode = VIS_MODES[currentVisMode];
     ctx.clearRect(0, 0, W, H);
 
     if (mode === 'scope' || mode === 'wave') {
-      // Time-domain waveform
+      // ── TIME DOMAIN — oscilloscope / waveform ─────────────────────
       const timeDomain = new Uint8Array(S.analyser.fftSize);
       S.analyser.getByteTimeDomainData(timeDomain);
+
       ctx.beginPath();
-      const accent = mode === 'scope' ? 'rgba(80,255,200,0.85)' : 'rgba(232,255,0,0.75)';
-      ctx.strokeStyle = accent;
-      ctx.lineWidth = mode === 'scope' ? 1 : 1.5;
+      ctx.strokeStyle = mode === 'scope' ? 'rgba(80,255,200,0.85)' : 'rgba(232,255,0,0.75)';
+      ctx.lineWidth   = mode === 'scope' ? 1 : 1.5;
+
       const step = timeDomain.length / W;
       for (let x = 0; x < W; x++) {
-        const idx  = Math.floor(x * step);
-        const v    = (timeDomain[idx] / 128.0) - 1.0;
-        const y    = (v * H * 0.42) + H / 2;
+        const idx = Math.floor(x * step);
+        const v   = (timeDomain[idx] / 128.0) - 1.0;
+        const y   = (v * H * 0.42) + H / 2;
         x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
       }
       ctx.stroke();
+
       if (mode === 'scope') {
-        // center line
-        ctx.strokeStyle = 'rgba(80,255,200,0.15)';
-        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(80,255,200,0.12)';
+        ctx.lineWidth   = 1;
         ctx.beginPath(); ctx.moveTo(0, H/2); ctx.lineTo(W, H/2); ctx.stroke();
       }
-    } else if (mode === 'dots') {
-      const raw = new Uint8Array(S.analyser.frequencyBinCount);
-      S.analyser.getByteFrequencyData(raw);
-      const bc = 48;
-      for (let i = 0; i < bc; i++) {
-        const idx = Math.floor(i / bc * raw.length * 0.75);
-        const target = raw[idx] / 255;
-        smoothed[i] += (target - smoothed[i]) * 0.22;
-        const x = (i / bc) * W + W / bc / 2;
-        const y = H/2 - smoothed[i] * H * 0.4;
-        const r = 1.5 + smoothed[i] * 4;
-        const a = 0.3 + smoothed[i] * 0.7;
-        const g = ctx.createRadialGradient(x, y, 0, x, y, r * 2);
-        g.addColorStop(0, `rgba(232,255,0,${a})`);
-        g.addColorStop(1, `rgba(80,255,200,0)`);
-        ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI * 2);
-        ctx.fillStyle = g;
-        ctx.fill();
-        // mirror dot below center
-        const y2 = H/2 + smoothed[i] * H * 0.4;
-        const g2 = ctx.createRadialGradient(x, y2, 0, x, y2, r * 2);
-        g2.addColorStop(0, `rgba(150,255,200,${a * 0.6})`);
-        g2.addColorStop(1, `rgba(80,255,200,0)`);
-        ctx.beginPath();
-        ctx.arc(x, y2, r * 0.7, 0, Math.PI * 2);
-        ctx.fillStyle = g2;
-        ctx.fill();
-      }
+
     } else {
-      // bars / mirror
-      const raw = new Uint8Array(S.analyser.frequencyBinCount);
+      // ── FREQUENCY DOMAIN — log-scale FFT ──────────────────────────
+      const raw = new Uint8Array(BIN_COUNT);
       S.analyser.getByteFrequencyData(raw);
-      const bc = 48, bw = W / bc;
 
-      for (let i = 0; i < bc; i++) {
-        const idx = Math.floor(i / bc * raw.length * 0.75);
-        const target = raw[idx] / 255;
-        smoothed[i] += (target - smoothed[i]) * 0.22;
-        const h = smoothed[i] * H;
-        if (peaks[i] < h) { peaks[i] = h; peakDecay[i] = 0; }
-        else { peakDecay[i] += 0.4; peaks[i] = Math.max(0, peaks[i] - peakDecay[i] * 0.012); }
+      const bw = W / BARS;
 
-        const a = 0.4 + smoothed[i] * 0.6;
-        const g = ctx.createLinearGradient(0, H, 0, H - h);
-        g.addColorStop(0, `rgba(232,255,0,${a})`);
-        g.addColorStop(0.7, `rgba(180,255,120,${a * 0.7})`);
-        g.addColorStop(1, `rgba(80,255,200,${a * 0.4})`);
-        ctx.fillStyle = g;
+      for (let i = 0; i < BARS; i++) {
+        // Average a small window around each bin for stability
+        let sum = 0, count = 0;
+        const lo = i > 0       ? barBins[i-1] : 0;
+        const hi = i < BARS-1  ? barBins[i+1] : BIN_COUNT-1;
+        const range = Math.max(1, hi - lo);
+        for (let b = barBins[i]; b < Math.min(BIN_COUNT, barBins[i] + Math.ceil(range/2) + 1); b++) {
+          sum += raw[b]; count++;
+        }
+        const target = (sum / count) / 255;
+
+        // Exponential smoothing — fast attack (0.4), slow decay (0.15)
+        if (target > smoothed[i]) smoothed[i] += (target - smoothed[i]) * 0.4;
+        else                       smoothed[i] += (target - smoothed[i]) * 0.15;
+
+        // Peak hold with gravity
+        if (smoothed[i] > peaks[i]) { peaks[i] = smoothed[i]; peakDecay[i] = 0; }
+        else { peakDecay[i] += 0.35; peaks[i] = Math.max(0, peaks[i] - peakDecay[i] * 0.013); }
+
+        const h   = smoothed[i] * H;
+        const a   = 0.45 + smoothed[i] * 0.55;
+        const bx  = i * bw + 0.5;
+
+        // Colour: deep yellow (bass) → acid yellow (mid) → cyan (treble)
+        const t   = i / BARS;
+        const r   = Math.round(232 - t * 132);   // 232 → 100
+        const g   = Math.round(255);
+        const bl  = Math.round(t * 220);          // 0   → 220
+
+        const grad = ctx.createLinearGradient(0, H, 0, H - h);
+        grad.addColorStop(0, `rgba(${r},${g},${bl},${a})`);
+        grad.addColorStop(0.6, `rgba(${r},${g},${bl},${a * 0.7})`);
+        grad.addColorStop(1,   `rgba(80,255,200,${a * 0.35})`);
+        ctx.fillStyle = grad;
 
         if (mode === 'mirror') {
           const hh = h / 2;
-          ctx.fillRect(i * bw + 0.5, H/2 - hh, bw - 1.5, hh);
-          ctx.fillRect(i * bw + 0.5, H/2, bw - 1.5, hh);
+          ctx.fillRect(bx, H/2 - hh, bw - 1.5, hh);
+          ctx.fillRect(bx, H/2,       bw - 1.5, hh);
           if (peaks[i] > 2) {
             ctx.fillStyle = `rgba(255,255,255,${0.4 + smoothed[i] * 0.5})`;
-            ctx.fillRect(i * bw + 0.5, H/2 - peaks[i]/2 - 1, bw - 1.5, 1.5);
+            ctx.fillRect(bx, H/2 - peaks[i]/2 - 1, bw - 1.5, 1.5);
           }
+        } else if (mode === 'dots') {
+          const y  = H/2 - smoothed[i] * H * 0.42;
+          const r2 = 1.5 + smoothed[i] * 4;
+          const grd = ctx.createRadialGradient(bx + bw/2, y, 0, bx + bw/2, y, r2 * 2);
+          grd.addColorStop(0, `rgba(${r},${g},${bl},${a})`);
+          grd.addColorStop(1, `rgba(80,255,200,0)`);
+          ctx.beginPath();
+          ctx.arc(bx + bw/2, y, r2, 0, Math.PI * 2);
+          ctx.fillStyle = grd;
+          ctx.fill();
+          // Mirror dot
+          const y2  = H/2 + smoothed[i] * H * 0.42;
+          const grd2 = ctx.createRadialGradient(bx + bw/2, y2, 0, bx + bw/2, y2, r2 * 1.5);
+          grd2.addColorStop(0, `rgba(80,255,200,${a * 0.5})`);
+          grd2.addColorStop(1, `rgba(80,255,200,0)`);
+          ctx.beginPath();
+          ctx.arc(bx + bw/2, y2, r2 * 0.7, 0, Math.PI * 2);
+          ctx.fillStyle = grd2;
+          ctx.fill();
         } else {
-          ctx.fillRect(i * bw + 0.5, H - h, bw - 1.5, h);
+          // bars (default)
+          ctx.fillRect(bx, H - h, bw - 1.5, Math.max(1, h));
+          // Peak dot
           if (peaks[i] > 2) {
-            ctx.fillStyle = `rgba(255,255,255,${0.5 + smoothed[i] * 0.5})`;
-            ctx.fillRect(i * bw + 0.5, H - peaks[i] - 1.5, bw - 1.5, 1.5);
+            ctx.fillStyle = `rgba(255,255,255,${0.55 + smoothed[i] * 0.45})`;
+            ctx.fillRect(bx, H - peaks[i] - 1.5, bw - 1.5, 1.5);
           }
         }
       }
@@ -2131,32 +2332,22 @@ function initLiveMiniVis() {
   frame();
 }
 
-// NOTE: AudioContext MediaElementSource is intentionally DISABLED for local file:// playback.
-// Connecting a MediaElementSource to a file:// URL triggers CORS errors in Chromium,
-// which silently mutes the audio. The visualizer uses a simulated animation instead.
-// If serving from http://localhost, you can re-enable the analyser connection below.
+// ensureAudioCtx — resumes the AudioContext if suspended (browser autoplay policy).
+// The analyser is wired in initAudioContext() as part of the main audio chain:
+//   audio (HTMLAudioElement) → EQ → normGain → fadeGain → analyser → destination
+// crossOrigin='anonymous' on the audio element (set at window load) allows
+// createMediaElementSource() to work on http://127.0.0.1 without CORS errors.
 function ensureAudioCtx() {
   try {
-    if (!S.audioCtx) {
-      S.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    // Main AudioContext (EQ + visualiser chain)
+    if (audioContext && audioContext.state === 'suspended') {
+      audioContext.resume().catch(e => console.warn('[MACAN] AudioCtx resume:', e));
     }
-    if (S.audioCtx.state === 'suspended') {
-      S.audioCtx.resume().catch(e => console.warn('[MACAN] AudioCtx resume:', e));
+    // Legacy secondary context (S.audioCtx) — kept for compat, resume only
+    if (S.audioCtx && S.audioCtx.state === 'suspended') {
+      S.audioCtx.resume().catch(e => console.warn('[MACAN] S.audioCtx resume:', e));
     }
-    // Analyser connection disabled — see note above
-    // Uncomment below only if running on http://localhost:
-    /*
-    if (!S.analyser) {
-      S.analyser = S.audioCtx.createAnalyser();
-      S.analyser.fftSize = 256;
-    }
-    if (S.srcNode) { try { S.srcNode.disconnect(); } catch(e){} }
-    S.srcNode = S.audioCtx.createMediaElementSource(mediaEl);
-    S.srcNode.connect(S.analyser);
-    S.analyser.connect(S.audioCtx.destination);
-    initLiveMiniVis();
-    */
-  } catch(e) { console.warn('[MACAN] AudioCtx init error:', e); }
+  } catch(e) { console.warn('[MACAN] ensureAudioCtx error:', e); }
 }
 
 // ─── AUDIO / VIDEO EVENTS ─────────────────────────────────────
