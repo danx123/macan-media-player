@@ -302,6 +302,7 @@ function initAudioContext() {
   // GainNode for fade in/out
   S._fadeGain = audioContext.createGain();
   S._fadeGain.gain.value = 1.0;
+  _gainState = 'full'; // newly created node is always at full gain
 
   // Connect chain: source → EQ → normGain → fadeGain → analyser → destination
   if (!audioSource) {
@@ -605,10 +606,7 @@ function initMediaSessionHandlers() {
       const p = activePlayer();
       if (!p.paused) {
         if (S.fadeEnabled && S._fadeGain && audioContext && !p.isVideo) {
-          doFadeOut(() => {
-            p.pause();
-            if (S._fadeGain) S._fadeGain.gain.setValueAtTime(0.0001, audioContext.currentTime);
-          });
+          doFadeOut(() => { p.pause(); }, 'pause');
         } else {
           p.pause();
         }
@@ -1656,7 +1654,10 @@ async function fetchLyrics(track, forceRefetch = false) {
 // This is important for restored sessions where audio may start before the user
 // explicitly clicks Play.
 function _initAudioCtxOnGesture() {
-  initAudioContext();
+  // Resume suspended context on first gesture (browser autoplay policy)
+  if (audioContext && audioContext.state === 'suspended') {
+    audioContext.resume().catch(() => {});
+  }
   document.removeEventListener('click',   _initAudioCtxOnGesture);
   document.removeEventListener('keydown', _initAudioCtxOnGesture);
 }
@@ -1844,6 +1845,14 @@ async function _doStateRestore() {
           videoLayer.classList.remove('active');
           $('main-layout').style.display = '';
         }
+
+        // FIX: Initialise AudioContext NOW — before audio.src is assigned.
+        // createMediaElementSource() internally reloads the element if src
+        // is already set, causing a 1-2s glitch back to position 0.
+        // Creating the context here (pre-src) avoids that entirely.
+        // AudioContext is allowed to be created without a user gesture;
+        // only resume() requires one — handled by _initAudioCtxOnGesture.
+        initAudioContext();
 
         // FIX: Store seek target BEFORE setting src so onMeta() (which fires
         // on loadedmetadata) can consume it. This eliminates the race between
@@ -2771,6 +2780,9 @@ async function loadTrack(index, autoplay = true) {
     _clearSubtitleTracks();
     videoLayer.classList.remove('active');
     $('main-layout').style.display = '';
+    // Ensure AudioContext + analyser chain is wired before src is set.
+    // Safe to call multiple times — initAudioContext() is idempotent.
+    initAudioContext();
     audio.src = srcUrl; audio.load();
     if (autoplay) doPlay(audio);
   }
@@ -2779,76 +2791,74 @@ async function loadTrack(index, autoplay = true) {
 }
 
 // ─── CROSSFADE ────────────────────────────────────────────────
+// Uses the same single audio element + Web Audio _fadeGain node as
+// normal fade in/out — no secondary Audio element needed.
+// Sequence:
+//   1. Schedule _fadeGain ramp: 1.0 → 0.0001 over crossfadeDuration
+//   2. At halfway point: swap audio.src to the new track, seek to 0
+//   3. Schedule _fadeGain ramp: 0.0001 → 1.0 over second half
+// This is glitch-free because we never create/destroy elements or
+// fight the Web Audio chain — just one gain node, one audio element.
 async function _doCrossfade(index, track, autoplay) {
   // Cancel any in-flight crossfade
   clearTimeout(S._xfadeTimer);
   if (S._xfadeAudio) {
     S._xfadeAudio.pause();
     S._xfadeAudio.src = '';
+    S._xfadeAudio = null;
   }
 
   S.currentIndex = index;
   _onTrackStart(track);
   updateTrackInfo(track);
   updatePlaylistHighlight(index);
-  setStatus(`LOADING — ${track.name}`);
   if (MiniPlayer.isActive()) MiniPlayer.updateMiniInfo();
-  applyNormalization(track);
 
   const srcUrl = await _resolveUrl(track);
   if (!srcUrl) { setStatus('ERROR — NO VALID URL FOR TRACK'); return; }
 
-  const dur = S.crossfadeDuration / 1000;
+  const halfMs = S.crossfadeDuration / 2; // ms per half
 
-  // Incoming audio element
-  const incoming = new Audio();
-  incoming.volume = 0;
-  incoming.src = srcUrl;
-  incoming.load();
-  S._xfadeAudio = incoming;
-
-  // Fade out the current (outgoing) audio
+  // ── Phase 1: fade out current track ─────────────────────────
+  _gainState = 'silent';
   if (S._fadeGain && audioContext) {
     const now = audioContext.currentTime;
+    const dur = halfMs / 1000;
     S._fadeGain.gain.cancelScheduledValues(now);
     S._fadeGain.gain.setValueAtTime(S._fadeGain.gain.value || 1.0, now);
     S._fadeGain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
   }
 
-  // Ramp incoming volume up via DOM property (not Web Audio — keeps it simple)
-  incoming.play().then(() => {
-    setStatus(`PLAYING — ${track.name}`);
-    let elapsed = 0;
-    const step  = 50; // ms
-    const ramp  = setInterval(() => {
-      elapsed += step;
-      incoming.volume = Math.min(1, elapsed / S.crossfadeDuration) * (S.volume / 100);
-      if (elapsed >= S.crossfadeDuration) {
-        clearInterval(ramp);
-        incoming.volume = S.volume / 100;
-        // Swap: stop old audio, rewire incoming as main audio element
-        audio.pause();
-        audio.src = '';
-        audio.src = srcUrl;
-        audio.currentTime = incoming.currentTime;
-        audio.volume = S.volume / 100;
-        incoming.pause();
-        incoming.src = '';
-        S._xfadeAudio = null;
-        // Reset fade gain
-        if (S._fadeGain && audioContext) {
-          S._fadeGain.gain.cancelScheduledValues(audioContext.currentTime);
-          S._fadeGain.gain.setValueAtTime(1.0, audioContext.currentTime);
-        }
-        doPlay(audio);
+  // ── Phase 2: swap src at the midpoint ────────────────────────
+  S._xfadeTimer = setTimeout(() => {
+    S._xfadeTimer = null;
+
+    audio.pause();
+    initAudioContext(); // idempotent — ensures chain is ready
+    applyNormalization(track);
+    audio.src = srcUrl;
+    audio.volume = S.volume / 100;
+    audio.load();
+
+    // Play and fade in once canplay fires
+    const onCanPlay = () => {
+      audio.removeEventListener('canplay', onCanPlay);
+      audio.play().catch(() => {});
+      setStatus(`PLAYING — ${track.name}`);
+
+      // Phase 3: fade in new track
+      if (S._fadeGain && audioContext) {
+        const now = audioContext.currentTime;
+        const dur = halfMs / 1000;
+        S._fadeGain.gain.cancelScheduledValues(now);
+        S._fadeGain.gain.setValueAtTime(0.0001, now);
+        S._fadeGain.gain.exponentialRampToValueAtTime(1.0, now + dur);
       }
-    }, step);
-    S._xfadeTimer = ramp;
-  }).catch(() => {
-    // Fallback to normal load on play error
-    audio.src = srcUrl; audio.load();
-    if (autoplay) doPlay(audio);
-  });
+      _gainState = 'full';
+    };
+    audio.addEventListener('canplay', onCanPlay, { once: true });
+
+  }, halfMs);
 
   scheduleStateSave();
 }
@@ -3037,26 +3047,45 @@ function doPlay(player) {
 }
 
 // ─── FADE IN/OUT ──────────────────────────────────────────────
+// _gainState tracks what the gain is/was scheduled to be:
+//   'full'   = 1.0  (normal playback)
+//   'silent' = 0.0001 (after fade-out for track switch)
+//   'paused' = 0.0001 (after fade-out for pause — resume should NOT fade in)
+let _gainState = 'full';
+
 function doFadeIn() {
   if (!S._fadeGain || !audioContext) return;
   const now = audioContext.currentTime;
-  const dur = S.fadeDuration / 1000;
   S._fadeGain.gain.cancelScheduledValues(now);
-  S._fadeGain.gain.setValueAtTime(0.0001, now);
-  S._fadeGain.gain.exponentialRampToValueAtTime(1.0, now + dur);
+
+  if (_gainState === 'silent') {
+    // Came from a track-switch fade-out — ramp up smoothly
+    const dur = S.fadeDuration / 1000;
+    S._fadeGain.gain.setValueAtTime(0.0001, now);
+    S._fadeGain.gain.exponentialRampToValueAtTime(1.0, now + dur);
+  } else {
+    // Fresh play, restore session, or resume after pause — immediate full gain
+    S._fadeGain.gain.setValueAtTime(1.0, now);
+  }
+  _gainState = 'full';
 }
 
-function doFadeOut(callback) {
-  if (!S._fadeGain || !audioContext) { if (callback) callback(); return; }
+function doFadeOut(callback, reason = 'switch') {
+  // reason: 'switch' = track change (next doFadeIn should ramp)
+  //         'pause'  = user pause  (next doFadeIn should be immediate)
+  if (!S._fadeGain || !audioContext) {
+    _gainState = reason === 'pause' ? 'paused' : 'silent';
+    if (callback) callback();
+    return;
+  }
   const now = audioContext.currentTime;
   const dur = S.fadeDuration / 1000;
   S._fadeGain.gain.cancelScheduledValues(now);
   S._fadeGain.gain.setValueAtTime(S._fadeGain.gain.value || 1.0, now);
   S._fadeGain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
   setTimeout(() => {
+    _gainState = reason === 'pause' ? 'paused' : 'silent';
     if (callback) callback();
-    // Reset gain so next fade-in works
-    if (S._fadeGain) S._fadeGain.gain.setValueAtTime(1.0, audioContext.currentTime);
   }, S.fadeDuration + 50);
 }
 
@@ -3353,11 +3382,7 @@ function togglePlayPause() {
   } else {
     // Fade out then pause — only for audio tracks, not video
     if (S.fadeEnabled && S._fadeGain && audioContext && !p.isVideo) {
-      doFadeOut(() => {
-        p.pause();
-        // Reset gain so next doFadeIn starts from silence correctly
-        if (S._fadeGain) S._fadeGain.gain.setValueAtTime(0.0001, audioContext.currentTime);
-      });
+      doFadeOut(() => { p.pause(); }, 'pause');
     } else {
       p.pause();
     }
