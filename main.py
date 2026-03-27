@@ -40,8 +40,48 @@ GUI_BACKEND = 'edgechromium' if sys.platform == 'win32' else 'qt'
 # Must be set before webview.start() is called (env var is read at process start).
 if sys.platform == 'win32':
     _wv2_flags = ' '.join([
+        # ── Media Session / SMTC ─────────────────────────────────────────────
+        # Required for OS overlay, taskbar thumbnail, hardware media keys.
         '--enable-features=HardwareMediaKeyHandling,MediaSessionService',
         '--autoplay-policy=no-user-gesture-required',
+
+        # ── Disable unused browser subsystems ────────────────────────────────
+        # Each of these spawns background threads / network activity that waste
+        # CPU and RAM on low-spec machines without providing any benefit to a
+        # media player that has no extensions, sync, or translate needs.
+        '--disable-extensions',
+        '--disable-sync',
+        '--disable-translate',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-component-update',
+        '--disable-domain-reliability',
+        '--disable-client-side-phishing-detection',
+        '--disable-hang-monitor',
+        '--disable-prompt-on-repost',
+        '--disable-features=TranslateUI,ChromeWhatsNew,PrivacySandboxSettings4',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--no-pings',
+
+        # ── GPU / Rendering ──────────────────────────────────────────────────
+        # GPU rasterization offloads canvas/CSS compositing to the GPU —
+        # cheaper than software rasterization on integrated graphics.
+        # Zero-copy reduces CPU↔GPU memory transfers for video frames.
+        '--enable-gpu-rasterization',
+        '--enable-zero-copy',
+        '--enable-oop-rasterization',
+
+        # ── V8 / Memory ──────────────────────────────────────────────────────
+        # Cap the V8 old-space heap. A media player UI does not need a large
+        # JS heap — 192 MB is generous. On low-spec machines this prevents
+        # the renderer from ballooning into swap.
+        '--js-flags=--max-old-space-size=192',
+
+        # ── Misc ─────────────────────────────────────────────────────────────
+        '--disable-ipc-flooding-protection',  # allow fast pywebview IPC calls
+        '--disable-renderer-backgrounding',   # don't throttle when window loses focus
+        '--disable-backgrounding-occluded-windows',
     ])
     _existing = os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', '')
     if '--enable-features=HardwareMediaKeyHandling' not in _existing:
@@ -129,15 +169,46 @@ class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
 
 
 class _SilentTCPServer(socketserver.ThreadingTCPServer):
-    """ThreadingTCPServer that silences client-disconnect errors (WinError 10053/10054)."""
+    """ThreadingTCPServer backed by a bounded thread pool.
+
+    The default ThreadingTCPServer spawns a new thread per request —
+    unbounded. On low-spec machines, simultaneous requests (seeking,
+    cover-art fetches, playlist loading) can spawn dozens of threads,
+    exhausting the OS thread pool and causing latency spikes.
+
+    Fix: override process_request() to dispatch to a fixed-size
+    ThreadPoolExecutor instead of spawning raw threads.  A pool of
+    MAX_WORKERS threads is more than enough for a local media server —
+    requests are fast (local disk reads) and short-lived.
+    """
+
+    # 6 workers: enough for concurrent seeking + art + 2-3 playlist items.
+    # Raising this beyond ~8 gives diminishing returns on HDDs (seek contention).
+    MAX_WORKERS = 6
+
+    allow_reuse_address = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from concurrent.futures import ThreadPoolExecutor
+        self._pool = ThreadPoolExecutor(
+            max_workers=self.MAX_WORKERS,
+            thread_name_prefix='MediaSrv',
+        )
+
+    def process_request(self, request, client_address):
+        """Submit request to thread pool instead of spawning a new thread."""
+        self._pool.submit(self.process_request_thread, request, client_address)
+
+    def server_close(self):
+        self._pool.shutdown(wait=False)
+        super().server_close()
+
     def handle_error(self, request, client_address):
-        import sys
         exc = sys.exc_info()[1]
-        # Silently ignore normal client-abort / connection-reset errors
         if isinstance(exc, (ConnectionAbortedError, ConnectionResetError,
                             BrokenPipeError, OSError)):
             return
-        # Let anything unexpected propagate to stderr
         super().handle_error(request, client_address)
 
 
