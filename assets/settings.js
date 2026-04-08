@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// MACAN MEDIA PLAYER — SETTINGS MODULE  (Patch 17)
+// MACAN MEDIA PLAYER — SETTINGS MODULE  (Patch 10)
 //
 // Features:
 //   1. CUSTOMIZE BUTTONS — show/hide toolbar buttons individually
@@ -47,20 +47,55 @@ const Settings = (() => {
   let _current = {};  // live settings in memory
   let _auraCanvas = null; // offscreen canvas for color extraction
 
-  // ── Storage ─────────────────────────────────────────────────
+  // ── Storage — Python SQLite backend ─────────────────────────
+  // settings.js previously used localStorage which is not reliably
+  // flushed to disk by WebView2 before the window is destroyed.
+  // Now uses pywebview.api.save_settings() / get_settings() — the same
+  // Python SQLite DB that persists all other app state.
+  // Falls back to localStorage for non-pywebview environments (dev/test).
+
   function _load() {
+    // Synchronous load from _current (populated async at startup by _loadFromPython)
+    // Returns DEFAULTS merge with whatever _pythonSettings holds.
     try {
-      const saved = JSON.parse(localStorage.getItem(SK));
+      const saved = _pythonSettings;
       const merged = _deepMerge(JSON.parse(JSON.stringify(DEFAULTS)), saved || {});
-      // Migration: ensure any new button keys from DEFAULTS are present
-      // (users upgrading from older versions won't have them in localStorage)
+      // Migration: ensure new button keys are always present as true
       Object.keys(DEFAULTS.buttons).forEach(id => {
         if (merged.buttons[id] === undefined) merged.buttons[id] = true;
       });
       return merged;
     } catch { return JSON.parse(JSON.stringify(DEFAULTS)); }
   }
+
+  // In-memory cache of Python-loaded settings
+  let _pythonSettings = null;
+
+  async function _loadFromPython() {
+    try {
+      if (typeof pywebview !== 'undefined') {
+        const saved = await pywebview.api.get_settings();
+        // get_settings returns the full settings kv store — look for our key
+        _pythonSettings = saved && saved['ui_settings']
+          ? saved['ui_settings']
+          : null;
+      }
+    } catch(e) {
+      console.warn('[Settings] _loadFromPython failed:', e);
+    }
+    // Re-apply with freshly loaded data
+    _current = _load();
+    applyAll(_current);
+  }
+
   function _save(s) {
+    // Persist to Python SQLite — reliable across restarts
+    if (typeof pywebview !== 'undefined') {
+      pywebview.api.save_settings({ ui_settings: s }).catch(e =>
+        console.warn('[Settings] save_settings failed:', e)
+      );
+    }
+    // Also keep localStorage as fallback
     try { localStorage.setItem(SK, JSON.stringify(s)); } catch {}
   }
   function _deepMerge(base, over) {
@@ -387,8 +422,21 @@ const Settings = (() => {
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && isOpen) close(); });
 
   // ── Init ─────────────────────────────────────────────────────
+  // Phase 1 — apply immediately from localStorage fallback so buttons
+  // are hidden/shown before first paint (no flash of wrong state).
+  _pythonSettings = (() => {
+    try { return JSON.parse(localStorage.getItem(SK)); } catch { return null; }
+  })();
   _current = _load();
-  applyAll(_current); // apply on startup
+  applyAll(_current);
+
+  // Phase 2 — load authoritative values from Python SQLite and re-apply.
+  // Deferred until pywebview bridge is ready.
+  if (typeof pywebview !== 'undefined') {
+    _loadFromPython();
+  } else {
+    window.addEventListener('pywebviewready', () => _loadFromPython(), { once: true });
+  }
 
   // Re-export swatch update for applyArt hook
   setInterval(() => { if (isOpen) _updateAuraSwatch(); }, 500);
