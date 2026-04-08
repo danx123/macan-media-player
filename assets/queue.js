@@ -218,8 +218,9 @@ const Queue = (() => {
       if (e.key === 'Escape' && _panelOpen) closePanel();
     });
 
-    // Ensure btn-up-next is visible regardless of settings state
-    if (btnOpen) btnOpen.style.removeProperty('display');
+    // Note: btn-up-next visibility is controlled exclusively by settings.js
+    // (_applyButtons). Do NOT force-show it here — that would override the
+    // user's saved preference and make the hide setting non-persistent.
 
     _updateBadge();
   }
