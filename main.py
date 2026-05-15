@@ -2044,6 +2044,136 @@ class MacanMediaAPI:
         except Exception as e:
             return {'ok': False, 'error': str(e)}
 
+    # ─── PLUGIN MANAGER ──────────────────────────────────────────────────────
+    # Plugins are .js files stored in assets/plugins/.
+    # plugins.config.js references them by path — pm_set_enabled toggles
+    # the comment-out status of a line in plugins.config.js.
+
+    def _get_plugins_dir(self) -> Path:
+        base = Path(os.path.dirname(os.path.abspath(__file__))) / 'assets' / 'plugins'
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    def _get_plugins_config_path(self) -> Path:
+        return Path(os.path.dirname(os.path.abspath(__file__))) / 'assets' / 'plugins.config.js'
+
+    def pm_list_plugins(self) -> list:
+        """Return list of dicts: {filename, enabled, size_bytes, size_str}."""
+        plugins_dir = self._get_plugins_dir()
+        config_path = self._get_plugins_config_path()
+
+        # Read enabled plugin paths from plugins.config.js
+        enabled_set = set()
+        try:
+            import re as _re
+            config_text = config_path.read_text(encoding='utf-8')
+            # Match uncommented lines like: 'plugins/foo.js',
+            for m in _re.finditer(r"^\s*'(plugins/[^']+\.js)'", config_text, _re.MULTILINE):
+                enabled_set.add(m.group(1).split('/')[-1])
+        except Exception as e:
+            print(f"[PluginManager] Could not read plugins.config.js: {e}")
+
+        result = []
+        try:
+            for p in sorted(plugins_dir.iterdir()):
+                if p.suffix.lower() == '.js' and p.is_file():
+                    sz = p.stat().st_size
+                    result.append({
+                        'filename':   p.name,
+                        'enabled':    p.name in enabled_set,
+                        'size_bytes': sz,
+                        'size_str':   self._fmt_bytes(sz),
+                    })
+        except Exception as e:
+            print(f"[PluginManager] pm_list_plugins error: {e}")
+        return result
+
+    def pm_add_plugin(self) -> dict:
+        """Open a file dialog to pick a .js plugin file, copy it to assets/plugins/."""
+        try:
+            result = self._open_dialog(
+                allow_multiple=False,
+                file_types=('JavaScript Plugin (*.js)', 'All files (*.*)')
+            )
+            if not result or len(result) == 0:
+                return {'ok': False, 'error': 'cancelled'}
+
+            src = Path(result[0])
+            if not src.exists() or src.suffix.lower() != '.js':
+                return {'ok': False, 'error': 'Invalid file. Must be a .js file.'}
+
+            dest = self._get_plugins_dir() / src.name
+            import shutil as _shutil
+            _shutil.copy2(str(src), str(dest))
+            print(f"[PluginManager] Added plugin: {dest.name}")
+            return {'ok': True, 'filename': dest.name}
+        except Exception as e:
+            print(f"[PluginManager] pm_add_plugin error: {e}")
+            return {'ok': False, 'error': str(e)}
+
+    def pm_remove_plugin(self, filename: str) -> dict:
+        """Delete a plugin .js file from assets/plugins/ and remove it from config."""
+        try:
+            dest = self._get_plugins_dir() / Path(filename).name
+            if dest.exists():
+                dest.unlink()
+            # Also disable in config if present
+            self.pm_set_enabled(filename, False)
+            print(f"[PluginManager] Removed plugin: {filename}")
+            return {'ok': True}
+        except Exception as e:
+            print(f"[PluginManager] pm_remove_plugin error: {e}")
+            return {'ok': False, 'error': str(e)}
+
+    def pm_set_enabled(self, filename: str, enabled: bool) -> dict:
+        """Toggle a plugin line in plugins.config.js by commenting/uncommenting it."""
+        import re as _re
+        config_path = self._get_plugins_config_path()
+        try:
+            text = config_path.read_text(encoding='utf-8')
+            safe_name = Path(filename).name
+            plugin_path = f"plugins/{safe_name}"
+
+            if enabled:
+                # Uncomment: '// \'plugins/foo.js\''  →  '\'plugins/foo.js\','
+                # Handle lines that are commented out
+                new_text = _re.sub(
+                    r"(\s*)//\s*('\"?)(" + _re.escape(plugin_path) + r")('\"?,?)",
+                    lambda m: f"{m.group(1)}'{plugin_path}',",
+                    text
+                )
+                # If still not present at all, inject before the closing bracket
+                if plugin_path not in new_text:
+                    new_text = new_text.replace(
+                        '    // ───────────────────────────────────────────────────────',
+                        f"    '{plugin_path}',\n    // ───────────────────────────────────────────────────────",
+                        1
+                    )
+                    # Fallback: insert before the closing ] of PLUGINS
+                    if plugin_path not in new_text:
+                        new_text = _re.sub(
+                            r'(const PLUGINS\s*=\s*\[)',
+                            r"\1\n    '" + plugin_path + "',",
+                            new_text,
+                            count=1
+                        )
+            else:
+                # Comment out the active line
+                new_text = _re.sub(
+                    r"^(\s*)('\"?)(" + _re.escape(plugin_path) + r")('\"?,?)\s*$",
+                    lambda m: f"{m.group(1)}// '{plugin_path}',",
+                    text,
+                    flags=_re.MULTILINE
+                )
+
+            config_path.write_text(new_text, encoding='utf-8')
+            action = 'enabled' if enabled else 'disabled'
+            print(f"[PluginManager] Plugin {action}: {safe_name}")
+            return {'ok': True}
+        except Exception as e:
+            print(f"[PluginManager] pm_set_enabled error: {e}")
+            return {'ok': False, 'error': str(e)}
+
     # ─── PRIVATE: DIALOG WRAPPERS ─────────────────────────────────────────────
 
     def _open_dialog(self, allow_multiple=False, file_types=()):
