@@ -587,6 +587,86 @@ class MacanMediaAPI:
 
     def set_window(self, window):
         self._window = window
+        # Start taskbar autohide detection after window is assigned
+        if sys.platform == 'win32':
+            self._start_taskbar_watcher()
+
+    # ─── TASKBAR AUTOHIDE DETECTION (Windows) ────────────────────────────────
+    # Adapted from taskbar.py: when the window is fullscreen, Windows taskbar
+    # with "auto-hide" enabled won't peek through because the window covers the
+    # full screen height.  The fix (same trick as taskbar.py's height - 1) is
+    # to temporarily shrink the window by 1 pixel whenever the mouse approaches
+    # the bottom edge — that 1-pixel gap lets Windows trigger the taskbar peek.
+    # When the mouse moves away, the window is restored to full height.
+
+    def _start_taskbar_watcher(self):
+        """Spawn a background thread that polls the cursor position and
+        shrinks/restores the window height to allow taskbar autohide to work."""
+        import ctypes
+        import ctypes.wintypes
+
+        THRESHOLD_PX   = 2    # pixels from screen bottom that trigger shrink
+        POLL_INTERVAL  = 0.05 # seconds between cursor polls (50 ms)
+
+        self._taskbar_shrunken = False
+
+        def _get_screen_size():
+            """Return (width, height) of the primary monitor's work area."""
+            try:
+                user32 = ctypes.windll.user32
+                # SM_CXSCREEN / SM_CYSCREEN give the full physical resolution
+                w = user32.GetSystemMetrics(0)   # SM_CXSCREEN
+                h = user32.GetSystemMetrics(1)   # SM_CYSCREEN
+                return w, h
+            except Exception:
+                return 1920, 1080  # safe fallback
+
+        def _get_cursor_y():
+            """Return the current cursor Y coordinate in screen pixels."""
+            try:
+                pt = ctypes.wintypes.POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                return pt.y
+            except Exception:
+                return 0
+
+        def _watcher():
+            import time
+            screen_w, screen_h = _get_screen_size()
+            print(f"[MACAN] Taskbar watcher started — screen {screen_w}×{screen_h}")
+
+            while True:
+                try:
+                    cursor_y   = _get_cursor_y()
+                    near_bottom = cursor_y >= screen_h - THRESHOLD_PX
+
+                    if near_bottom and not self._taskbar_shrunken:
+                        # Shrink window by 1 px at the bottom — same trick as
+                        # taskbar.py's (screen_geom.height() - 1).
+                        # pywebview exposes window.resize(w, h) and window.move(x, y).
+                        try:
+                            self._window.resize(screen_w, screen_h - 1)
+                            self._taskbar_shrunken = True
+                            print("[MACAN] Taskbar gap opened (height - 1)")
+                        except Exception as e:
+                            print(f"[MACAN] Taskbar shrink error: {e}")
+
+                    elif not near_bottom and self._taskbar_shrunken:
+                        # Restore full-screen height once cursor moves away
+                        try:
+                            self._window.resize(screen_w, screen_h)
+                            self._taskbar_shrunken = False
+                            print("[MACAN] Taskbar gap closed (height restored)")
+                        except Exception as e:
+                            print(f"[MACAN] Taskbar restore error: {e}")
+
+                except Exception as e:
+                    print(f"[MACAN] Taskbar watcher error: {e}")
+
+                time.sleep(POLL_INTERVAL)
+
+        t = threading.Thread(target=_watcher, name='TaskbarWatcher', daemon=True)
+        t.start()
 
     # ─── WINDOW MANAGEMENT ───────────────────────────────────────────────────
 
