@@ -2101,10 +2101,38 @@ const VIS_MODE_LABELS = {
   mirror: 'MIRROR BARS',
   dots:   'DOT STORM',
 };
-let currentVisMode = 0; // index into VIS_MODES
+// Restore saved vis mode — try Python SQLite first (most reliable),
+// fall back to localStorage as immediate cache before pywebview is ready.
+let currentVisMode = (() => {
+  try {
+    const saved = parseInt(localStorage.getItem('macan_vis_mode') || '0', 10);
+    return (saved >= 0 && saved < VIS_MODES.length) ? saved : 0;
+  } catch { return 0; }
+})();
+
+// Once pywebview is ready, sync from Python SQLite (authoritative source)
+function _restoreVisModeFromPython() {
+  if (typeof pywebview === 'undefined') return;
+  pywebview.api.get_settings().then(s => {
+    if (s && typeof s.vis_mode === 'number' && s.vis_mode >= 0 && s.vis_mode < VIS_MODES.length) {
+      currentVisMode = s.vis_mode;
+      try { localStorage.setItem('macan_vis_mode', String(currentVisMode)); } catch {}
+      // Restart visualizer with restored mode
+      if (S.analyser) initLiveMiniVis();
+      else initIdleMiniVis();
+    }
+  }).catch(() => {});
+}
+window.addEventListener('pywebviewready', _restoreVisModeFromPython, { once: true });
+if (typeof pywebview !== 'undefined') _restoreVisModeFromPython();
 
 function cycleVisMode() {
   currentVisMode = (currentVisMode + 1) % VIS_MODES.length;
+  // Persist to both localStorage (instant) and Python SQLite (durable across cache clears)
+  try { localStorage.setItem('macan_vis_mode', String(currentVisMode)); } catch {}
+  if (typeof pywebview !== 'undefined') {
+    pywebview.api.save_settings({ vis_mode: currentVisMode }).catch(() => {});
+  }
   const label = document.getElementById('vis-mode-label');
   if (label) {
     label.textContent = VIS_MODE_LABELS[VIS_MODES[currentVisMode]];
