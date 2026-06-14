@@ -1091,7 +1091,22 @@ class MacanMediaAPI:
         abs_path = str(p.resolve())
 
         meta = self._read_tags(abs_path, ext, is_video)
-        duration = meta.get('duration') or 0  # skip _get_duration() — it spawns ffprobe
+        duration = meta.get('duration') or 0
+
+        # FIX: For videos, mutagen sometimes can't parse container duration
+        # (e.g. some AVI/WMV/MKV variants). Fall back to a quick cv2 probe —
+        # still much cheaper than spawning ffprobe.
+        if is_video and not duration:
+            try:
+                import cv2
+                cap = cv2.VideoCapture(abs_path)
+                fps    = cap.get(cv2.CAP_PROP_FPS)
+                frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                cap.release()
+                if fps and fps > 0 and frames > 0:
+                    duration = int(frames / fps)
+            except Exception:
+                pass
 
         display_name = meta.get('title') or p.stem
         artist       = meta.get('artist') or ''
@@ -2426,9 +2441,23 @@ class MacanMediaAPI:
         return paths
 
     def _read_tags(self, path, ext, is_video):
-        """Read title, artist, album, duration from file tags."""
+        """Read title, artist, album, duration from file tags.
+
+        For video files, tag fields (title/artist/album) are skipped, but
+        duration IS read via mutagen's container parser (MP4/MKV/etc.) —
+        this is fast (no ffprobe spawn) and works for most common formats.
+        """
         result = {}
         if is_video:
+            # FIX: read duration from container metadata for videos too.
+            # mutagen.File() parses MP4/MOV/MKV/WEBM/AVI atoms/headers without
+            # spawning ffprobe — cheap enough for bulk scans.
+            try:
+                media_file = mutagen.File(path)
+                if media_file and media_file.info and getattr(media_file.info, 'length', 0):
+                    result['duration'] = int(media_file.info.length)
+            except Exception as e:
+                print(f"[Tags] Could not read video duration for {path}: {e}")
             return result
         try:
             audio_file = mutagen.File(path, easy=True)
