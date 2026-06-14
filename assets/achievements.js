@@ -6,7 +6,6 @@
 
 const AchievementSystem = (() => {
   const SK_UNLOCKED  = 'macan_achievements';
-  const SK_NOTIFIED  = 'macan_ach_notified';
   let isOpen = false;
 
   // ── Achievement Definitions ────────────────────────────────
@@ -316,25 +315,26 @@ const AchievementSystem = (() => {
   }
 
   // ── Check and unlock ─────────────────────────────────────────
+  // FIX: SK_NOTIFIED was unreliable as a secondary guard — if it drifted
+  // out of sync with SK_UNLOCKED (e.g. localStorage cleared partially, or
+  // notified[] not persisted before the next _checkAll call), toast would
+  // fire again for already-unlocked achievements.
+  // Single source of truth: an achievement is new IFF it wasn't in the
+  // unlocked list BEFORE this check run. We snapshot the pre-check set,
+  // then only toast IDs that are genuinely newly added this call.
   function _checkAll() {
     const unlocked = _loadUnlocked();
-    const notified = (() => {
-      try { return JSON.parse(localStorage.getItem(SK_NOTIFIED)) || []; }
-      catch { return []; }
-    })();
+    const unlockedSet = new Set(unlocked); // snapshot before this run
     const stats = _buildStats();
     let changed = false;
 
     ACHIEVEMENTS.forEach(ach => {
-      if (!unlocked.includes(ach.id) && ach.check(stats)) {
+      if (!unlockedSet.has(ach.id) && ach.check(stats)) {
         unlocked.push(ach.id);
+        unlockedSet.add(ach.id);
         changed = true;
-        // Show toast notification if not yet notified
-        if (!notified.includes(ach.id)) {
-          notified.push(ach.id);
-          try { localStorage.setItem(SK_NOTIFIED, JSON.stringify(notified)); } catch {}
-          _showToast(ach);
-        }
+        // Only toast for achievements newly unlocked in THIS call
+        _showToast(ach);
       }
     });
 
@@ -445,6 +445,9 @@ const AchievementSystem = (() => {
 
   // ── Init ────────────────────────────────────────────────────
   _initInstallDate();
+  // Clean up legacy 'macan_ach_notified' key that was used as a secondary
+  // notification guard — now replaced by SK_UNLOCKED as single source of truth.
+  try { localStorage.removeItem('macan_ach_notified'); } catch {}
   _updateMenuBadge();
   setTimeout(_checkAll, 1500); // check on startup after other modules load
 
