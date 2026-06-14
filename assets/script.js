@@ -1472,6 +1472,17 @@ lyricsRefetch.addEventListener('click', () => {
   }
 });
 
+// ── Load lyrics from local .lrc / .txt file ──────────────────
+const lyricsFileInput = document.getElementById('lyrics-file-input');
+document.getElementById('lyrics-load-file').addEventListener('click', () => {
+  lyricsFileInput.value = '';   // reset so same file can be picked again
+  lyricsFileInput.click();
+});
+lyricsFileInput.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (file) loadLyricsFromFile(file);
+});
+
 function toggleLyrics() {
   if (S.lyricsOpen) {
     closeLyrics();
@@ -1621,6 +1632,75 @@ function highlightCurrentLyricLine() {
   }
 }
 
+// ─── LOAD LYRICS FROM LOCAL FILE (.lrc / .txt) ───────────────
+// Allows the user to manually load a lyrics file from disk.
+// .lrc  → parsed as synced lyrics (LRC format, timestamps required)
+// .txt  → loaded as plain-text lyrics (no sync)
+function loadLyricsFromFile(file) {
+  const track = S.currentIndex >= 0 ? S.playlist[S.currentIndex] : null;
+  const ext    = file.name.split('.').pop().toLowerCase();
+
+  // Show loading state
+  if (track) {
+    lyricsTrackName.textContent  = track.name;
+    lyricsArtistName.textContent = track.artist ? track.artist.toUpperCase() : '—';
+  }
+  lyricsStatus.textContent      = 'LOADING FILE...';
+  lyricsSyncBadge.style.display = 'none';
+  lyricsRefetch.style.display   = 'none';
+  lyricsBody.innerHTML = `
+    <div class="lyrics-loading">
+      <div class="lyrics-spinner"></div>
+      <span>READING ${esc(file.name.toUpperCase())}</span>
+    </div>`;
+
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const raw = ev.target.result;
+    if (!raw || !raw.trim()) {
+      lyricsStatus.textContent    = 'EMPTY FILE';
+      lyricsRefetch.style.display = 'inline-block';
+      lyricsBody.innerHTML = `
+        <div class="lyrics-not-found">
+          <p>FILE IS EMPTY</p>
+          <small style="font-size:9px;color:var(--text-lo)">The selected file has no content.</small>
+        </div>`;
+      return;
+    }
+
+    // Detect synced (.lrc) vs plain (.txt or .lrc without timestamps)
+    const hasTimestamps = /\[\d{1,3}:\d{2}/.test(raw);
+    const isSynced      = ext === 'lrc' && hasTimestamps;
+
+    const data = {
+      content:   raw,
+      is_synced: isSynced,
+      source:    'local_file',
+      filename:  file.name,
+    };
+
+    renderLyrics(data, track);
+
+    // Update status badge
+    lyricsStatus.textContent    = isSynced ? 'SYNCED (LRC)' : 'PLAIN TEXT';
+    lyricsRefetch.style.display = 'inline-block';   // allow retry/re-fetch
+
+    // Badge label reflects local file origin
+    lyricsSyncBadge.textContent    = isSynced ? 'SYNCED' : 'LOCAL';
+    lyricsSyncBadge.style.display  = 'inline-block';
+  };
+  reader.onerror = () => {
+    lyricsStatus.textContent    = 'READ ERROR';
+    lyricsRefetch.style.display = 'inline-block';
+    lyricsBody.innerHTML = `
+      <div class="lyrics-not-found">
+        <p>COULD NOT READ FILE</p>
+        <small style="font-size:9px;color:var(--text-lo)">Check file permissions or try again.</small>
+      </div>`;
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
 async function fetchLyrics(track, forceRefetch = false) {
   if (!track || track.is_video) { showLyricsIdle(); return; }
   showLyricsLoading(track);
@@ -1683,7 +1763,6 @@ window.addEventListener('load', () => {
   setupVcSeekbar();
   setupVideoControls();
   setupVideoContextMenu();
-  initNextCountdown();
 
   audio.volume = S.volume / 100;
   video.volume = S.volume / 100;
@@ -3362,21 +3441,6 @@ function onTimeUpdate() {
     }
   }
 
-  // ── Next track countdown (video only) ─────────────────────────
-  // Tampilkan overlay countdown 10 detik sebelum video berikutnya
-  if (S.duration > 0 && S.isPlaying
-      && S.playlist[S.currentIndex]?.is_video
-      && videoLayer.classList.contains('active')) {
-    const _remaining = S.duration - cur;
-    if (_remaining > 0 && _remaining <= 10 && _getNextTrackIndex() >= 0) {
-      _showNextCountdown(_remaining);
-    } else if (_countdownActive) {
-      _hideNextCountdown();
-    }
-  } else if (_countdownActive) {
-    _hideNextCountdown();
-  }
-
   // FIX: Periodic state save every ~10s using wall-clock time
   const now = Date.now();
   if (!S._lastStateSaveWallMs || now - S._lastStateSaveWallMs > 10000) {
@@ -3400,8 +3464,6 @@ function onTimeUpdate() {
 
 // ─── TRACK END ────────────────────────────────────────────────
 function onEnded() {
-  // Hide countdown overlay when track ends naturally
-  _hideNextCountdown();
   // Bridge: notify plugins track finished naturally
   window.MacanBridge?.emit('player:end', { track: S.playlist[S.currentIndex] || null });
 
@@ -3635,11 +3697,8 @@ window.onTrackBatchReady = function(tracks, done) {
   const startIdx = S.playlist.length;
   S.playlist.push(...newTracks);
 
-  // Normalize duration_str + update cached total duration incrementally
-  for (const t of newTracks) {
-    if (!t.duration_str && t.duration > 0) t.duration_str = formatTime(t.duration);
-    _cachedTotalDuration += (t.duration || 0);
-  }
+  // Update cached total duration incrementally (no full reduce needed)
+  for (const t of newTracks) _cachedTotalDuration += (t.duration || 0);
 
   // Seed caches for the new tracks only
   for (const t of newTracks) {
@@ -3786,7 +3845,7 @@ function _buildPlaylistItem(track, realIdx) {
       <span class="pl-item-artist">${track.artist ? esc(track.artist) : ''}</span>
       <span class="pl-item-ext">${track.ext || ''}</span>
     </div>
-    <span class="pl-item-duration">${track.duration_str || (track.duration > 0 ? formatTime(track.duration) : '--:--')}</span>
+    <span class="pl-item-duration">${track.duration_str || '--:--'}</span>
     <span class="pl-item-type ${track.is_video ? 'video' : ''}">
       ${track.is_video
         ? '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" style="margin-right:3px;opacity:.7"><polygon points="23,7 16,12 23,17"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>VIDEO'
@@ -3865,11 +3924,6 @@ function _appendPlaylistRows(tracks, startIdx) {
 }
 
 function renderPlaylist() {
-  // Ensure duration_str is populated for all tracks (Python only provides duration in seconds)
-  for (const t of S.playlist) {
-    if (!t.duration_str && t.duration > 0) t.duration_str = formatTime(t.duration);
-  }
-
   const list = filterQ
     ? S.playlist.filter(t => t.name.toLowerCase().includes(filterQ))
     : S.playlist;
@@ -4073,64 +4127,6 @@ function setupVideoContextMenu() {
     if (!track) return;
     showContextMenu(e.clientX, e.clientY, track);
   });
-}
-
-// ─── NEXT TRACK COUNTDOWN OVERLAY ─────────────────────────────
-// Overlay countdown 10 detik sebelum track berikutnya (video mode).
-// Ditempatkan di pojok kanan bawah di atas seekbar video.
-let _countdownEl     = null;
-let _countdownActive = false;
-
-function initNextCountdown() {
-  _countdownEl = document.createElement('div');
-  _countdownEl.id = 'vc-next-countdown';
-  _countdownEl.innerHTML = [
-    '<div class="vnc-label">UP NEXT</div>',
-    '<div class="vnc-title" id="vnc-next-title"></div>',
-    '<div class="vnc-row">',
-    '  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="opacity:.65;flex-shrink:0">',
-    '    <polygon points="5,4 15,12 5,20"/><line x1="19" y1="4" x2="19" y2="20"/>',
-    '  </svg>',
-    '  <span class="vnc-secs" id="vnc-secs-val">10</span>',
-    '  <span class="vnc-secs-label">SEC</span>',
-    '</div>',
-  ].join('');
-  // Sisipkan ke dalam #video-controls agar ikut tersembunyi saat autohide
-  if (videoControls) videoControls.appendChild(_countdownEl);
-}
-
-function _showNextCountdown(secondsLeft) {
-  if (!_countdownEl) return;
-  const nextIdx = _getNextTrackIndex();
-  if (nextIdx < 0) { _hideNextCountdown(); return; }
-
-  const nextName = S.playlist[nextIdx]?.name || '';
-  const secsEl   = document.getElementById('vnc-secs-val');
-  const titleEl  = document.getElementById('vnc-next-title');
-  if (titleEl)  { titleEl.textContent = nextName; titleEl.title = nextName; }
-  if (secsEl)   secsEl.textContent = Math.max(0, Math.ceil(secondsLeft));
-
-  if (!_countdownActive) {
-    _countdownEl.classList.add('active');
-    _countdownActive = true;
-  }
-}
-
-function _hideNextCountdown() {
-  if (!_countdownEl || !_countdownActive) return;
-  _countdownEl.classList.remove('active');
-  _countdownActive = false;
-}
-
-function _getNextTrackIndex() {
-  if (!S.playlist.length) return -1;
-  if (S.isShuffle) return -1; // shuffle: tidak bisa tahu next
-  if (S.repeatMode === 'one') return -1; // repeat one: tidak beralih
-  const next = S.currentIndex + 1;
-  if (next >= S.playlist.length) {
-    return S.repeatMode === 'all' ? 0 : -1;
-  }
-  return next;
 }
 
 // ─── FILE PROPERTIES MODAL ────────────────────────────────────
