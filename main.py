@@ -1,4 +1,5 @@
 import os
+import ctypes
 import sys
 import json
 import base64
@@ -2842,7 +2843,75 @@ class MacanMediaAPI:
             print(f"[MACAN] Save playlist error: {e}")
 
 
+def _register_aumid_for_smtc():
+    """
+    Register the App User Model ID (AUMID) into the registry and set it on
+    the current process so Windows SMTC (System Media Transport Controls)
+    can resolve the correct application name and icon.
+
+    Without this, the OS media overlay / system tray shows "Unknown App"
+    even if SetCurrentProcessExplicitAppUserModelID() is called, because
+    Windows still needs a registry entry under:
+        HKCU\\Software\\Classes\\AppUserModelId\\<AUMID>
+    to map the ID to a human-readable name and executable icon.
+
+    This writes to HKEY_CURRENT_USER only — no admin privilege required.
+    The key is created/updated on every launch so it survives profile wipes.
+    """
+    if sys.platform != 'win32':
+        return
+
+    AUMID       = 'MacanAngkasa.MacanMediaPlayer.App'
+    APP_NAME    = 'Macan Media Player'
+    REG_PATH    = r'Software\Classes\AppUserModelId\{}'.format(AUMID)
+    EXE_PATH    = sys.executable  # path to python.exe or the frozen .exe
+
+    # If running as a PyInstaller bundle, sys.executable is the actual .exe
+    # If running as a script, use python.exe — icon won't be custom, but
+    # the app name will still show correctly in SMTC.
+    try:
+        frozen_exe = getattr(sys, '_MEIPASS', None)
+        if frozen_exe:
+            # PyInstaller bundle: use the bundle's own executable
+            EXE_PATH = os.path.abspath(sys.executable)
+        else:
+            # Dev mode: try to find main2.py's directory for a possible icon
+            EXE_PATH = os.path.abspath(sys.executable)
+    except Exception:
+        pass
+
+    import winreg
+    try:
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            REG_PATH,
+            0,
+            winreg.KEY_SET_VALUE | winreg.KEY_CREATE_SUB_KEY,
+        )
+        # DisplayName  — shown in SMTC overlay, system tray, notification centre
+        winreg.SetValueEx(key, 'DisplayName',       0, winreg.REG_SZ, APP_NAME)
+        # ApplicationName — fallback name used by some older SMTC surfaces
+        winreg.SetValueEx(key, 'ApplicationName',   0, winreg.REG_SZ, APP_NAME)
+        # IconUri — path to the executable whose embedded icon Windows extracts.
+        # Format must be "shell:<path>,<icon_index>" or a direct file path.
+        winreg.SetValueEx(key, 'IconUri',           0, winreg.REG_SZ, EXE_PATH)
+        winreg.CloseKey(key)
+        print(f'[MACAN] AUMID registry entry written: {AUMID}')
+    except Exception as e:
+        print(f'[MACAN] AUMID registry write failed (non-fatal): {e}')
+
+    # Always set the AUMID on the process regardless of registry success —
+    # this is the minimum required for grouping in taskbar + SMTC recognition.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(AUMID)
+        print(f'[MACAN] AUMID set on process: {AUMID}')
+    except Exception as e:
+        print(f'[MACAN] SetCurrentProcessExplicitAppUserModelID failed: {e}')
+
+
 def main():
+    _register_aumid_for_smtc()
+
     # Start media server BEFORE creating the window
     _media_server.start()
 
