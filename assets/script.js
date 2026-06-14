@@ -10,7 +10,14 @@
 ═══════════════════════════════════════════════════════════════ */
 'use strict';
 
-// ─── STATE ────────────────────────────────────────────────────
+// ─── VIDEO COUNTDOWN STATE ────────────────────────────────────
+// Tracks whether the 10-second countdown overlay is active for video.
+// _vcCdActive   : true while countdown is showing
+// _vcCdCancelled: user clicked BATAL — suppress for the rest of this track
+let _vcCdActive    = false;
+let _vcCdCancelled = false;
+
+
 // MUST be declared first — all modules below reference S directly.
 const S = {
   playlist:     [],
@@ -2844,6 +2851,10 @@ function pinVcControls(on) {
 async function loadTrack(index, autoplay = true) {
   if (index < 0 || index >= S.playlist.length) return;
 
+  // Reset countdown state for each new track
+  _hideVideoCountdown();
+  _vcCdCancelled = false;
+
   const track  = S.playlist[index];
   const isVid  = track.is_video;
   const wasPlaying = S.isPlaying;
@@ -3441,7 +3452,28 @@ function onTimeUpdate() {
     }
   }
 
-  // FIX: Periodic state save every ~10s using wall-clock time
+  // ── Video countdown: show overlay during last 10s ──────────
+  // Only for video tracks in the fullscreen video layer, when there
+  // is a next track to advance to, and user hasn't cancelled it.
+  if (S.isPlaying && S.duration > 0 && S.playlist[S.currentIndex]?.is_video
+      && videoLayer.classList.contains('active') && !MiniPlayer.isActive()) {
+
+    const remaining = S.duration - cur;
+    const hasNext   = S.isShuffle || S.repeatMode === 'all'
+                      || S.currentIndex < S.playlist.length - 1;
+
+    if (hasNext && remaining <= 10 && remaining > 0 && !_vcCdCancelled) {
+      // Show overlay (idempotent — startVideoCountdown guards double-call)
+      if (!_vcCdActive) startVideoCountdown();
+      // Update ring + number in real time from actual remaining time
+      _updateVideoCountdownUI(remaining);
+    } else if (_vcCdActive && (remaining > 10 || !hasNext)) {
+      // Seeked back past the 10s mark or no next track — hide overlay
+      _hideVideoCountdown();
+    }
+  }
+
+
   const now = Date.now();
   if (!S._lastStateSaveWallMs || now - S._lastStateSaveWallMs > 10000) {
     if (!S._saveLock) {
@@ -3467,6 +3499,9 @@ function onEnded() {
   // Bridge: notify plugins track finished naturally
   window.MacanBridge?.emit('player:end', { track: S.playlist[S.currentIndex] || null });
 
+  // Hide countdown overlay (it already ran its course visually)
+  _hideVideoCountdown();
+
   if (S.repeatMode === 'one') {
     const p = activePlayer(); p.currentTime = 0; doPlay(p); return;
   }
@@ -3474,6 +3509,63 @@ function onEnded() {
   if (S.currentIndex < S.playlist.length - 1) { nextTrack(); return; }
   onPlayState(false);
   setStatus('QUEUE COMPLETE');
+}
+
+// ─── VIDEO COUNTDOWN FUNCTIONS ────────────────────────────────
+// Overlay muncul saat 10 detik terakhir video (dari timeupdate),
+// diupdate real-time, dan hilang saat track berganti atau user batal.
+
+const _VC_CIRCUMFERENCE = 2 * Math.PI * 24; // r=24 → 150.796
+
+function startVideoCountdown() {
+  if (_vcCdActive) return;  // sudah aktif
+  _vcCdActive = true;
+
+  const overlay = $('vc-countdown');
+  if (!overlay) return;
+
+  overlay.style.display = 'block';
+
+  // Wire buttons — clone untuk hapus listener lama
+  const skipBtn   = $('vc-cd-skip');
+  const cancelBtn = $('vc-cd-cancel');
+  if (skipBtn && cancelBtn) {
+    const newSkip   = skipBtn.cloneNode(true);
+    const newCancel = cancelBtn.cloneNode(true);
+    skipBtn.replaceWith(newSkip);
+    cancelBtn.replaceWith(newCancel);
+
+    $('vc-cd-skip').addEventListener('click', () => {
+      _hideVideoCountdown();
+      nextTrack();
+    });
+    $('vc-cd-cancel').addEventListener('click', () => {
+      _vcCdCancelled = true;  // jangan muncul lagi untuk track ini
+      _hideVideoCountdown();
+      setStatus('AUTO-ADVANCE DIBATALKAN');
+    });
+  }
+}
+
+function _updateVideoCountdownUI(remaining) {
+  // remaining = detik tersisa (float), 0–10
+  const secs = Math.ceil(remaining);          // 10 → 1
+  const pct  = Math.max(0, remaining / 10);   // 1.0 → 0.0 (berkurang)
+  const offset = (_VC_CIRCUMFERENCE * (1 - pct)).toFixed(2);
+
+  const numEl  = $('vc-countdown-num');
+  const fillEl = $('vc-cd-fill');
+  if (numEl)  numEl.textContent = secs > 0 ? secs : 0;
+  if (fillEl) {
+    fillEl.style.transition      = 'none';  // ikuti timeupdate, no CSS easing
+    fillEl.style.strokeDashoffset = offset;
+  }
+}
+
+function _hideVideoCountdown() {
+  _vcCdActive = false;
+  const overlay = $('vc-countdown');
+  if (overlay) overlay.style.display = 'none';
 }
 
 // ─── CONTROLS ─────────────────────────────────────────────────
@@ -3633,6 +3725,8 @@ function closeVideo() {
     MiniPlayer.closeFromMini();
     return;
   }
+  _hideVideoCountdown();
+  _vcCdCancelled = false;
   video.pause(); video.src = '';
   videoLayer.classList.remove('active');
   $('main-layout').style.display = '';
