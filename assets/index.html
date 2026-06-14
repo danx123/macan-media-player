@@ -396,6 +396,25 @@
       </div>
     </div>
   </div>
+
+  <!-- Countdown overlay: direct child of video-layer so it stays visible
+       independent of video-controls autohide (opacity/pointer-events) -->
+  <div id="vc-countdown" class="vc-countdown" style="display:none">
+    <div class="vc-countdown-inner">
+      <span class="vc-countdown-label">NEXT VIDEO IN</span>
+      <div class="vc-countdown-ring">
+        <svg class="vc-countdown-svg" viewBox="0 0 56 56">
+          <circle class="vc-cd-track" cx="28" cy="28" r="24"/>
+          <circle class="vc-cd-fill" id="vc-cd-fill" cx="28" cy="28" r="24"/>
+        </svg>
+        <span class="vc-countdown-num" id="vc-countdown-num">10</span>
+      </div>
+      <div class="vc-countdown-actions">
+        <button class="vc-cd-btn vc-cd-skip" id="vc-cd-skip">⏭ SKIP</button>
+        <button class="vc-cd-btn vc-cd-cancel" id="vc-cd-cancel">✕ CANCEL</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- ═══════════ LYRICS OVERLAY ═════════════════════════════ -->
