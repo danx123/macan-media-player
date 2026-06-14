@@ -426,7 +426,19 @@
     </div>
     <div class="lyrics-footer" id="lyrics-footer">
       <span id="lyrics-status">IDLE</span>
-      <button class="lyrics-refetch-btn" id="lyrics-refetch" style="display:none">↺ RETRY</button>
+      <div class="lyrics-footer-actions">
+        <button class="lyrics-load-btn" id="lyrics-load-file" title="Load lyrics from .lrc or .txt file">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          LOAD FILE
+        </button>
+        <button class="lyrics-refetch-btn" id="lyrics-refetch" style="display:none">↺ RETRY</button>
+      </div>
+      <!-- Hidden file input for .lrc / .txt -->
+      <input type="file" id="lyrics-file-input" accept=".lrc,.txt" style="display:none">
     </div>
   </div>
 </div>
