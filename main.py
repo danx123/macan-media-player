@@ -73,11 +73,20 @@ if sys.platform == 'win32':
         '--enable-zero-copy',
         '--enable-oop-rasterization',
 
+        # ── Low-end device extra flags ────────────────────────────────────
+        # Reduce GPU memory pressure and disable non-essential compositing.
+        '--disable-smooth-scrolling',
+        #'--disable-accelerated-video-decode',  # trade-off: CPU decode on weak CPU+GPU combos can cause choppy playback; test per-device before enabling
+        #'--memory-pressure-off',               # trade-off: prevents Chromium from releasing cache under OS memory pressure — risky on 2 GB RAM machines
+        '--disable-partial-raster',
+        '--disable-skia-runtime-opts',
+
+
         # ── V8 / Memory ──────────────────────────────────────────────────────
         # Cap the V8 old-space heap. A media player UI does not need a large
         # JS heap — 192 MB is generous. On low-spec machines this prevents
         # the renderer from ballooning into swap.
-        '--js-flags=--max-old-space-size=192',
+        '--js-flags=--max-old-space-size=128',  # reduced: 128 MB sufficient for media player UI on low-end devices
 
         # ── Misc ─────────────────────────────────────────────────────────────
         '--disable-ipc-flooding-protection',  # allow fast pywebview IPC calls
@@ -149,7 +158,7 @@ class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
                     f.seek(start)
                     remaining = length
                     while remaining > 0:
-                        chunk = f.read(min(65536, remaining))
+                        chunk = f.read(min(32768, remaining))  # 32 KB chunks: lower RAM pressure
                         if not chunk: break
                         self.wfile.write(chunk)
                         remaining -= len(chunk)
@@ -162,7 +171,7 @@ class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 with open(fp, 'rb') as f:
                     while True:
-                        chunk = f.read(65536)
+                        chunk = f.read(32768)  # 32 KB chunks: lower RAM pressure
                         if not chunk: break
                         self.wfile.write(chunk)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
@@ -183,9 +192,10 @@ class _SilentTCPServer(socketserver.ThreadingTCPServer):
     requests are fast (local disk reads) and short-lived.
     """
 
-    # 6 workers: enough for concurrent seeking + art + 2-3 playlist items.
-    # Raising this beyond ~8 gives diminishing returns on HDDs (seek contention).
-    MAX_WORKERS = 6
+    # 4 workers: reduced from 6 for low-end devices.
+    # 4 is sufficient for seeking + art + 1-2 playlist items without exhausting
+    # OS threads on single/dual-core machines.
+    MAX_WORKERS = 4
 
     allow_reuse_address = True
 
@@ -252,6 +262,9 @@ class AlbumArtCache:
 
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA cache_size = -4096")   # 4 MB page cache
+        conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute('''CREATE TABLE IF NOT EXISTS album_art (
             query_hash TEXT PRIMARY KEY,
             artist TEXT, title TEXT, local_path TEXT
@@ -303,8 +316,8 @@ class AlbumArtCache:
             if PIL_AVAILABLE:
                 img = Image.open(BytesIO(image_data))
                 img = img.convert("RGB")
-                img.thumbnail((500, 500))
-                img.save(file_path, "JPEG", quality=85)
+                img.thumbnail((400, 400))  # 400px: smaller footprint on low-end
+                img.save(file_path, "JPEG", quality=80)  # q80: ~30% smaller files
             else:
                 with open(file_path, 'wb') as f:
                     f.write(image_data)
@@ -331,7 +344,10 @@ class LyricCache:
         self._init_db()
 
     def _conn(self):
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        return conn
 
     def _init_db(self):
         conn = self._conn()
@@ -511,7 +527,7 @@ class LyricCache:
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
+                    "Chrome/149.0.0.0 Safari/537.36"
                 ),
                 "Accept-Language": "en-US,en;q=0.9",
             }
@@ -588,86 +604,56 @@ class MacanMediaAPI:
 
     def set_window(self, window):
         self._window = window
-        # Start taskbar autohide detection after window is assigned
-        if sys.platform == 'win32':
-            self._start_taskbar_watcher()
+        # [DISABLED] Taskbar autohide detection — disabled for low-end device compatibility.
+        # Uncomment the block below (and _start_taskbar_watcher) to re-enable.
+        # if sys.platform == 'win32':
+        #     self._start_taskbar_watcher()
 
     # ─── TASKBAR AUTOHIDE DETECTION (Windows) ────────────────────────────────
-    # Adapted from taskbar.py: when the window is fullscreen, Windows taskbar
-    # with "auto-hide" enabled won't peek through because the window covers the
-    # full screen height.  The fix (same trick as taskbar.py's height - 1) is
-    # to temporarily shrink the window by 1 pixel whenever the mouse approaches
-    # the bottom edge — that 1-pixel gap lets Windows trigger the taskbar peek.
-    # When the mouse moves away, the window is restored to full height.
-
-    def _start_taskbar_watcher(self):
-        """Spawn a background thread that polls the cursor position and
-        shrinks/restores the window height to allow taskbar autohide to work."""
-        import ctypes
-        import ctypes.wintypes
-
-        THRESHOLD_PX   = 2    # pixels from screen bottom that trigger shrink
-        POLL_INTERVAL  = 0.05 # seconds between cursor polls (50 ms)
-
-        self._taskbar_shrunken = False
-
-        def _get_screen_size():
-            """Return (width, height) of the primary monitor's work area."""
-            try:
-                user32 = ctypes.windll.user32
-                # SM_CXSCREEN / SM_CYSCREEN give the full physical resolution
-                w = user32.GetSystemMetrics(0)   # SM_CXSCREEN
-                h = user32.GetSystemMetrics(1)   # SM_CYSCREEN
-                return w, h
-            except Exception:
-                return 1920, 1080  # safe fallback
-
-        def _get_cursor_y():
-            """Return the current cursor Y coordinate in screen pixels."""
-            try:
-                pt = ctypes.wintypes.POINT()
-                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-                return pt.y
-            except Exception:
-                return 0
-
-        def _watcher():
-            import time
-            screen_w, screen_h = _get_screen_size()
-            print(f"[MACAN] Taskbar watcher started — screen {screen_w}×{screen_h}")
-
-            while True:
-                try:
-                    cursor_y   = _get_cursor_y()
-                    near_bottom = cursor_y >= screen_h - THRESHOLD_PX
-
-                    if near_bottom and not self._taskbar_shrunken:
-                        # Shrink window by 1 px at the bottom — same trick as
-                        # taskbar.py's (screen_geom.height() - 1).
-                        # pywebview exposes window.resize(w, h) and window.move(x, y).
-                        try:
-                            self._window.resize(screen_w, screen_h - 1)
-                            self._taskbar_shrunken = True
-                            print("[MACAN] Taskbar gap opened (height - 1)")
-                        except Exception as e:
-                            print(f"[MACAN] Taskbar shrink error: {e}")
-
-                    elif not near_bottom and self._taskbar_shrunken:
-                        # Restore full-screen height once cursor moves away
-                        try:
-                            self._window.resize(screen_w, screen_h)
-                            self._taskbar_shrunken = False
-                            print("[MACAN] Taskbar gap closed (height restored)")
-                        except Exception as e:
-                            print(f"[MACAN] Taskbar restore error: {e}")
-
-                except Exception as e:
-                    print(f"[MACAN] Taskbar watcher error: {e}")
-
-                time.sleep(POLL_INTERVAL)
-
-        t = threading.Thread(target=_watcher, name='TaskbarWatcher', daemon=True)
-        t.start()
+    # [DISABLED] This feature polls the cursor position every 50 ms and resizes
+    # the window to open a 1-pixel gap for the taskbar peek.  On low-end devices
+    # the continuous thread + Win32 calls add measurable CPU overhead.  The call
+    # site in set_window() is also commented out.  To re-enable: uncomment
+    # everything below and un-comment the _start_taskbar_watcher() call above.
+    #
+    # def _start_taskbar_watcher(self):
+    #     import ctypes, ctypes.wintypes
+    #     THRESHOLD_PX  = 2
+    #     POLL_INTERVAL = 0.05
+    #     self._taskbar_shrunken = False
+    #
+    #     def _get_screen_size():
+    #         try:
+    #             user32 = ctypes.windll.user32
+    #             return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    #         except Exception:
+    #             return 1920, 1080
+    #
+    #     def _get_cursor_y():
+    #         try:
+    #             pt = ctypes.wintypes.POINT()
+    #             ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    #             return pt.y
+    #         except Exception:
+    #             return 0
+    #
+    #     def _watcher():
+    #         import time
+    #         screen_w, screen_h = _get_screen_size()
+    #         while True:
+    #             try:
+    #                 near_bottom = _get_cursor_y() >= screen_h - THRESHOLD_PX
+    #                 if near_bottom and not self._taskbar_shrunken:
+    #                     self._window.resize(screen_w, screen_h - 1)
+    #                     self._taskbar_shrunken = True
+    #                 elif not near_bottom and self._taskbar_shrunken:
+    #                     self._window.resize(screen_w, screen_h)
+    #                     self._taskbar_shrunken = False
+    #             except Exception:
+    #                 pass
+    #             time.sleep(POLL_INTERVAL)
+    #
+    #     threading.Thread(target=_watcher, name='TaskbarWatcher', daemon=True).start()
 
     # ─── WINDOW MANAGEMENT ───────────────────────────────────────────────────
 
@@ -758,27 +744,6 @@ class MacanMediaAPI:
             return url
         except Exception as e:
             print(f"[MACAN] get_file_url error: {e}")
-            return None
-
-    def get_subtitle_url(self, video_path):
-        """Look for a same-named .srt file next to the video and serve it via
-        the local media server so the browser can load it cross-origin."""
-        try:
-            p = Path(video_path).resolve()
-            srt = p.with_suffix('.srt')
-            if not srt.exists():
-                # Case-insensitive fallback (useful on Windows-originated paths)
-                for sibling in p.parent.iterdir():
-                    if sibling.stem.lower() == p.stem.lower() and sibling.suffix.lower() == '.srt':
-                        srt = sibling
-                        break
-                else:
-                    return None
-            url = _media_server.register(srt)
-            print(f"[MACAN] Serving subtitle: {url}  ← {srt.name}")
-            return url
-        except Exception as e:
-            print(f"[MACAN] get_subtitle_url error: {e}")
             return None
 
     def get_subtitle_url(self, video_path):
@@ -975,7 +940,7 @@ class MacanMediaAPI:
 
         # Parallel metadata scan — skip heavy cover_art/video_thumb at this stage
         results = [None] * len(candidates)
-        workers = min(8, len(candidates))
+        workers = min(4, len(candidates))  # capped at 4 for low-end devices
 
         def _scan(idx_path):
             idx, fp = idx_path
@@ -1027,8 +992,8 @@ class MacanMediaAPI:
             return True
 
         total     = len(candidates)
-        BATCH_SZ  = 12   # flush to JS every N tracks
-        workers   = min(8, total)
+        BATCH_SZ  = 8    # flush to JS every N tracks; smaller = smoother on low-end
+        workers   = min(4, total)   # capped at 4 for low-end devices
         batch_buf = []
 
         def _push_batch(tracks, done=False):
@@ -1270,9 +1235,9 @@ class MacanMediaAPI:
             if not ret or frame is None:
                 self._video_thumb_cache[path] = None
                 return None
-            # Resize to 160×90 (16:9) keeping aspect ratio
+            # Resize to 120×68 (16:9) — reduced from 160×90 for low-end devices
             h, w = frame.shape[:2]
-            target_w, target_h = 160, 90
+            target_w, target_h = 120, 68
             scale = min(target_w / w, target_h / h)
             nw, nh = int(w * scale), int(h * scale)
             frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
@@ -1281,7 +1246,7 @@ class MacanMediaAPI:
             x_off = (target_w - nw) // 2
             y_off = (target_h - nh) // 2
             canvas[y_off:y_off+nh, x_off:x_off+nw] = frame
-            ret2, buf = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            ret2, buf = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 65])  # q65: lighter on RAM
             if not ret2:
                 self._video_thumb_cache[path] = None
                 return None
@@ -2658,7 +2623,7 @@ class MacanMediaAPI:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA cache_size=-8000")   # 8 MB page cache
+        conn.execute("PRAGMA cache_size=-4096")   # 4 MB page cache (reduced for low-end)
         return conn
 
     def _db_init(self):
