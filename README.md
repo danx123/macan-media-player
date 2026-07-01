@@ -2,10 +2,6 @@
 
 A sleek, fullscreen desktop media player built with Python and pywebview. Macan delivers a modern, cinema-grade playback experience for both audio and video files — with a dark aesthetic, real-time visualizer, and a robust local media HTTP server that ensures reliable playback on Windows (EdgeWebView2).
 
----
-
-<img width="1024" height="1536" alt="macan media player v10 7 0" src="https://github.com/user-attachments/assets/5c5d5411-0447-4780-9e36-dd6e3c584671" />
-
 
 ---
 
