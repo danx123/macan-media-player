@@ -2874,6 +2874,64 @@ def _register_aumid_for_smtc():
         print(f'[MACAN] SetCurrentProcessExplicitAppUserModelID failed: {e}')
 
 
+# ─── MULTI-INSTANCE SUPPORT: WebView2 profile locking ────────────────────────
+# EdgeWebView2 requires EXCLUSIVE access to its user-data folder — only one
+# running process can hold a given profile directory at a time. Because
+# _get_webview_storage_path() always returns the same fixed path, launching a
+# second instance of this app (or any other WebView2 app pointed at the same
+# profile folder) causes WebView2 environment creation to fail SILENTLY in the
+# background. The window still opens, but pywebview's local content server
+# never finishes wiring up correctly, which surfaces as the
+# "404 index.live.html — File does not exist" screen.
+#
+# Fix: claim the preferred profile folder with an OS-level file lock that is
+# automatically released by Windows if the process exits or crashes. If the
+# lock is already held (another instance is running), fall back to a sibling
+# folder (_2, _3, ...) so each instance gets its own independent WebView2
+# profile and can run concurrently.
+_profile_lock_handle = None  # kept open for the process lifetime; do not close
+
+
+def _acquire_webview_profile(preferred_path: str) -> str:
+    global _profile_lock_handle
+
+    if sys.platform != 'win32':
+        # Non-Windows builds use the Qt backend, not WebView2 — no locking needed.
+        os.makedirs(preferred_path, exist_ok=True)
+        return preferred_path
+
+    import msvcrt
+
+    candidate = preferred_path
+    attempt = 1
+    while True:
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            lock_path = os.path.join(candidate, '.instance.lock')
+            f = open(lock_path, 'a+b')
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                f.close()
+                raise
+            _profile_lock_handle = f  # keep handle alive -> lock held until process exits/crashes
+            if attempt > 1:
+                print(f'[Macan] Profile "{preferred_path}" busy (another instance running) '
+                      f'— using "{candidate}" instead.')
+            return candidate
+        except OSError:
+            attempt += 1
+            candidate = f'{preferred_path}_{attempt}'
+            if attempt > 20:
+                # Extremely unlikely, but don't loop forever — fall back to an
+                # unlocked, PID-suffixed folder rather than hang.
+                candidate = f'{preferred_path}_{os.getpid()}'
+                os.makedirs(candidate, exist_ok=True)
+                print(f'[Macan] Warning: could not acquire a locked profile after '
+                      f'20 attempts, using unlocked "{candidate}".')
+                return candidate
+
+
 def main():
     _register_aumid_for_smtc()
 
@@ -2888,8 +2946,11 @@ def main():
     # Passing storage_path tells EdgeWebView2 to use a fixed user-data directory.
     # This makes localStorage, IndexedDB, cookies, and cache survive restarts.
     # On non-Windows builds (Qt backend) pywebview ignores the kwarg gracefully.
-    webview_storage = api._get_webview_storage_path()
-    os.makedirs(webview_storage, exist_ok=True)
+    # Claim a WebView2 profile folder this process can exclusively own.
+    # Falls back to a sibling folder (_2, _3, ...) if another instance
+    # already holds the preferred one — this is what enables multiple
+    # instances to run at the same time instead of hitting the 404 screen.
+    webview_storage = _acquire_webview_profile(api._get_webview_storage_path())
 
     # ── Auto cache-bust: clear WebView2 disk cache when assets change ─────────
     # Problem: WebView2 aggressively caches HTML/CSS/JS on disk. When source
@@ -2980,9 +3041,30 @@ def main():
     #
     # The busted file is written INSIDE the assets folder so that relative
     # src/href paths (script.js, style.css, etc.) still resolve correctly.
+    #
+    # MULTI-INSTANCE FIX: this filename used to be the fixed "index.live.html"
+    # for every launch. When two instances started at the same time they'd
+    # race to write/read/delete that same file — one instance could end up
+    # requesting it mid-write (or right after another instance's cleanup),
+    # producing the "File does not exist" 404. Suffixing with the PID gives
+    # each running instance its own file so they can never collide.
     import re as _re
     _orig_html  = os.path.join(_assets_dir, 'index.html')
-    _bust_html  = os.path.join(_assets_dir, 'index.live.html')
+    _bust_html  = os.path.join(_assets_dir, f'index.live.{os.getpid()}.html')
+
+    # Best-effort cleanup of stale index.live.*.html left behind by instances
+    # that crashed or were killed without cleaning up after themselves.
+    try:
+        import glob as _glob
+        for _stale in _glob.glob(os.path.join(_assets_dir, 'index.live.*.html')):
+            if _stale != _bust_html:
+                try:
+                    os.remove(_stale)
+                except OSError:
+                    pass  # still in use by another running instance — leave it
+    except Exception:
+        pass
+
     try:
         with open(_orig_html, 'r', encoding='utf-8') as _f:
             _html_content = _f.read()
@@ -3005,14 +3087,34 @@ def main():
         with open(_bust_html, 'w', encoding='utf-8') as _f:
             _f.write(_html_content)
         entry_point = _bust_html
-        print(f'[Macan] Cache-bust HTML written to assets/ (v={_ver_tag})')
+        print(f'[Macan] Cache-bust HTML written to assets/{os.path.basename(_bust_html)} (v={_ver_tag})')
+
+        import atexit as _atexit
+        def _cleanup_bust_html(_path=_bust_html):
+            try:
+                os.remove(_path)
+            except OSError:
+                pass
+        _atexit.register(_cleanup_bust_html)
     except Exception as _e:
         print(f'[Macan] Warning: cache-bust HTML failed, using original: {_e}')
         # entry_point stays as the original index.html — safe fallback
 
+    # ── Avoid pywebview's implicit Bottle HTTP server for the main window ──────
+    # pywebview's is_local_url() treats ANY bare filesystem path (even an
+    # absolute one) as "needing a server", so passing entry_point as-is makes
+    # pywebview silently spin up its own internal Bottle server on a random
+    # 127.0.0.1 port just to serve index.live.<pid>.html. That's a SECOND local
+    # server (separate from our own _MediaServer) — extra surface area that can
+    # get interfered with by other local WebView2/browser apps (e.g. Shrine
+    # Browser Lite) running at the same time. Explicitly using a file:// URI
+    # bypasses is_local_url()'s check entirely, so pywebview loads the window
+    # natively via file:// and never starts that extra Bottle server.
+    _entry_url = Path(entry_point).resolve().as_uri()
+
     window = webview.create_window(
         title='Macan Media Player',
-        url=entry_point,
+        url=_entry_url,
         js_api=api,
         frameless=True,
         fullscreen=True,
