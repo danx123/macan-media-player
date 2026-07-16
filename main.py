@@ -709,19 +709,19 @@ class MacanMediaAPI:
         self._window.toggle_fullscreen()
         
     def open_tv_player(self, source_url=None):
-        """Launch the standalone libVLC-based TV player as its own process.
-
-        A separate process is used (not a thread) because libVLC needs a
-        real native window handle to render into, and Qt's QApplication
-        must own the main thread — something WebView2's message loop in
-        this process already occupies. This lets TV streams that the
-        browser's <video> tag can't decode play correctly via libVLC."""
         try:
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            script   = os.path.join(base_dir, 'tv_vlc_player.py')
             db_path  = os.path.join(self._get_app_data(), 'tv_channels.db')
 
-            cmd = [sys.executable, script, '--db', db_path]
+            if getattr(sys, 'frozen', False):
+            # sudah jadi exe (Nuitka/PyInstaller) -> panggil exe tv player
+                player_exe = os.path.join(base_dir, 'tv_vlc_player.exe')
+                cmd = [player_exe, '--db', db_path]
+            else:
+            # masih mode dev (python biasa)
+                script = os.path.join(base_dir, 'tv_vlc_player.py')
+                cmd = [sys.executable, script, '--db', db_path]
+
             if source_url:
                 cmd += ['--source', source_url]
 
