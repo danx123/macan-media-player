@@ -709,18 +709,34 @@ class MacanMediaAPI:
         self._window.toggle_fullscreen()
         
     def open_tv_player(self, source_url=None):
-        try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            db_path  = os.path.join(self._get_app_data(), 'tv_channels.db')
+        """Launch the standalone libVLC-based TV player as its own process.
 
-            if getattr(sys, 'frozen', False):
-            # sudah jadi exe (Nuitka/PyInstaller) -> panggil exe tv player
-                player_exe = os.path.join(base_dir, 'tv_vlc_player.exe')
+        A separate process is used (not a thread) because libVLC needs a
+        real native window handle to render into, and Qt's QApplication
+        must own the main thread — something WebView2's message loop in
+        this process already occupies. This lets TV streams that the
+        browser's <video> tag can't decode play correctly via libVLC."""
+        try:
+            # Pakai folder tempat exe/script utama berada, bukan __file__
+            # (aman untuk Nuitka --standalone maupun mode dev biasa).
+            base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+            exe_name = 'tv_vlc_player.exe' if sys.platform == 'win32' else 'tv_vlc_player'
+            player_exe = os.path.join(base_dir, exe_name)
+            script     = os.path.join(base_dir, 'tv_vlc_player.py')
+            db_path    = os.path.join(self._get_app_data(), 'tv_channels.db')
+
+            if os.path.exists(player_exe):
+                # Sudah hasil compile (Nuitka) -> jalankan exe-nya langsung
                 cmd = [player_exe, '--db', db_path]
-            else:
-            # masih mode dev (python biasa)
-                script = os.path.join(base_dir, 'tv_vlc_player.py')
+            elif os.path.exists(script):
+                # Mode dev / belum di-compile -> jalankan lewat python
                 cmd = [sys.executable, script, '--db', db_path]
+            else:
+                raise FileNotFoundError(
+                    f'tv_vlc_player tidak ditemukan di {base_dir} '
+                    f'(cek: {player_exe} / {script})'
+                )
 
             if source_url:
                 cmd += ['--source', source_url]
