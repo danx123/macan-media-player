@@ -1195,15 +1195,21 @@ const RTV = (() => {
   }
 
   // TV overlay
-  btnTv.addEventListener('click', () => { tvOpen ? closeTv() : openTv(); });
-  document.getElementById('tv-close').addEventListener('click', closeTv);
-  tvOverlay.addEventListener('click', e => { if (e.target === tvOverlay) closeTv(); });
-
-  tvSearch.addEventListener('input', () => filterTv(tvSearch.value));
-
-  document.getElementById('tv-refresh').addEventListener('click', () => {
-    fetchTvChannels(tvSourceSelect.value);
+  // TV — now handled by the native libVLC fullscreen player (main.py).
+  // The old in-page HTML <video> overlay is kept below for browsers-only
+  // deployments, but the desktop app routes straight to libVLC.
+  btnTv.addEventListener('click', () => {
+    if (window.pywebview && pywebview.api && pywebview.api.open_tv_player) {
+      pywebview.api.open_tv_player().catch(err =>
+        console.warn('[MACAN] open_tv_player failed:', err)
+      );
+    } else {
+      // Fallback for non-desktop contexts (no pywebview bridge available)
+      tvOpen ? closeTv() : openTv();
+    }
   });
+  document.getElementById('tv-close').addEventListener('click', closeTv);
+  tvOverlay.addEventListener('click', e => { if (e.target === tvOverlay) closeTv(); });  
 
   // ── Inject "FAVORITES" filter button for TV ─────────────────────
   (() => {
