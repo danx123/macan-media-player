@@ -45,6 +45,10 @@ body {
   z-index: 999;
   opacity: 0.03;
   mix-blend-mode: overlay;
+  /* PERF: canvas backing store is rendered at 1/4 resolution (see initNoise()
+     in script.js) and upscaled via CSS — pixelated keeps the grain look
+     instead of a blurry smoothed scale. */
+  image-rendering: pixelated;
 }
 
 /* ─── VISUALIZER BG ──────────────────────────────────────────── */
@@ -63,11 +67,14 @@ body {
   position: fixed; inset: 0;
   background-size: cover;
   background-position: center;
-  filter: blur(80px) saturate(1.5);
+  /* PERF: reduced from 80px — an 80px blur over a full-screen layer is one
+     of the most expensive filters a browser can run every frame it repaints. */
+  filter: blur(40px) saturate(1.5);
   opacity: 0;
   transition: opacity 1.2s ease, background-image 0.8s ease;
   z-index: 1;
   transform: scale(1.1);
+  will-change: opacity;
 }
 
 /* ─── HEADER ─────────────────────────────────────────────────── */
@@ -81,7 +88,9 @@ body {
   background: linear-gradient(180deg, rgba(0,0,0,0.95) 0%, transparent 100%);
   z-index: 100;
   border-bottom: 1px solid var(--border);
-  backdrop-filter: blur(20px);
+  /* PERF: reduced from 20px — large blur radii are expensive to recomposite
+     on every scroll/paint of content behind this bar. */
+  backdrop-filter: blur(12px);
 }
 
 .brand {
@@ -237,7 +246,11 @@ body {
 #now-playing-panel {
   background: rgba(10,10,10,0.82);
   border-right: 1px solid var(--border);
-  backdrop-filter: blur(40px);
+  /* PERF: reduced from 40px — visually near-identical but far cheaper to
+     recomposite, especially while the adjacent playlist is scrolling. */
+  backdrop-filter: blur(20px);
+  will-change: backdrop-filter;
+  transform: translateZ(0);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -639,7 +652,11 @@ body {
   display: flex;
   flex-direction: column;
   background: rgba(6,6,6,0.7);
-  backdrop-filter: blur(30px);
+  /* PERF: reduced from 30px — this panel sits directly behind the scrolling
+     playlist list, so its blur was being recomposited on every scroll frame. */
+  backdrop-filter: blur(16px);
+  will-change: backdrop-filter;
+  transform: translateZ(0);
   overflow: hidden;
   min-width: 0;
 }
@@ -747,9 +764,13 @@ body {
   position: relative;
   user-select: none;
   /* PERF: Browser-native virtual scroll — skip paint/layout for off-screen rows.
-     contain-intrinsic-size matches the row height so scrollbar stays accurate. */
+     min-height + contain-intrinsic-size now match the actual rendered row
+     height (name can wrap to 2 lines + artist + ext) so the browser doesn't
+     have to reflow when a row estimated at the wrong size enters the
+     viewport during fast scrolling. */
+  min-height: 64px;
   content-visibility: auto;
-  contain-intrinsic-size: 0 52px;
+  contain-intrinsic-size: 0 64px;
 }
 .pl-item.pl-dragging {
   opacity: 0.35;
