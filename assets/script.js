@@ -1981,20 +1981,34 @@ function initClock() {
 // ─── NOISE ────────────────────────────────────────────────────
 function initNoise() {
   const ctx = noiseCanvas.getContext('2d');
-  function resize() { noiseCanvas.width = innerWidth; noiseCanvas.height = innerHeight; }
+  // PERF: render noise at reduced resolution and let CSS upscale it —
+  // generating full-resolution random pixels every frame was the single
+  // biggest cause of scroll/UI jank (millions of Math.random() calls/sec).
+  const NOISE_SCALE = 4;
+  function resize() {
+    noiseCanvas.width  = Math.ceil(innerWidth  / NOISE_SCALE);
+    noiseCanvas.height = Math.ceil(innerHeight / NOISE_SCALE);
+  }
   resize();
   window.addEventListener('resize', resize);
-  function drawNoise() {
-    const img = ctx.createImageData(noiseCanvas.width, noiseCanvas.height);
-    for (let i = 0; i < img.data.length; i += 4) {
-      const v = Math.random() * 255;
-      img.data[i] = img.data[i+1] = img.data[i+2] = v;
-      img.data[i+3] = 25;
+
+  let _lastNoiseTs = 0;
+  const NOISE_INTERVAL = 80; // ~12fps — noise doesn't need 60fps to read as "alive"
+
+  function drawNoise(ts) {
+    if (ts - _lastNoiseTs > NOISE_INTERVAL) {
+      _lastNoiseTs = ts;
+      const img = ctx.createImageData(noiseCanvas.width, noiseCanvas.height);
+      for (let i = 0; i < img.data.length; i += 4) {
+        const v = Math.random() * 255;
+        img.data[i] = img.data[i+1] = img.data[i+2] = v;
+        img.data[i+3] = 25;
+      }
+      ctx.putImageData(img, 0, 0);
     }
-    ctx.putImageData(img, 0, 0);
     requestAnimationFrame(drawNoise);
   }
-  drawNoise();
+  requestAnimationFrame(drawNoise);
 }
 
 // ─── BG VISUALIZER ────────────────────────────────────────────
@@ -2125,7 +2139,10 @@ function initBgVis() {
     }
 
     // ── Layer 3: floating particles ───────────────────────────
-    for (const p of particles) {
+    // PERF: connection check is now i vs j>i only (half the comparisons
+    // of the previous "every particle vs every other particle" version).
+    for (let pi = 0; pi < particles.length; pi++) {
+      const p = particles[pi];
       p.pulse += p.pulseSpeed * (1 + bass * 3);
       const freqAmp = data[p.freq] || 0;
       const boost = isActive ? freqAmp * 2.5 : 0;
@@ -2137,9 +2154,9 @@ function initBgVis() {
       ctx.fillStyle = `rgba(232,255,0,${Math.min(alpha, 0.85)})`;
       ctx.fill();
 
-      // Particle connections (nearby only)
-      for (const q of particles) {
-        if (q === p) continue;
+      // Particle connections (nearby only) — only check forward neighbors
+      for (let qi = pi + 1; qi < particles.length; qi++) {
+        const q = particles[qi];
         const dx = q.x - p.x, dy = q.y - p.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
         if (dist < 90) {
@@ -2172,7 +2189,16 @@ function initBgVis() {
     }
 
     phase += 0.008;
-    requestAnimationFrame(draw);
+
+    // PERF: when nothing is playing (no analyser data), this whole layered
+    // draw is just idle decoration — no need to burn a full 60fps on it.
+    // Dropping to ~15fps while idle frees up the main thread significantly,
+    // most noticeably for scroll smoothness in the playlist.
+    if (isActive) {
+      requestAnimationFrame(draw);
+    } else {
+      setTimeout(() => requestAnimationFrame(draw), 66);
+    }
   }
   draw();
 }
