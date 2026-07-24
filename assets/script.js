@@ -3397,6 +3397,12 @@ function onPlayState(playing) {
   // Sync SMTC play state
   syncMediaSessionState();
 
+  // Sync taskbar thumbbar play/pause icon (Windows) — no-op kalau bukan
+  // di app pywebview / kalau taskbar_thumbbar gagal init di sisi Python.
+  if (pw()) {
+    pywebview.api.notify_play_state(playing).catch(() => {});
+  }
+
   // Sync mini player play state
   MiniPlayer.syncMiniPlayState(playing);
 
