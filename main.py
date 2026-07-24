@@ -30,6 +30,7 @@ except ImportError:
     PIL_AVAILABLE = False
 
 from core.video_utils import VideoThumbnailer
+from macan_taskbar_thumbbar_webview import TaskbarThumbBar
 
 if hasattr(webview, 'settings'):
     webview.settings['ALLOW_DOWNLOADS'] = True
@@ -605,10 +606,28 @@ class MacanMediaAPI:
 
     def set_window(self, window):
         self._window = window
+
+        # ── Taskbar thumbnail toolbar (tombol Prev/Play-Pause/Next saat hover
+        #    di preview taskbar Windows) — no-op otomatis di non-Windows.
+        self._taskbar_thumbbar = TaskbarThumbBar(window=window, window_title='Macan Media Player')
+        self._taskbar_thumbbar.previous_requested.connect(
+            lambda: self._window.evaluate_js('prevTrack()'))
+        self._taskbar_thumbbar.play_pause_requested.connect(
+            lambda: self._window.evaluate_js('togglePlayPause()'))
+        self._taskbar_thumbbar.next_requested.connect(
+            lambda: self._window.evaluate_js('nextTrack()'))
+
         # [DISABLED] Taskbar autohide detection — disabled for low-end device compatibility.
         # Uncomment the block below (and _start_taskbar_watcher) to re-enable.
         # if sys.platform == 'win32':
         #     self._start_taskbar_watcher()
+
+    def notify_play_state(self, playing: bool):
+        """Dipanggil dari JS (onPlayState) supaya ikon tombol taskbar thumbbar
+        (Play <-> Pause) ikut sinkron dengan status <audio>/<video> di frontend."""
+        tb = getattr(self, '_taskbar_thumbbar', None)
+        if tb is not None:
+            tb.set_playing(bool(playing))
 
     # ─── TASKBAR AUTOHIDE DETECTION (Windows) ────────────────────────────────
     # [DISABLED] This feature polls the cursor position every 50 ms and resizes
@@ -2870,7 +2889,7 @@ def _register_aumid_for_smtc():
     if sys.platform != 'win32':
         return
 
-    AUMID       = 'MacanAngkasa.MacanMediaPlayer.App'
+    AUMID       = 'MacanAngkasa.MacanMediaPlayer'
     APP_NAME    = 'Macan Media Player'
     REG_PATH    = r'Software\Classes\AppUserModelId\{}'.format(AUMID)
     EXE_PATH    = sys.executable  # path to python.exe or the frozen .exe
@@ -3168,6 +3187,14 @@ def main():
     )
 
     api.set_window(window)
+
+    # ── Taskbar thumbnail toolbar: HWND cuma valid setelah window benar-benar
+    #    tampil, jadi init_buttons() dipanggil lewat event 'shown'. shutdown()
+    #    dipanggil di 'closing' biar window proc di-restore sebelum app mati.
+    if sys.platform == 'win32':
+        window.events.shown += api._taskbar_thumbbar.init_buttons
+        window.events.closing += api._taskbar_thumbbar.shutdown
+
     webview.start(
         debug=False,
         gui=GUI_BACKEND,
