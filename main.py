@@ -31,6 +31,7 @@ except ImportError:
 
 from core.video_utils import VideoThumbnailer
 from macan_taskbar_thumbbar_webview import TaskbarThumbBar
+from macan_now_playing_bubble import NowPlayingBubble
 
 if hasattr(webview, 'settings'):
     webview.settings['ALLOW_DOWNLOADS'] = True
@@ -604,6 +605,16 @@ class MacanMediaAPI:
         self._art_cache   = AlbumArtCache(app_data)
         self._lyric_cache = LyricCache(app_data)
 
+        # ── "Now Playing" notification bubble (floats above the system
+        #    tray). Windows-only; no-op elsewhere — safe to always construct.
+        # NOTE: only constructed here, NOT started — its worker thread /
+        # window is created later from set_window(), alongside the taskbar
+        # thumbbar init. Starting it this early (before webview.create_window()
+        # even runs) risked shifting the timing of when Explorer creates the
+        # app's taskbar button relative to TaskbarThumbBar's setup, which is
+        # timing-sensitive (see macan_taskbar_thumbbar_webview.py).
+        self._now_playing_bubble = NowPlayingBubble(app_name='Macan Media Player')
+
     def set_window(self, window):
         self._window = window
 
@@ -628,6 +639,30 @@ class MacanMediaAPI:
         tb = getattr(self, '_taskbar_thumbbar', None)
         if tb is not None:
             tb.set_playing(bool(playing))
+
+    def show_now_playing_bubble(self, title: str, artist: str = '', artwork_data_url=None):
+        """Dipanggil dari JS (_onTrackStart) setiap kali lagu/video BARU mulai
+        diputar (bukan saat resume dari pause). Menampilkan bubble notifikasi
+        native di atas system tray berisi artist-title + artwork.
+
+        Bisa dimatikan lewat settings: save_settings({'notify_bubble_enabled': false}).
+        """
+        if not self.settings.get('notify_bubble_enabled', True):
+            return False
+        bubble = getattr(self, '_now_playing_bubble', None)
+        if bubble is None:
+            return False
+        try:
+            bubble.show(
+                title=title or '',
+                artist=artist or '',
+                artwork_data_url=artwork_data_url,
+                on_click=lambda: self._window and self._window.restore(),
+            )
+            return True
+        except Exception as e:
+            print(f'[MACAN] show_now_playing_bubble error: {e}')
+            return False
 
     # ─── TASKBAR AUTOHIDE DETECTION (Windows) ────────────────────────────────
     # [DISABLED] This feature polls the cursor position every 50 ms and resizes
@@ -679,6 +714,9 @@ class MacanMediaAPI:
 
     def close_app(self):
         print("[MACAN] Shutdown initiated...")
+        bubble = getattr(self, '_now_playing_bubble', None)
+        if bubble is not None:
+            bubble.shutdown()
         def delayed_close():
             import time
             time.sleep(0.1)
@@ -3194,6 +3232,13 @@ def main():
     if sys.platform == 'win32':
         window.events.shown += api._taskbar_thumbbar.init_buttons
         window.events.closing += api._taskbar_thumbbar.shutdown
+
+        # ── "Now Playing" bubble: started AFTER taskbar thumbbar init_buttons
+        #    (registered second -> runs second on the same 'shown' event) so
+        #    its window/thread creation never races with Explorer setting up
+        #    the app's taskbar button. See NowPlayingBubble docstring.
+        window.events.shown += api._now_playing_bubble.start
+        window.events.closing += api._now_playing_bubble.shutdown
 
     webview.start(
         debug=False,
