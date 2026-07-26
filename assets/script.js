@@ -3033,6 +3033,19 @@ function _onTrackStart(track) {
     AchievementSystem.record('totalPlays');
     if (track.is_video) AchievementSystem.record('videosPlayed');
   }
+
+  // Native "Now Playing" notification bubble (floats above the system tray).
+  // Fires once per genuine track change — not on pause/resume of the same
+  // track. Uses whatever artwork is already known at this point (from cache
+  // or embedded tags); if art hasn't been fetched yet for a brand-new track,
+  // the bubble falls back to a placeholder icon rather than waiting.
+  if (pw()) {
+    pywebview.api.show_now_playing_bubble(
+      track.name || '',
+      track.artist || '',
+      track.cover_art || null
+    ).catch(() => {});
+  }
 }
 
 // ─── SUBTITLE (SRT) SUPPORT ───────────────────────────────────
