@@ -88,6 +88,19 @@ function _persistArtToServer(path, dataUrl, isVideo) {
   }, 1000));
 }
 
+// Same idea, for lazily-resolved video durations (see onMeta()) — backfills
+// the DB when a video whose duration mutagen couldn't read during the fast
+// scan finally gets played and the <video> element reports the real value.
+const _persistDurationDebounce = new Map();
+function _persistDurationToServer(path, duration, durationStr) {
+  if (!pw() || !duration) return;
+  clearTimeout(_persistDurationDebounce.get(path));
+  _persistDurationDebounce.set(path, setTimeout(() => {
+    _persistDurationDebounce.delete(path);
+    pywebview.api.update_track_duration(path, duration, durationStr).catch(() => {});
+  }, 500));
+}
+
 // Seed caches from track array — call before renderPlaylist() whenever
 // S.playlist is replaced so the first render is already cache-warm.
 function _seedThumbCache(tracks) {
@@ -1026,6 +1039,48 @@ window.onOnlineArtReady = function(path, dataUrl) {
     }
     if (wasNew) _persistArtToServer(path, dataUrl, false);
   }
+  if (S.currentIndex >= 0 && S.playlist[S.currentIndex]?.path === path) {
+    applyArt(dataUrl);
+  }
+};
+
+// ─── VIDEO THUMBNAIL CALLBACK (called from Python via evaluate_js) ────────
+// get_video_thumbnail() no longer blocks the JS<->Python bridge: on a cache
+// miss it returns null right away and does the cv2 decode on a background
+// thread in Python, pushing the result here once it's ready. Both call
+// sites that use get_video_thumbnail() (_fetchLazyThumb's video branch,
+// and the "now playing" header art fetch) will typically get null back
+// immediately on a first-ever fetch — this callback is what actually
+// paints the thumbnail in when it lands.
+window.onVideoThumbReady = function(path, dataUrl) {
+  if (!dataUrl) return;
+  videoThumbCache.set(path, dataUrl);
+
+  const idx = S.playlist.findIndex(t => t.path === path);
+  if (idx >= 0) {
+    const track = S.playlist[idx];
+    const wasNew = !track.video_thumb;
+    track.video_thumb = dataUrl;
+    if (!track.cover_art) {
+      track.cover_art = dataUrl;
+      thumbCache.set(path, dataUrl);
+    }
+    // Swap the lazy placeholder -> real <img> if this row is still rendered
+    const item = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
+    if (item) {
+      const placeholder = item.querySelector('.pl-thumb-placeholder');
+      if (placeholder) {
+        const img = document.createElement('img');
+        img.className = 'pl-thumb pl-thumb-video-img';
+        img.src = dataUrl; img.alt = ''; img.draggable = false; img.loading = 'lazy';
+        placeholder.replaceWith(img);
+      }
+    }
+    if (wasNew) _persistArtToServer(path, dataUrl, true);
+  }
+
+  // If this track is the one currently shown in the "now playing" panel,
+  // update the big album-art view too.
   if (S.currentIndex >= 0 && S.playlist[S.currentIndex]?.path === path) {
     applyArt(dataUrl);
   }
@@ -3444,9 +3499,21 @@ function onMeta() {
   timeTotal.textContent   = str;
   vcTimeTotal.textContent = str;
   if (S.currentIndex >= 0 && S.playlist[S.currentIndex]) {
-    S.playlist[S.currentIndex].duration     = Math.floor(S.duration);
-    S.playlist[S.currentIndex].duration_str = str;
+    const _track = S.playlist[S.currentIndex];
+    const _hadNoDuration = !_track.duration;
+    _track.duration     = Math.floor(S.duration);
+    _track.duration_str = str;
     updatePlaylistMeta();
+
+    // FIX: fast bulk scan (_build_track_meta_fast) leaves duration at 0 for
+    // videos mutagen couldn't parse (some AVI/WMV/MKV variants) rather than
+    // paying for a synchronous cv2 probe on every such file up front. The
+    // <video>/<audio> element itself just read the real duration for free
+    // via loadedmetadata — so backfill it into the DB now, lazily, right
+    // when the track is actually played. No cv2 needed on this path at all.
+    if (_hadNoDuration && S.duration > 0 && _track.is_video && pw()) {
+      _persistDurationToServer(_track.path, Math.floor(S.duration), str);
+    }
   }
 
   // FIX: Consume the pending seek that was stored in _doStateRestore().
