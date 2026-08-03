@@ -161,7 +161,7 @@ class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
                     f.seek(start)
                     remaining = length
                     while remaining > 0:
-                        chunk = f.read(min(32768, remaining))  # 32 KB chunks: lower RAM pressure
+                        chunk = f.read(min(1048576, remaining))  # 1 MB chunks: lower CPU/loop overhead for large video
                         if not chunk: break
                         self.wfile.write(chunk)
                         remaining -= len(chunk)
@@ -174,7 +174,7 @@ class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 with open(fp, 'rb') as f:
                     while True:
-                        chunk = f.read(32768)  # 32 KB chunks: lower RAM pressure
+                        chunk = f.read(1048576)  # 1 MB chunks: lower CPU/loop overhead for large video
                         if not chunk: break
                         self.wfile.write(chunk)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
@@ -600,6 +600,16 @@ class MacanMediaAPI:
         # own thread, so parallel invocations are possible).
         self._settings_lock   = threading.Lock()
         self._plugin_handlers = {}   # 'plugin_id:action' → callable
+        # FIX: playlist saves used to run synchronously (DELETE + bulk INSERT)
+        # on every single remove/reorder call, blocking the caller. With big
+        # playlists (5000+ tracks) that's a lot of I/O to redo on every tiny
+        # edit. Now _save_playlist() just marks state dirty and (re)starts a
+        # short debounce timer; a background thread does the actual write,
+        # so a burst of rapid edits (drag-reorder, multi-remove) collapses
+        # into a single write instead of one per mutation.
+        self._playlist_save_lock  = threading.Lock()
+        self._playlist_save_dirty = False
+        self._playlist_save_timer = None
         self._load_settings()
         app_data = self._get_app_data()
         self._art_cache   = AlbumArtCache(app_data)
@@ -1160,20 +1170,13 @@ class MacanMediaAPI:
         meta = self._read_tags(abs_path, ext, is_video)
         duration = meta.get('duration') or 0
 
-        # FIX: For videos, mutagen sometimes can't parse container duration
-        # (e.g. some AVI/WMV/MKV variants). Fall back to a quick cv2 probe —
-        # still much cheaper than spawning ffprobe.
-        if is_video and not duration:
-            try:
-                import cv2
-                cap = cv2.VideoCapture(abs_path)
-                fps    = cap.get(cv2.CAP_PROP_FPS)
-                frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                cap.release()
-                if fps and fps > 0 and frames > 0:
-                    duration = int(frames / fps)
-            except Exception:
-                pass
+        # NOTE: previously fell back to cv2.VideoCapture() here when mutagen
+        # couldn't parse container duration (some AVI/WMV/MKV variants).
+        # cv2 init is heavy (~tens-hundreds of ms per file); with 100+ such
+        # videos in one scan this stalls the whole thread pool and the app
+        # feels hung. Instead, leave duration at 0 for the fast scan and
+        # resolve it lazily the first time the track is actually played
+        # (see _get_lazy_video_duration / wherever playback starts).
 
         display_name = meta.get('title') or p.stem
         artist       = meta.get('artist') or ''
@@ -1241,6 +1244,27 @@ class MacanMediaAPI:
         for track in self.playlist:
             if track.get('path') == path:
                 track['video_thumb'] = video_thumb
+                updated = True
+                break
+        if updated:
+            self._save_playlist()
+        return updated
+
+    def update_track_duration(self, path, duration, duration_str=None):
+        """Backfill a track's duration once it's known for certain.
+
+        Used for the lazy-duration fix: _build_track_meta_fast leaves
+        duration at 0 for videos mutagen couldn't parse (some AVI/WMV/MKV
+        variants), instead of paying for a synchronous cv2 probe on every
+        such file during the bulk scan. The frontend's <video>/<audio>
+        element reads the real duration for free the moment the track is
+        actually played (loadedmetadata event) and calls this to persist
+        it — so no cv2 call is needed anywhere on this path."""
+        updated = False
+        for track in self.playlist:
+            if track.get('path') == path:
+                track['duration'] = int(duration) if duration else 0
+                track['duration_str'] = duration_str or self._format_duration(duration)
                 updated = True
                 break
         if updated:
@@ -1315,49 +1339,76 @@ class MacanMediaAPI:
     def get_video_thumbnail(self, path):
         """Return a base64 thumbnail for a video file, extracted at ~10% of duration.
         Result is cached in memory keyed by path so repeat calls are instant.
-        Returns data URI string or None on failure."""
+
+        NON-BLOCKING: the actual cv2 decode is heavy (open container + seek +
+        decode + resize + jpeg-encode) and this method runs on the pywebview
+        JS<->Python IPC bridge thread. Doing that work synchronously here
+        freezes every other JS call (play/pause, etc.) until it finishes.
+        So: on a cache miss we kick the work to a background thread and
+        return None immediately; once the thumbnail is ready we push it to
+        the frontend via evaluate_js (same pattern as
+        get_cover_art_with_online_fallback's online-art push).
+        JS side should render a placeholder while waiting for
+        window.onVideoThumbReady.
+        """
         if not hasattr(self, '_video_thumb_cache'):
             self._video_thumb_cache = {}
+        if not hasattr(self, '_video_thumb_pending'):
+            self._video_thumb_pending = set()
+
         if path in self._video_thumb_cache:
             return self._video_thumb_cache[path]
-        try:
-            import cv2
-            cap = cv2.VideoCapture(path)
-            if not cap.isOpened():
-                self._video_thumb_cache[path] = None
-                return None
-            total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            fps   = cap.get(cv2.CAP_PROP_FPS) or 24
-            # Seek to ~10% of duration, minimum 1 second in
-            seek_frame = max(int(fps), int(total * 0.10))
-            cap.set(cv2.CAP_PROP_POS_FRAMES, seek_frame)
-            ret, frame = cap.read()
-            cap.release()
-            if not ret or frame is None:
-                self._video_thumb_cache[path] = None
-                return None
-            # Resize to 120×68 (16:9) — reduced from 160×90 for low-end devices
-            h, w = frame.shape[:2]
-            target_w, target_h = 120, 68
-            scale = min(target_w / w, target_h / h)
-            nw, nh = int(w * scale), int(h * scale)
-            frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
-            # Pad to exact size
-            canvas = __import__('numpy').zeros((target_h, target_w, 3), dtype='uint8')
-            x_off = (target_w - nw) // 2
-            y_off = (target_h - nh) // 2
-            canvas[y_off:y_off+nh, x_off:x_off+nw] = frame
-            ret2, buf = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 65])  # q65: lighter on RAM
-            if not ret2:
-                self._video_thumb_cache[path] = None
-                return None
-            data_uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.tobytes()).decode()
-            self._video_thumb_cache[path] = data_uri
-            return data_uri
-        except Exception as e:
-            print(f'[VideoThumb] Error for {path}: {e}')
-            self._video_thumb_cache[path] = None
-            return None
+
+        if path in self._video_thumb_pending:
+            return None  # already being generated in background
+
+        self._video_thumb_pending.add(path)
+
+        def _bg():
+            data_uri = None
+            try:
+                import cv2
+                cap = cv2.VideoCapture(path)
+                if cap.isOpened():
+                    total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    fps   = cap.get(cv2.CAP_PROP_FPS) or 24
+                    # Seek to ~10% of duration, minimum 1 second in
+                    seek_frame = max(int(fps), int(total * 0.10))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, seek_frame)
+                    ret, frame = cap.read()
+                    cap.release()
+                    if ret and frame is not None:
+                        # Resize to 120×68 (16:9) — reduced from 160×90 for low-end devices
+                        h, w = frame.shape[:2]
+                        target_w, target_h = 120, 68
+                        scale = min(target_w / w, target_h / h)
+                        nw, nh = int(w * scale), int(h * scale)
+                        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+                        # Pad to exact size
+                        canvas = __import__('numpy').zeros((target_h, target_w, 3), dtype='uint8')
+                        x_off = (target_w - nw) // 2
+                        y_off = (target_h - nh) // 2
+                        canvas[y_off:y_off+nh, x_off:x_off+nw] = frame
+                        ret2, buf = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 65])  # q65: lighter on RAM
+                        if ret2:
+                            data_uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.tobytes()).decode()
+                else:
+                    cap.release()
+            except Exception as e:
+                print(f'[VideoThumb] Error for {path}: {e}')
+            finally:
+                self._video_thumb_cache[path] = data_uri
+                self._video_thumb_pending.discard(path)
+                if data_uri and self._window:
+                    safe_path = path.replace('\\', '\\\\').replace("'", "\\'")
+                    js = f"window.onVideoThumbReady && window.onVideoThumbReady('{safe_path}', `{data_uri}`);"
+                    try:
+                        self._window.evaluate_js(js)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+        return None
 
     def reorder_playlist(self, from_index, to_index):
         """Move a track in the server-side playlist from from_index to to_index.
@@ -2893,16 +2944,66 @@ class MacanMediaAPI:
             print(f"[MACAN] Save settings error: {e}")
 
     def _save_playlist(self):
-        """Persist self.playlist to the playlist table.
+        """Public-facing entry point, called after every playlist mutation
+        (remove, reorder, add, clear, ...).
+
+        FIX: this used to run the DELETE-then-bulk-INSERT synchronously on
+        the caller's thread every single time it was invoked. On a 5000+
+        track playlist, a single drag-reorder or a "remove 20 tracks" batch
+        could trigger that many full-table rewrites back to back, hammering
+        disk I/O and stalling whatever UI action triggered it. Now this just
+        marks the playlist dirty and (re)arms a short debounce timer; the
+        actual write happens on a background thread via
+        _save_playlist_worker(), so a burst of rapid edits coalesces into
+        one write ~0.4s after the last one, instead of one write per edit.
+        """
+        with self._playlist_save_lock:
+            self._playlist_save_dirty = True
+            if self._playlist_save_timer is not None:
+                self._playlist_save_timer.cancel()
+            self._playlist_save_timer = threading.Timer(0.4, self._save_playlist_worker)
+            self._playlist_save_timer.daemon = True
+            self._playlist_save_timer.start()
+
+    def _save_playlist_worker(self):
+        """Runs on the debounce Timer's thread. Snapshots the current
+        playlist under the lock (so it doesn't race a concurrent mutation),
+        then does the actual DB write outside the lock."""
+        with self._playlist_save_lock:
+            if not self._playlist_save_dirty:
+                return
+            self._playlist_save_dirty = False
+            snapshot = list(self.playlist)
+        self._save_playlist_sync(snapshot)
+
+    def flush_playlist_save(self):
+        """Force any pending debounced save to happen immediately and
+        synchronously. Call this on app shutdown (window 'closing' event)
+        so the last few edits before exit are never silently dropped by
+        the debounce window."""
+        with self._playlist_save_lock:
+            if self._playlist_save_timer is not None:
+                self._playlist_save_timer.cancel()
+                self._playlist_save_timer = None
+            if not self._playlist_save_dirty:
+                return
+            self._playlist_save_dirty = False
+            snapshot = list(self.playlist)
+        self._save_playlist_sync(snapshot)
+
+    def _save_playlist_sync(self, snapshot):
+        """Persist a given playlist snapshot to the playlist table.
         Replaces the entire table in a single transaction — fast even with
-        hundreds of tracks because SQLite is an in-process library."""
+        hundreds of tracks because SQLite is an in-process library. Only
+        called from the debounce worker / flush, never directly from a
+        JS-triggered call site (use _save_playlist() for that)."""
         try:
             with self._db_connect() as conn:
                 conn.execute("DELETE FROM playlist")
                 conn.executemany(
                     "INSERT INTO playlist(pos,data) VALUES(?,?)",
                     [(pos, json.dumps(track, ensure_ascii=False))
-                     for pos, track in enumerate(self.playlist)]
+                     for pos, track in enumerate(snapshot)]
                 )
                 conn.commit()
         except Exception as e:
@@ -3225,6 +3326,11 @@ def main():
     )
 
     api.set_window(window)
+
+    # FIX: _save_playlist() is now debounced (see class docstring on
+    # flush_playlist_save). Force a synchronous flush on close so edits
+    # made in the last ~0.4s before quitting aren't lost.
+    window.events.closing += api.flush_playlist_save
 
     # ── Taskbar thumbnail toolbar: HWND cuma valid setelah window benar-benar
     #    tampil, jadi init_buttons() dipanggil lewat event 'shown'. shutdown()
