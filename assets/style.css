@@ -6622,3 +6622,9 @@ video::cue {
 }
 .vc-cd-cancel:hover  { background: rgba(255,255,255,0.16); color: #fff; border-color: rgba(255,255,255,0.35); }
 .vc-cd-cancel:active { transform: scale(0.97); }
+
+/* TARUH DI PALING BAWAH FILE CSS UNTUK MATIKAN SEMUA BLUR KUSTOM */
+* {
+    backdrop-filter: none !important;
+    will-change: auto !important;
+}
