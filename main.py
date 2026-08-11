@@ -1,4 +1,5 @@
 import os
+import shutil
 import ctypes
 import sys
 import subprocess
@@ -12,6 +13,7 @@ import secrets
 import mimetypes
 import urllib.parse
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from io import BytesIO
 from pathlib import Path
@@ -122,6 +124,24 @@ class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
             return None
         return _MediaRequestHandler.registry.get(parts[1])
 
+    def _zero_copy_send(self, f, offset, count=None):
+        """Stream file bytes straight from the disk fd to the socket fd.
+
+        Uses socket.sendfile(), which dispatches to the OS-level
+        os.sendfile() syscall on platforms that support it (Linux) —
+        a true kernel-to-kernel copy with no userspace buffer bouncing
+        through self.wfile. On platforms/paths without native sendfile
+        support, socket.sendfile() transparently falls back to a
+        buffered send loop, so this is always at least as fast as the
+        old manual f.read()/wfile.write() loop and often much faster
+        for large video files.
+
+        offset/count let this serve both full-file and HTTP Range
+        requests through the same code path.
+        """
+        self.wfile.flush()  # make sure headers are out before raw socket writes
+        self.connection.sendfile(f, offset=offset, count=count)
+
     def do_HEAD(self):
         fp = self._resolve()
         if not fp or not fp.exists():
@@ -158,13 +178,7 @@ class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 with open(fp, 'rb') as f:
-                    f.seek(start)
-                    remaining = length
-                    while remaining > 0:
-                        chunk = f.read(min(1048576, remaining))  # 1 MB chunks: lower CPU/loop overhead for large video
-                        if not chunk: break
-                        self.wfile.write(chunk)
-                        remaining -= len(chunk)
+                    self._zero_copy_send(f, offset=start, count=length)
             else:
                 self.send_response(200)
                 self.send_header('Content-Type', mime)
@@ -173,10 +187,7 @@ class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 with open(fp, 'rb') as f:
-                    while True:
-                        chunk = f.read(1048576)  # 1 MB chunks: lower CPU/loop overhead for large video
-                        if not chunk: break
-                        self.wfile.write(chunk)
+                    self._zero_copy_send(f, offset=0)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             pass  # client disconnected mid-stream (normal during seeks/track changes on Windows)
 
@@ -250,6 +261,17 @@ class _MediaServer:
 
 # ─── Single instance (declared once, here) ───────────────────────────────────
 _media_server = _MediaServer()
+
+
+# ─── VIDEO THUMBNAIL POOL ──────────────────────────────────────────────────
+# get_video_thumbnail() used to spawn a brand-new threading.Thread() on every
+# cache miss. Fast playlist scrolling can trigger 20-30 cache misses at once
+# (each item requesting its own thumbnail), which meant 20-30 OpenCV decode
+# threads all fighting for CPU simultaneously — a severe spike on low-end
+# machines. A small global pool bounds that to a fixed number of concurrent
+# decodes; everything else just queues instead of piling more OS threads on
+# top of an already-saturated CPU.
+_VIDEO_THUMB_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='VidThumb')
 
 
 # ─── ALBUM ART CACHE ──────────────────────────────────────────────────────────
@@ -610,6 +632,12 @@ class MacanMediaAPI:
         self._playlist_save_lock  = threading.Lock()
         self._playlist_save_dirty = False
         self._playlist_save_timer = None
+        # FIX: add_tracks / add_tracks_stream used to create-and-destroy a
+        # ThreadPoolExecutor on every call. Spinning up/tearing down worker
+        # threads repeatedly has its own overhead, and back-to-back bulk
+        # adds (e.g. dragging in several folders) paid that cost each time.
+        # One shared pool, created once here, is reused for every scan.
+        self._scan_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='ScanPool')
         self._load_settings()
         app_data = self._get_app_data()
         self._art_cache   = AlbumArtCache(app_data)
@@ -1034,8 +1062,6 @@ class MacanMediaAPI:
         cover art per-track after the queue is rendered, keeping the bridge
         responsive during the scan.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         # Build a set of already-known paths for O(1) dedup
         known = {t['path'] for t in self.playlist}
 
@@ -1049,9 +1075,10 @@ class MacanMediaAPI:
         if not candidates:
             return self.playlist
 
-        # Parallel metadata scan — skip heavy cover_art/video_thumb at this stage
+        # Parallel metadata scan — skip heavy cover_art/video_thumb at this stage.
+        # Reuses the shared self._scan_pool (built once in __init__) instead of
+        # creating/destroying a ThreadPoolExecutor on every call.
         results = [None] * len(candidates)
-        workers = min(4, len(candidates))  # capped at 4 for low-end devices
 
         def _scan(idx_path):
             idx, fp = idx_path
@@ -1061,10 +1088,9 @@ class MacanMediaAPI:
                 print(f"[MACAN] add_tracks scan error {fp}: {e}")
                 return idx, None
 
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            for idx, track in ex.map(_scan, enumerate(candidates)):
-                if track:
-                    results[idx] = track
+        for idx, track in self._scan_pool.map(_scan, enumerate(candidates)):
+            if track:
+                results[idx] = track
 
         for track in results:
             if track:
@@ -1081,8 +1107,6 @@ class MacanMediaAPI:
         JS side must implement window.onTrackBatchReady(tracks, done) to receive
         the pushes. Returns True immediately; JS gets data asynchronously.
         """
-        from concurrent.futures import ThreadPoolExecutor
-
         known = {t['path'] for t in self.playlist}
         candidates = []
         for fp in file_paths:
@@ -1104,7 +1128,6 @@ class MacanMediaAPI:
 
         total     = len(candidates)
         BATCH_SZ  = 8    # flush to JS every N tracks; smaller = smoother on low-end
-        workers   = min(4, total)   # capped at 4 for low-end devices
         batch_buf = []
 
         def _push_batch(tracks, done=False):
@@ -1120,18 +1143,18 @@ class MacanMediaAPI:
 
         def _worker_thread():
             nonlocal batch_buf
-            # Process in order-preserving fashion using a pool
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futures = {ex.submit(self._build_track_meta_fast, fp): fp
-                           for fp in candidates}
-                # Collect in submission order to keep natural sort order
-                done_map = {}
-                for fut in futures:
-                    fp = futures[fut]
-                    try:
-                        done_map[fp] = fut.result()
-                    except Exception as e:
-                        print(f"[MACAN] stream scan error {fp}: {e}")
+            # Reuses the shared self._scan_pool instead of spinning up a
+            # fresh ThreadPoolExecutor for this call.
+            futures = {self._scan_pool.submit(self._build_track_meta_fast, fp): fp
+                       for fp in candidates}
+            # Collect in submission order to keep natural sort order
+            done_map = {}
+            for fut in futures:
+                fp = futures[fut]
+                try:
+                    done_map[fp] = fut.result()
+                except Exception as e:
+                    print(f"[MACAN] stream scan error {fp}: {e}")
 
             for fp in candidates:
                 track = done_map.get(fp)
@@ -1407,7 +1430,7 @@ class MacanMediaAPI:
                     except Exception:
                         pass
 
-        threading.Thread(target=_bg, daemon=True).start()
+        _VIDEO_THUMB_POOL.submit(_bg)
         return None
 
     def reorder_playlist(self, from_index, to_index):
