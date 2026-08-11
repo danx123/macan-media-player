@@ -36,6 +36,7 @@ const S = {
   vcHideTimer:  null,
   vcCursorTimer: null,  // auto-hide cursor timer in video fullscreen
   previewThrottle: null,
+  isPreviewFetching: false,
   lyricsOpen:   false,
   lyricsData:   null,     // { content, is_synced, lines }
   lyricsActiveLine: -1,
@@ -126,14 +127,34 @@ function _seedThumbCache(tracks) {
 // _lazyThumbObserver is initialized lazily on first use so that
 // #playlist-body is guaranteed to exist in the DOM.
 let _lazyThumbObserver = null;
+// el -> pending debounce timeout id. Fast-scrolling past a row means it
+// enters and leaves the 300px margin within a fraction of a second; without
+// debouncing, that alone was enough to fire a get_video_thumbnail/
+// get_cover_art IPC call for every row that flashed past, spiking Python-side
+// CPU for thumbnails nobody actually looked at.
+const _lazyPending = new Map();
 function _getLazyObserver() {
   if (_lazyThumbObserver) return _lazyThumbObserver;
   _lazyThumbObserver = new IntersectionObserver((entries) => {
     for (const entry of entries) {
-      if (!entry.isIntersecting) continue;
       const el = entry.target;
-      _lazyThumbObserver.unobserve(el);
-      _fetchLazyThumb(el);
+      if (entry.isIntersecting) {
+        if (_lazyPending.has(el)) continue; // already scheduled, don't double-fire
+        const timeoutId = setTimeout(() => {
+          _lazyPending.delete(el);
+          _lazyThumbObserver.unobserve(el);
+          _fetchLazyThumb(el);
+        }, 180); // 150-200ms grace period before actually fetching
+        _lazyPending.set(el, timeoutId);
+      } else {
+        // Row left the viewport again before the debounce fired — cancel it,
+        // the IPC call is no longer worth making.
+        const pending = _lazyPending.get(el);
+        if (pending !== undefined) {
+          clearTimeout(pending);
+          _lazyPending.delete(el);
+        }
+      }
     }
   }, {
     root:       document.getElementById('playlist-body'),
@@ -893,6 +914,20 @@ const trackType     = $('track-type');
 const progressBar   = $('progress-bar');
 const progressFill  = $('progress-fill');
 const progressThumb = $('progress-thumb');
+
+// onTimeUpdate() fires very frequently while a track/video plays. Animating
+// it via style.width forces the browser to recompute layout (DOM reflow) on
+// every single tick, which is what causes FPS drops / stutter on low-end
+// devices. transform: scaleX() is compositor-only (GPU), so it never
+// triggers layout — same visual result, none of the reflow cost.
+// NOTE: this assumes the fill element's CSS width is 100% (so scaleX(pct)
+// visually matches the old width:pct*100% behavior) and that
+// transform-origin is anchored left, which this sets inline so no separate
+// CSS edit is required.
+function _setProgressFill(el, pct) {
+  el.style.transformOrigin = 'left';
+  el.style.transform = `scaleX(${pct})`;
+}
 const progressTrack = $('progress-track');
 const timeCurrent   = $('time-current');
 const timeTotal     = $('time-total');
@@ -1825,6 +1860,7 @@ window.addEventListener('load', () => {
   setupVcSeekbar();
   setupVideoControls();
   setupVideoContextMenu();
+  _setupPlaylistDelegation(); // one delegated listener set on #playlist-list instead of per-row listeners
 
   audio.volume = S.volume / 100;
   video.volume = S.volume / 100;
@@ -2089,6 +2125,27 @@ function initBgVis() {
     freq: Math.floor(Math.random() * 128), // maps to smoothData[0..127] log-scale
   }));
 
+  // PERF: adaptive quality + artificial framerate cap for the "isActive"
+  // (music playing) branch. This layer is purely decorative, but its cost
+  // scales with PARTICLE_COUNT^2 (the connection-line pass below checks
+  // every particle against every other) plus a 128-bar gradient spectrum,
+  // all at whatever rate requestAnimationFrame fires — normally 60fps.
+  // On low-end machines that's a real, sustained CPU cost just for a
+  // background flourish.
+  //   1) Frame-rate cap: while active, only do the actual draw work at
+  //      most ~30fps instead of chasing 60 — halves the steady-state cost
+  //      with no visible difference for ambient particles.
+  //   2) Adaptive particle count: if frames are still coming in slow even
+  //      at the 30fps budget (a sign the machine is genuinely struggling),
+  //      quietly shrink how many particles get simulated/drawn. This is a
+  //      one-shot downgrade (not a constant flip-flop) to keep things
+  //      visually stable rather than stuttering between quality levels.
+  const ACTIVE_FRAME_INTERVAL = 1000 / 30; // cap: 30fps while isActive
+  let _lastActiveDrawTs = 0;
+  let _activeFrameDeltas = [];
+  let _activeParticleCount = PARTICLE_COUNT;
+  let _particleCountLocked = false;
+
   let phase = 0;
   let smoothData = new Float32Array(128).fill(0);
 
@@ -2136,14 +2193,42 @@ function initBgVis() {
     return smoothData;
   }
 
-  function draw() {
+  function draw(ts) {
     const W = visCanvas.width, H = visCanvas.height;
+    // isActive: real analyser data available (not just simulated idle breathing)
+    const isActive = !!(S.analyser && S.isPlaying);
+
+    if (isActive) {
+      // Frame-rate cap: skip the heavy draw work if we're being called
+      // faster than the 30fps budget. Still re-arm requestAnimationFrame
+      // so the loop keeps ticking and stays in sync with the display.
+      if (_lastActiveDrawTs && ts && (ts - _lastActiveDrawTs) < ACTIVE_FRAME_INTERVAL) {
+        requestAnimationFrame(draw);
+        return;
+      }
+      // Adaptive quality: if actual frame spacing is still well above our
+      // 30fps target (i.e. the machine can't even keep up with the capped
+      // rate), permanently drop the particle count once rather than
+      // re-checking every frame — avoids visual flicker from repeatedly
+      // toggling quality up and down.
+      if (_lastActiveDrawTs && ts) {
+        _activeFrameDeltas.push(ts - _lastActiveDrawTs);
+        if (_activeFrameDeltas.length > 20) _activeFrameDeltas.shift();
+        if (!_particleCountLocked && _activeFrameDeltas.length === 20) {
+          const avgDelta = _activeFrameDeltas.reduce((a, b) => a + b, 0) / 20;
+          if (avgDelta > (ACTIVE_FRAME_INTERVAL * 1.6) && _activeParticleCount > 20) {
+            _activeParticleCount = Math.max(20, _activeParticleCount - 20);
+          }
+          _particleCountLocked = true;
+        }
+      }
+      _lastActiveDrawTs = ts || performance.now();
+    }
+
     const data = getFreqData();
     // Bass ≈ bins 1–5 (log-scale: ~20–100Hz), mid ≈ bins 20–30 (~500Hz–2kHz)
     const bass = (data[1] + data[2] + data[3] + data[4] + data[5]) / 5;
     const mid  = (data[20] + data[24] + data[28]) / 3;
-    // isActive: real analyser data available (not just simulated idle breathing)
-    const isActive = !!(S.analyser && S.isPlaying);
 
     ctx.clearRect(0, 0, W, H);
 
@@ -2196,7 +2281,10 @@ function initBgVis() {
     // ── Layer 3: floating particles ───────────────────────────
     // PERF: connection check is now i vs j>i only (half the comparisons
     // of the previous "every particle vs every other particle" version).
-    for (let pi = 0; pi < particles.length; pi++) {
+    // Also bounded by _activeParticleCount, which the adaptive-quality
+    // check above may have shrunk on sustained slow frames.
+    const pCount = isActive ? _activeParticleCount : particles.length;
+    for (let pi = 0; pi < pCount; pi++) {
       const p = particles[pi];
       p.pulse += p.pulseSpeed * (1 + bass * 3);
       const freqAmp = data[p.freq] || 0;
@@ -2210,7 +2298,7 @@ function initBgVis() {
       ctx.fill();
 
       // Particle connections (nearby only) — only check forward neighbors
-      for (let qi = pi + 1; qi < particles.length; qi++) {
+      for (let qi = pi + 1; qi < pCount; qi++) {
         const q = particles[qi];
         const dx = q.x - p.x, dy = q.y - p.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
@@ -2671,7 +2759,7 @@ function setupSeekbar() {
     activePlayer().currentTime = pct * S.duration;
   }
   function setFill(pct) {
-    progressFill.style.width = (pct * 100) + '%';
+    _setProgressFill(progressFill, pct);
     progressThumb.style.left  = (pct * 100) + '%';
   }
 
@@ -2719,9 +2807,8 @@ function setupVcSeekbar() {
   }
   
   function setFill(pct) {
-    const p = (pct * 100) + '%';
-    vcSeekFill.style.width = p;
-    vcSeekThumb.style.left = p;
+    _setProgressFill(vcSeekFill, pct);
+    vcSeekThumb.style.left = (pct * 100) + '%';
   }
 
   // Mouse Move untuk Hover Preview + Dragging
@@ -2790,13 +2877,21 @@ function showVideoPreview(e, pct) {
     if (S.previewThrottle && now - S.previewThrottle < 150) {
         return; 
     }
+    // Guard tambahan: kalau request sebelumnya masih in-flight (Python-side
+    // OpenCV extraction lebih lambat dari 150ms), jangan tumpuk Promise baru.
+    // Time-throttle doang nggak cukup kalau backend-nya yang lambat — ini
+    // yang bikin IPC numpuk dan UI ikut ngelag.
+    if (S.isPreviewFetching) {
+        return;
+    }
     S.previewThrottle = now;
 
     // Panggil Python API
     if (window.pywebview) {
         // Ambil path asli file video saat ini
         const currentTrack = S.playlist[S.currentIndex];
-        
+
+        S.isPreviewFetching = true;
         pywebview.api.get_video_preview(currentTrack.path, targetTime)
             .then(base64Img => {
                 if (base64Img) {
@@ -2807,7 +2902,10 @@ function showVideoPreview(e, pct) {
                     vcPreviewImg.style.display = 'none';
                 }
             })
-            .catch(err => console.error(err));
+            .catch(err => console.error(err))
+            .finally(() => {
+                S.isPreviewFetching = false;
+            });
     }
 }
 
@@ -3525,7 +3623,7 @@ function onMeta() {
     if (S.duration > 0 && position > 0 && position < S.duration) {
       p.currentTime = position;
       const pct = position / S.duration;
-      progressFill.style.width = (pct * 100) + '%';
+      _setProgressFill(progressFill, pct);
       progressThumb.style.left = (pct * 100) + '%';
       timeCurrent.textContent  = formatTime(position);
     }
@@ -3541,10 +3639,10 @@ function onTimeUpdate() {
   const pct = (S.duration > 0) ? cur / S.duration : 0;
   const str = formatTime(cur);
 
-  progressFill.style.width  = (pct*100)+'%';
+  _setProgressFill(progressFill, pct);
   progressThumb.style.left  = (pct*100)+'%';
   timeCurrent.textContent   = str;
-  vcSeekFill.style.width    = (pct*100)+'%';
+  _setProgressFill(vcSeekFill, pct);
   vcSeekThumb.style.left    = (pct*100)+'%';
   vcTimeCur.textContent     = str;
 
@@ -3955,7 +4053,7 @@ async function clearPlaylist() {
   trackArtist.textContent = 'UNKNOWN ARTIST';
   trackFormat.textContent = '—';
   trackType.textContent = 'AUDIO';
-  progressFill.style.width = '0%';
+  _setProgressFill(progressFill, 0);
   timeCurrent.textContent = '0:00';
   timeTotal.textContent = '0:00';
   albumArt.src = ''; albumArt.classList.remove('loaded');
@@ -4059,54 +4157,114 @@ function _buildPlaylistItem(track, realIdx) {
     </span>
     <button class="pl-remove-btn" title="Remove">✕</button>`;
 
-  div.querySelector('.pl-remove-btn').addEventListener('click', e => removeTrack(track.path, e));
-  div.addEventListener('click', () => loadTrack(realIdx));
-  div.addEventListener('dblclick', () => loadTrack(realIdx, true));
-  div.addEventListener('contextmenu', e => {
-    e.preventDefault(); e.stopPropagation();
-    showContextMenu(e.clientX, e.clientY, track);
-  });
-
-  if (!filterQ) {
-    div.addEventListener('dragstart', e => {
-      DND.dragIndex = realIdx;
-      div.classList.add('pl-dragging');
-      e.dataTransfer.effectAllowed = 'move';
-      e.dataTransfer.setData('text/plain', String(realIdx));
-      const ghost = div.cloneNode(true);
-      ghost.style.cssText = 'position:fixed;top:-200px;left:0;width:300px;opacity:.8;pointer-events:none;';
-      document.body.appendChild(ghost);
-      e.dataTransfer.setDragImage(ghost, 20, 20);
-      setTimeout(() => ghost.remove(), 0);
-    });
-    div.addEventListener('dragend', () => {
-      div.classList.remove('pl-dragging');
-      _dndCleanup();
-    });
-    div.addEventListener('dragover', e => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-      if (DND.dragIndex === realIdx) return;
-      const rect = div.getBoundingClientRect();
-      const after = e.clientY > rect.top + rect.height / 2;
-      const targetIdx = after ? realIdx + 1 : realIdx;
-      if (DND.overIndex !== targetIdx) {
-        DND.overIndex = targetIdx;
-        _dndShowIndicator(div, after);
-      }
-    });
-    div.addEventListener('dragleave', e => {
-      if (!playlistList.contains(e.relatedTarget)) _dndCleanup(false);
-    });
-    div.addEventListener('drop', e => {
-      e.preventDefault();
-      if (DND.dragIndex < 0 || DND.dragIndex === DND.overIndex) { _dndCleanup(); return; }
-      _doPlaylistReorder(DND.dragIndex, DND.overIndex);
-      _dndCleanup();
-    });
-  }
+  // NOTE: no per-item addEventListener calls here anymore. With playlists
+  // in the thousands, attaching click/dblclick/contextmenu/drag* to every
+  // single row meant tens of thousands of live listeners sitting in memory
+  // and made renderPlaylist() itself heavier. All of that is now handled by
+  // ONE delegated listener set per event type on the shared `playlistList`
+  // container (see _setupPlaylistDelegation, wired once at load). Rows only
+  // need `.dataset.index` for the delegated handlers to find them, which is
+  // already set above.
 
   return div;
+}
+
+// ── EVENT DELEGATION for playlist rows ─────────────────────────
+// Replaces the old per-row addEventListener() calls in _buildPlaylistItem.
+// One listener per event type on the parent container instead of N per row —
+// same click/dblclick/contextmenu/remove/drag behavior, a fraction of the
+// memory and setup cost when the playlist has thousands of tracks.
+let _playlistDelegationReady = false;
+function _setupPlaylistDelegation() {
+  if (_playlistDelegationReady) return; // idempotent — safe to call multiple times
+  _playlistDelegationReady = true;
+
+  function _rowFromEvent(e) {
+    return e.target.closest('.pl-item');
+  }
+  function _idxFromRow(row) {
+    return row ? parseInt(row.dataset.index, 10) : -1;
+  }
+
+  playlistList.addEventListener('click', e => {
+    const removeBtn = e.target.closest('.pl-remove-btn');
+    const row = _rowFromEvent(e);
+    if (!row) return;
+    if (removeBtn) {
+      const idx = _idxFromRow(row);
+      const track = S.playlist[idx];
+      if (track) removeTrack(track.path, e);
+      return;
+    }
+    const idx = _idxFromRow(row);
+    if (idx >= 0) loadTrack(idx);
+  });
+
+  playlistList.addEventListener('dblclick', e => {
+    const row = _rowFromEvent(e);
+    if (!row) return;
+    const idx = _idxFromRow(row);
+    if (idx >= 0) loadTrack(idx, true);
+  });
+
+  playlistList.addEventListener('contextmenu', e => {
+    const row = _rowFromEvent(e);
+    if (!row) return;
+    e.preventDefault(); e.stopPropagation();
+    const idx = _idxFromRow(row);
+    const track = S.playlist[idx];
+    if (track) showContextMenu(e.clientX, e.clientY, track);
+  });
+
+  playlistList.addEventListener('dragstart', e => {
+    const row = _rowFromEvent(e);
+    if (!row || !row.draggable) return;
+    const realIdx = _idxFromRow(row);
+    DND.dragIndex = realIdx;
+    row.classList.add('pl-dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(realIdx));
+    const ghost = row.cloneNode(true);
+    ghost.style.cssText = 'position:fixed;top:-200px;left:0;width:300px;opacity:.8;pointer-events:none;';
+    document.body.appendChild(ghost);
+    e.dataTransfer.setDragImage(ghost, 20, 20);
+    setTimeout(() => ghost.remove(), 0);
+  });
+
+  playlistList.addEventListener('dragend', e => {
+    const row = _rowFromEvent(e);
+    if (row) row.classList.remove('pl-dragging');
+    _dndCleanup();
+  });
+
+  playlistList.addEventListener('dragover', e => {
+    const row = _rowFromEvent(e);
+    if (!row) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const realIdx = _idxFromRow(row);
+    if (DND.dragIndex === realIdx) return;
+    const rect = row.getBoundingClientRect();
+    const after = e.clientY > rect.top + rect.height / 2;
+    const targetIdx = after ? realIdx + 1 : realIdx;
+    if (DND.overIndex !== targetIdx) {
+      DND.overIndex = targetIdx;
+      _dndShowIndicator(row, after);
+    }
+  });
+
+  playlistList.addEventListener('dragleave', e => {
+    if (!playlistList.contains(e.relatedTarget)) _dndCleanup(false);
+  });
+
+  playlistList.addEventListener('drop', e => {
+    const row = _rowFromEvent(e);
+    if (!row) return;
+    e.preventDefault();
+    if (DND.dragIndex < 0 || DND.dragIndex === DND.overIndex) { _dndCleanup(); return; }
+    _doPlaylistReorder(DND.dragIndex, DND.overIndex);
+    _dndCleanup();
+  });
 }
 
 // Register all lazy placeholders in a container with the IntersectionObserver.
