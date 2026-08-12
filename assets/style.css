@@ -448,10 +448,11 @@ body {
 
 #progress-fill {
   height: 100%;
-  width: 0%;
+  width: 100%;
+  transform: scaleX(0);
+  transform-origin: left;
   background: linear-gradient(90deg, var(--accent) 0%, #FFFB00 100%);
   position: relative;
-  transition: width 0.1s linear;
 }
 
 /* removed-old */ #progress-thumb-SKIP {
