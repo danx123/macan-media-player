@@ -1317,23 +1317,18 @@ input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider)::-webk
 
 .vc-seek-fill {
   height: 100%;
-  width: 0%;
+  width: 100%;               /* JS scale via transform: scaleX(pct), lihat _setProgressFill() di script.js — width tetap 100%, bukan progress itu sendiri */
   background: var(--accent);
   border-radius: 2px;
-  transition: width 0.1s linear;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.1s linear;
 }
 
-.vc-seek-thumb {
-  position: absolute;
-  right: calc(100% - 0%);
-  top: 50%;
-  transform: translate(50%, -50%) scale(0);
-  width: 14px; height: 14px;
-  background: var(--accent);
-  border-radius: 50%;
-  transition: transform 0.2s;
-}
-.vc-seekbar:hover .vc-seek-thumb { transform: translate(50%, -50%) scale(1); }
+/* NOTE: posisi & animasi thumb didefinisikan sekali di bawah
+   (section "vc-seek-thumb left-based") supaya nggak ada 2 rule
+   yang bentrok (dulu ada versi `right`-based di sini yang bikin
+   update posisi dari JS jadi nggak nyambung dengan CSS aktif). */
 
 /* ── Video Button Row ── */
 .vc-btn-row {
@@ -1490,7 +1485,8 @@ video::cue {
 #video-layer { z-index: 500; }
 #video-controls { z-index: 501; }
 
-/* vc-seek-thumb left-based */
+/* vc-seek-thumb left-based (satu-satunya definisi, sinkron dengan
+   .vc-seek-fill yang juga update via `left`/`width` dari JS) */
 .vc-seek-thumb {
   position: absolute;
   left: 0%;
@@ -1499,7 +1495,7 @@ video::cue {
   width: 14px; height: 14px;
   background: var(--accent);
   border-radius: 50%;
-  transition: transform 0.2s;
+  transition: transform 0.2s, left 0.1s linear;
   pointer-events: none;
 }
 .vc-seekbar:hover .vc-seek-thumb,
