@@ -31,6 +31,11 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+# media_engine (binding Rust/FFmpeg) gantiin cv2 buat semua kebutuhan probe
+# metadata & decode frame video (lihat get_video_thumbnail, get_file_info,
+# video_resolution di get_track_info, dan _get_duration di bawah).
+import media_engine
+
 from core.video_utils import VideoThumbnailer
 from macan_taskbar_thumbbar_webview import TaskbarThumbBar
 from macan_now_playing_bubble import NowPlayingBubble
@@ -1181,7 +1186,7 @@ class MacanMediaAPI:
         Differences from _build_track_meta:
         - NO cover_art extraction (deferred to JS lazy fetch)
         - NO video_thumbnail generation (deferred)
-        - NO cv2 video resolution probe (deferred)
+        - NO media_engine video resolution probe (deferred)
         - Reads tags + duration + replaygain only
         This cuts per-file time from ~80–300ms to ~5–20ms.
         """
@@ -1194,8 +1199,10 @@ class MacanMediaAPI:
         duration = meta.get('duration') or 0
 
         # NOTE: previously fell back to cv2.VideoCapture() here when mutagen
-        # couldn't parse container duration (some AVI/WMV/MKV variants).
-        # cv2 init is heavy (~tens-hundreds of ms per file); with 100+ such
+        # couldn't parse container duration (some AVI/WMV/MKV variants) — now
+        # would fall back to media_engine.MediaInfo() instead, but the cost
+        # profile is the same: opening/probing the container is heavy
+        # (~tens-hundreds of ms per file); with 100+ such
         # videos in one scan this stalls the whole thread pool and the app
         # feels hung. Instead, leave duration at 0 for the fast scan and
         # resolve it lazily the first time the track is actually played
@@ -1278,11 +1285,11 @@ class MacanMediaAPI:
 
         Used for the lazy-duration fix: _build_track_meta_fast leaves
         duration at 0 for videos mutagen couldn't parse (some AVI/WMV/MKV
-        variants), instead of paying for a synchronous cv2 probe on every
-        such file during the bulk scan. The frontend's <video>/<audio>
+        variants), instead of paying for a synchronous media_engine probe on
+        every such file during the bulk scan. The frontend's <video>/<audio>
         element reads the real duration for free the moment the track is
         actually played (loadedmetadata event) and calls this to persist
-        it — so no cv2 call is needed anywhere on this path."""
+        it — so no extra media_engine call is needed anywhere on this path."""
         updated = False
         for track in self.playlist:
             if track.get('path') == path:
@@ -1363,10 +1370,10 @@ class MacanMediaAPI:
         """Return a base64 thumbnail for a video file, extracted at ~10% of duration.
         Result is cached in memory keyed by path so repeat calls are instant.
 
-        NON-BLOCKING: the actual cv2 decode is heavy (open container + seek +
-        decode + resize + jpeg-encode) and this method runs on the pywebview
-        JS<->Python IPC bridge thread. Doing that work synchronously here
-        freezes every other JS call (play/pause, etc.) until it finishes.
+        NON-BLOCKING: the actual media_engine decode is heavy (open container +
+        seek + decode + resize + jpeg-encode) and this method runs on the
+        pywebview JS<->Python IPC bridge thread. Doing that work synchronously
+        here freezes every other JS call (play/pause, etc.) until it finishes.
         So: on a cache miss we kick the work to a background thread and
         return None immediately; once the thumbnail is ready we push it to
         the frontend via evaluate_js (same pattern as
@@ -1390,33 +1397,33 @@ class MacanMediaAPI:
         def _bg():
             data_uri = None
             try:
-                import cv2
-                cap = cv2.VideoCapture(path)
-                if cap.isOpened():
-                    total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                    fps   = cap.get(cv2.CAP_PROP_FPS) or 24
-                    # Seek to ~10% of duration, minimum 1 second in
-                    seek_frame = max(int(fps), int(total * 0.10))
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, seek_frame)
-                    ret, frame = cap.read()
-                    cap.release()
-                    if ret and frame is not None:
-                        # Resize to 120×68 (16:9) — reduced from 160×90 for low-end devices
-                        h, w = frame.shape[:2]
-                        target_w, target_h = 120, 68
-                        scale = min(target_w / w, target_h / h)
-                        nw, nh = int(w * scale), int(h * scale)
-                        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
-                        # Pad to exact size
-                        canvas = __import__('numpy').zeros((target_h, target_w, 3), dtype='uint8')
-                        x_off = (target_w - nw) // 2
-                        y_off = (target_h - nh) // 2
-                        canvas[y_off:y_off+nh, x_off:x_off+nw] = frame
-                        ret2, buf = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 65])  # q65: lighter on RAM
-                        if ret2:
-                            data_uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.tobytes()).decode()
-                else:
-                    cap.release()
+                if not PIL_AVAILABLE:
+                    raise RuntimeError('Pillow tidak terpasang, tidak bisa resize/encode thumbnail')
+
+                # decoder.duration sudah ke-probe di VideoDecoder.new(), gak
+                # perlu hitung total_frames/fps kayak versi cv2 lama.
+                decoder = media_engine.VideoDecoder(path)
+                seek_second = max(1.0, decoder.duration * 0.10)  # ~10% durasi, minimal 1 detik
+                frame_rgb = decoder.seek_frame(seek_second)  # numpy array (H, W, 3) RGB24
+
+                img = Image.fromarray(frame_rgb, mode='RGB')
+
+                # Resize ke 120×68 (16:9) — dikecilin dari 160×90 buat perangkat low-end
+                target_w, target_h = 120, 68
+                w, h = img.size
+                scale = min(target_w / w, target_h / h)
+                nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+                resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
+
+                # Pad ke ukuran pas (letterbox hitam di sisi yang kosong)
+                canvas = Image.new('RGB', (target_w, target_h), (0, 0, 0))
+                x_off = (target_w - nw) // 2
+                y_off = (target_h - nh) // 2
+                canvas.paste(resized, (x_off, y_off))
+
+                buffer = BytesIO()
+                canvas.save(buffer, format='JPEG', quality=65)  # q65: lighter on RAM
+                data_uri = 'data:image/jpeg;base64,' + base64.b64encode(buffer.getvalue()).decode()
             except Exception as e:
                 print(f'[VideoThumb] Error for {path}: {e}')
             finally:
@@ -1473,14 +1480,11 @@ class MacanMediaAPI:
 
             if is_video:
                 try:
-                    import cv2
-                    cap = cv2.VideoCapture(str(p))
-                    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                    dur = int(frames / fps) if fps and fps > 0 else 0
-                    cap.release()
+                    mi  = media_engine.MediaInfo(str(p))
+                    w   = int(mi.width)
+                    h   = int(mi.height)
+                    fps = mi.fps
+                    dur = int(mi.duration) if mi.duration and mi.duration > 0 else 0
                     info["resolution"]   = f"{w}x{h}" if w and h else "Unknown"
                     info["duration"]     = dur
                     info["duration_str"] = self._format_duration(dur)
@@ -2500,11 +2504,8 @@ class MacanMediaAPI:
         video_resolution = None
         if is_video:
             try:
-                import cv2
-                cap = cv2.VideoCapture(abs_path)
-                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                cap.release()
+                mi = media_engine.MediaInfo(abs_path)
+                w, h = int(mi.width), int(mi.height)
                 if w and h:
                     video_resolution = f"{w}x{h}"
             except Exception:
@@ -2741,15 +2742,12 @@ class MacanMediaAPI:
                 return int(audio_file.info.length)
         except Exception:
             pass
-        # For video files, try cv2
+        # For video files, try media_engine (MediaInfo.duration udah dihitung
+        # langsung dari stream duration + time_base, gak perlu frames/fps lagi)
         try:
-            import cv2
-            cap = cv2.VideoCapture(path)
-            fps    = cap.get(cv2.CAP_PROP_FPS)
-            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            cap.release()
-            if fps and fps > 0 and frames > 0:
-                return int(frames / fps)
+            mi = media_engine.MediaInfo(path)
+            if mi.duration and mi.duration > 0:
+                return int(mi.duration)
         except Exception:
             pass
         return 0
