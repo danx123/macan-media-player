@@ -3947,6 +3947,118 @@ video::cue {
 #btn-about svg { flex-shrink: 0; }
 
 /* ═══════════════════════════════════════════════════════════════
+   MODE MENU (header, next to about button)
+═══════════════════════════════════════════════════════════════ */
+.mode-menu-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+.mode-menu-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(232,255,0,0.06);
+  border: 1px solid rgba(232,255,0,0.22);
+  color: rgba(232,255,0,0.75);
+  padding: 5px 10px;
+  border-radius: 4px;
+  font-family: 'Space Mono', monospace;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+.mode-menu-btn:hover,
+.mode-menu-btn.open {
+  background: rgba(232,255,0,0.14);
+  border-color: rgba(232,255,0,0.5);
+  color: #E8FF00;
+}
+.mode-menu-btn svg { flex-shrink: 0; }
+.mode-menu-chevron { transition: transform 0.2s; opacity: 0.7; }
+.mode-menu-btn.open .mode-menu-chevron { transform: rotate(180deg); }
+
+/* Performance mode active state — turns the header pill red-ish to make it obvious */
+.mode-menu-btn.perf-active {
+  background: rgba(255,107,0,0.10);
+  border-color: rgba(255,107,0,0.4);
+  color: #ff9d4d;
+}
+.mode-menu-btn.perf-active:hover,
+.mode-menu-btn.perf-active.open {
+  background: rgba(255,107,0,0.18);
+  border-color: rgba(255,107,0,0.65);
+  color: #ffb066;
+}
+
+.mode-dropdown {
+  display: none;
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 220px;
+  background: #0f0f0f;
+  border: 1px solid rgba(232,255,0,0.25);
+  border-radius: 8px;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.7), 0 0 0 1px rgba(232,255,0,0.06);
+  padding: 6px;
+  z-index: 200;
+  flex-direction: column;
+  gap: 2px;
+}
+.mode-dropdown.open { display: flex; }
+
+.mode-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: none;
+  border: none;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.mode-dropdown-item:hover { background: rgba(255,255,255,0.06); }
+.mode-dropdown-item.active { background: rgba(232,255,0,0.08); }
+
+.mode-dropdown-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255,255,255,0.3);
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+.mode-dropdown-item.active .mode-dropdown-dot {
+  background: #E8FF00;
+  border-color: #E8FF00;
+  box-shadow: 0 0 6px rgba(232,255,0,0.6);
+}
+
+.mode-dropdown-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.mode-dropdown-title {
+  font-family: 'Space Mono', monospace;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: rgba(255,255,255,0.9);
+}
+.mode-dropdown-item.active .mode-dropdown-title { color: #E8FF00; }
+.mode-dropdown-sub {
+  font-size: 9.5px;
+  color: rgba(255,255,255,0.4);
+  font-family: 'Inter', sans-serif;
+}
+
+/* ═══════════════════════════════════════════════════════════════
    ABOUT OVERLAY
 ═══════════════════════════════════════════════════════════════ */
 .about-overlay {
@@ -6619,9 +6731,3 @@ video::cue {
 }
 .vc-cd-cancel:hover  { background: rgba(255,255,255,0.16); color: #fff; border-color: rgba(255,255,255,0.35); }
 .vc-cd-cancel:active { transform: scale(0.97); }
-
-/* TARUH DI PALING BAWAH FILE CSS UNTUK MATIKAN SEMUA BLUR KUSTOM */
-* {
-    backdrop-filter: none !important;
-    will-change: auto !important;
-}
