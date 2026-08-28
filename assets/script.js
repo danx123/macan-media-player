@@ -1912,6 +1912,9 @@ window.addEventListener('load', () => {
   // Init mini player drag/resize/controls
   MiniPlayer.init();
 
+  // Init Normal/Performance mode dropdown menu
+  _setupModeMenu();
+
   // Init SMTC (Media Session API) handlers
   initMediaSessionHandlers();
   startSmtcHeartbeat();
@@ -2381,6 +2384,109 @@ function _restoreVisModeFromPython() {
 }
 window.addEventListener('pywebviewready', _restoreVisModeFromPython, { once: true });
 if (typeof pywebview !== 'undefined') _restoreVisModeFromPython();
+
+// ─── PERFORMANCE MODE ───────────────────────────────────────────
+// Normal   = full visual effects (backdrop blur, GPU-composited layers)
+// Performance = strips backdrop-filter + will-change everywhere, for
+// low-end / integrated-GPU machines where the blur layers tank fps.
+const PERF_MODE_STYLE_ID = 'macan-perf-mode-style';
+const PERF_MODE_CSS = `* {
+    backdrop-filter: none !important;
+    will-change: auto !important;
+}`;
+
+function _applyPerfModeStyle(enabled) {
+  let tag = document.getElementById(PERF_MODE_STYLE_ID);
+  if (enabled) {
+    if (!tag) {
+      tag = document.createElement('style');
+      tag.id = PERF_MODE_STYLE_ID;
+      tag.textContent = PERF_MODE_CSS;
+      document.head.appendChild(tag);
+    }
+  } else if (tag) {
+    tag.remove();
+  }
+}
+
+function _updatePerfModeUI(enabled) {
+  const btn   = $('btn-mode');
+  const label = $('mode-menu-label');
+  if (label) label.textContent = enabled ? 'PERFORMANCE' : 'NORMAL';
+  if (btn) btn.classList.toggle('perf-active', enabled);
+  document.querySelectorAll('#mode-dropdown .mode-dropdown-item').forEach(item => {
+    item.classList.toggle('active', item.dataset.mode === (enabled ? 'performance' : 'normal'));
+  });
+}
+
+// Restore saved mode — localStorage first (instant, before pywebview is ready),
+// then reconciled against Python SQLite once the bridge is up.
+let perfModeEnabled = (() => {
+  try { return localStorage.getItem('macan_perf_mode') === '1'; } catch { return false; }
+})();
+_applyPerfModeStyle(perfModeEnabled);
+
+function _restorePerfModeFromPython() {
+  if (typeof pywebview === 'undefined') return;
+  pywebview.api.get_settings().then(s => {
+    if (s && typeof s.perf_mode === 'boolean' && s.perf_mode !== perfModeEnabled) {
+      perfModeEnabled = s.perf_mode;
+      try { localStorage.setItem('macan_perf_mode', perfModeEnabled ? '1' : '0'); } catch {}
+      _applyPerfModeStyle(perfModeEnabled);
+    }
+    _updatePerfModeUI(perfModeEnabled);
+  }).catch(() => { _updatePerfModeUI(perfModeEnabled); });
+}
+window.addEventListener('pywebviewready', _restorePerfModeFromPython, { once: true });
+if (typeof pywebview !== 'undefined') _restorePerfModeFromPython();
+
+function setPerfMode(enabled) {
+  perfModeEnabled = enabled;
+  _applyPerfModeStyle(enabled);
+  _updatePerfModeUI(enabled);
+  try { localStorage.setItem('macan_perf_mode', enabled ? '1' : '0'); } catch {}
+  if (typeof pywebview !== 'undefined') {
+    pywebview.api.save_settings({ perf_mode: enabled }).catch(() => {});
+  }
+}
+
+function _setupModeMenu() {
+  const wrap = $('mode-menu-wrap');
+  const btn  = $('btn-mode');
+  const dropdown = $('mode-dropdown');
+  if (!wrap || !btn || !dropdown) return;
+
+  _updatePerfModeUI(perfModeEnabled);
+
+  const closeDropdown = () => {
+    dropdown.classList.remove('open');
+    btn.classList.remove('open');
+    btn.setAttribute('aria-expanded', 'false');
+  };
+  const toggleDropdown = () => {
+    const willOpen = !dropdown.classList.contains('open');
+    dropdown.classList.toggle('open', willOpen);
+    btn.classList.toggle('open', willOpen);
+    btn.setAttribute('aria-expanded', String(willOpen));
+  };
+
+  btn.onclick = e => { e.stopPropagation(); toggleDropdown(); };
+
+  dropdown.querySelectorAll('.mode-dropdown-item').forEach(item => {
+    item.onclick = e => {
+      e.stopPropagation();
+      setPerfMode(item.dataset.mode === 'performance');
+      closeDropdown();
+    };
+  });
+
+  document.addEventListener('click', e => {
+    if (!wrap.contains(e.target)) closeDropdown();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeDropdown();
+  });
+}
 
 function cycleVisMode() {
   currentVisMode = (currentVisMode + 1) % VIS_MODES.length;
