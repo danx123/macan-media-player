@@ -3643,7 +3643,21 @@ function applyArt(src) {
       }
     }
     // Persist newly-fetched art to Python so clear+reload and restarts keep it
-    if (wasNew) _persistArtToServer(track.path, src, false);
+    if (wasNew) {
+      _persistArtToServer(track.path, src, false);
+
+      // Bug fix: _onTrackStart() fires show_now_playing_bubble() before
+      // updateTrackInfo() has a chance to fetch cover art, so a brand-new
+      // (never-before-cached) track's first bubble goes out with
+      // track.cover_art still null — i.e. the placeholder icon. Now that
+      // the art has actually resolved, refresh the bubble in place. Only
+      // do this if the track that just got its art is still the one
+      // loaded (the user may have already skipped ahead by the time this
+      // async fetch came back).
+      if (pw() && S.playlist[S.currentIndex] === track) {
+        pywebview.api.show_now_playing_bubble(track.name || '', track.artist || '', src).catch(() => {});
+      }
+    }
   }
 }
 
