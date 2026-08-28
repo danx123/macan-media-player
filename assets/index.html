@@ -50,6 +50,33 @@
       <span id="clock-time">00:00:00</span>
       <span id="clock-date">MON 00</span>
     </div>
+    <div id="mode-menu-wrap" class="mode-menu-wrap">
+      <button id="btn-mode" class="mode-menu-btn" title="Rendering Mode" aria-haspopup="true" aria-expanded="false">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>
+        </svg>
+        <span id="mode-menu-label">NORMAL</span>
+        <svg class="mode-menu-chevron" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
+      </button>
+      <div id="mode-dropdown" class="mode-dropdown" role="menu">
+        <button class="mode-dropdown-item active" data-mode="normal" role="menuitem">
+          <span class="mode-dropdown-dot"></span>
+          <span class="mode-dropdown-text">
+            <span class="mode-dropdown-title">Normal</span>
+            <span class="mode-dropdown-sub">Full visual effects</span>
+          </span>
+        </button>
+        <button class="mode-dropdown-item" data-mode="performance" role="menuitem">
+          <span class="mode-dropdown-dot"></span>
+          <span class="mode-dropdown-text">
+            <span class="mode-dropdown-title">Performance</span>
+            <span class="mode-dropdown-sub">Disable blur / GPU compositing</span>
+          </span>
+        </button>
+      </div>
+    </div>
     <button id="btn-about" title="About Macan Media Player">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <circle cx="12" cy="12" r="10"/>
