@@ -102,6 +102,7 @@ if _IS_WINDOWS:
     gdi32    = ctypes.WinDLL('gdi32',    use_last_error=True)
     shell32  = ctypes.WinDLL('shell32',  use_last_error=True)
     kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    ole32    = ctypes.WinDLL('ole32',    use_last_error=True)
 
     # ── constants ──
     WS_POPUP           = 0x80000000
@@ -131,6 +132,7 @@ if _IS_WINDOWS:
     HWND_TOPMOST       = -1
     IDC_ARROW          = 32512
     TIMER_ID_ANIM      = 1
+    COINIT_APARTMENTTHREADED = 0x2
 
     class SIZE(ctypes.Structure):
         _fields_ = [('cx', wintypes.LONG), ('cy', wintypes.LONG)]
@@ -275,6 +277,16 @@ if _IS_WINDOWS:
     gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
     gdi32.DeleteDC.argtypes     = [wintypes.HDC]
 
+    # CoInitializeEx: some shell32 builds touch COM internally when servicing
+    # ABM_GETTASKBARPOS (SHAppBarData), and calling into that from a raw
+    # thread that never entered a COM apartment is a classic source of
+    # intermittent access violations. restype is c_long (signed HRESULT) so
+    # failure (negative) is a plain `< 0` check, no masking needed.
+    ole32.CoInitializeEx.restype  = ctypes.c_long
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    ole32.CoUninitialize.restype  = None
+    ole32.CoUninitialize.argtypes = []
+
 
 class NowPlayingBubble:
     """
@@ -324,6 +336,11 @@ class NowPlayingBubble:
         self._current_payload = None
         self._on_click = None
         self._thread = None
+        # Cached (edge, rc) from the first successful SHAppBarData lookup.
+        # The taskbar's position practically never changes within a session,
+        # so re-querying it via a raw Win32 shell call on every single track
+        # change is pure waste — look it up once and reuse it.
+        self._taskbar_cache = None
 
     def start(self):
         """Spawn the worker thread that creates the (initially hidden)
@@ -380,22 +397,41 @@ class NowPlayingBubble:
     # ─── Worker thread: owns the window + message loop ────────────────
 
     def _run(self):
-        try:
-            self._register_class()
-            self._hwnd = self._create_window()
-            self._load_fonts()
-        except Exception as e:
-            print(f'[NowPlayingBubble] Init failed, disabling: {e}')
-            self._enabled = False
-            return
+        # This thread owns the window, the message loop, and (per Bug #1)
+        # the taskbar lookup — so it needs a COM apartment initialized on it
+        # before anything else runs. COINIT_APARTMENTTHREADED matches how a
+        # window-owning UI thread is expected to enter COM. hr can be S_OK
+        # (0) or S_FALSE (1, already-initialized) on success; only a
+        # negative HRESULT is a real failure, and even then we keep going
+        # rather than disabling the whole bubble over a non-fatal COM quirk
+        # — CoUninitialize is simply skipped in that case.
+        com_hr = ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+        if com_hr < 0:
+            print(f'[NowPlayingBubble] CoInitializeEx failed (hr={com_hr:#x}), continuing without COM init')
 
-        msg = wintypes.MSG()
-        while True:
-            ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if ret == 0 or ret == -1:
-                break
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
+        try:
+            try:
+                self._register_class()
+                self._hwnd = self._create_window()
+                self._load_fonts()
+            except Exception as e:
+                print(f'[NowPlayingBubble] Init failed, disabling: {e}')
+                self._enabled = False
+                return
+
+            msg = wintypes.MSG()
+            while True:
+                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret == 0 or ret == -1:
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            if com_hr >= 0:
+                try:
+                    ole32.CoUninitialize()
+                except Exception:
+                    pass
 
     def _register_class(self):
         self._hInstance = kernel32.GetModuleHandleW(None)
@@ -694,30 +730,40 @@ class NowPlayingBubble:
     # ─── Positioning: just outside the real taskbar edge ────────────────
 
     def _compute_position(self, w, h):
-        try:
-            taskbar_hwnd = user32.FindWindowW('Shell_TrayWnd', None)
-            if taskbar_hwnd and _sh_app_bar_data is not None:
-                abd = APPBARDATA()
-                abd.cbSize = ctypes.sizeof(APPBARDATA)
-                abd.hWnd   = taskbar_hwnd
-                _sh_app_bar_data(ABM_GETTASKBARPOS, ctypes.byref(abd))
-                edge, rc = abd.uEdge, abd.rc
+        cached = self._taskbar_cache
+        if cached is None:
+            try:
+                taskbar_hwnd = user32.FindWindowW('Shell_TrayWnd', None)
+                if taskbar_hwnd and _sh_app_bar_data is not None:
+                    abd = APPBARDATA()
+                    abd.cbSize = ctypes.sizeof(APPBARDATA)
+                    abd.hWnd   = taskbar_hwnd
+                    _sh_app_bar_data(ABM_GETTASKBARPOS, ctypes.byref(abd))
+                    # Copy uEdge/rc out of the transient APPBARDATA into a
+                    # plain tuple so the cache doesn't hold a reference into
+                    # a ctypes struct that's about to go out of scope.
+                    rc = abd.rc
+                    cached = (abd.uEdge, (rc.left, rc.top, rc.right, rc.bottom))
+                    self._taskbar_cache = cached
+            except Exception as e:
+                print(f'[NowPlayingBubble] Taskbar position lookup failed: {e}')
 
-                if edge == ABE_BOTTOM:
-                    x = rc.right - w - MARGIN_FROM_SIDE
-                    y = rc.top - h - MARGIN_FROM_TASKBAR
-                elif edge == ABE_TOP:
-                    x = rc.right - w - MARGIN_FROM_SIDE
-                    y = rc.bottom + MARGIN_FROM_TASKBAR
-                elif edge == ABE_LEFT:
-                    x = rc.right + MARGIN_FROM_TASKBAR
-                    y = rc.bottom - h - MARGIN_FROM_SIDE
-                else:  # ABE_RIGHT
-                    x = rc.left - w - MARGIN_FROM_TASKBAR
-                    y = rc.bottom - h - MARGIN_FROM_SIDE
-                return int(x), int(y)
-        except Exception as e:
-            print(f'[NowPlayingBubble] Taskbar position lookup failed: {e}')
+        if cached is not None:
+            edge, (left, top, right, bottom) = cached
+
+            if edge == ABE_BOTTOM:
+                x = right - w - MARGIN_FROM_SIDE
+                y = top - h - MARGIN_FROM_TASKBAR
+            elif edge == ABE_TOP:
+                x = right - w - MARGIN_FROM_SIDE
+                y = bottom + MARGIN_FROM_TASKBAR
+            elif edge == ABE_LEFT:
+                x = right + MARGIN_FROM_TASKBAR
+                y = bottom - h - MARGIN_FROM_SIDE
+            else:  # ABE_RIGHT
+                x = left - w - MARGIN_FROM_TASKBAR
+                y = bottom - h - MARGIN_FROM_SIDE
+            return int(x), int(y)
 
         # Fallback: bottom-right of the primary monitor.
         # trade-off: only used if SHAppBarData couldn't be resolved at all,
