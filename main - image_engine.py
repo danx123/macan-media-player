@@ -1,0 +1,3389 @@
+import os
+import shutil
+import ctypes
+import sys
+import subprocess
+import json
+import base64
+import hashlib
+import threading
+import http.server
+import socketserver
+import secrets
+import mimetypes
+import urllib.parse
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+import requests
+from io import BytesIO
+from pathlib import Path
+
+import webview
+import mutagen
+from mutagen.mp4 import MP4
+from mutagen.id3 import ID3
+from mutagen.flac import FLAC
+from mutagen.oggvorbis import OggVorbis
+
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+import image_engine
+
+from core.video_utils import VideoThumbnailer
+from macan_taskbar_thumbbar_webview import TaskbarThumbBar
+from macan_now_playing_bubble import NowPlayingBubble
+
+if hasattr(webview, 'settings'):
+    webview.settings['ALLOW_DOWNLOADS'] = True
+
+GUI_BACKEND = 'edgechromium' if sys.platform == 'win32' else 'qt'
+
+# ── EdgeWebView2: enable SMTC / Media Session API ────────────────────────────
+# Without these flags, navigator.mediaSession exists but is silently ignored —
+# the OS overlay, taskbar thumbnail, and hardware media keys won't respond.
+# Must be set before webview.start() is called (env var is read at process start).
+if sys.platform == 'win32':
+    _wv2_flags = ' '.join([
+        # ── Media Session / SMTC ─────────────────────────────────────────────
+        # Required for OS overlay, taskbar thumbnail, hardware media keys.
+        '--enable-features=HardwareMediaKeyHandling,MediaSessionService',
+        '--autoplay-policy=no-user-gesture-required',
+
+        # ── Disable unused browser subsystems ────────────────────────────────
+        # Each of these spawns background threads / network activity that waste
+        # CPU and RAM on low-spec machines without providing any benefit to a
+        # media player that has no extensions, sync, or translate needs.
+        '--disable-extensions',
+        '--disable-sync',
+        '--disable-translate',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-component-update',
+        '--disable-domain-reliability',
+        '--disable-client-side-phishing-detection',
+        '--disable-hang-monitor',
+        '--disable-prompt-on-repost',
+        '--disable-features=TranslateUI,ChromeWhatsNew,PrivacySandboxSettings4',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--no-pings',
+
+        # ── GPU / Rendering ──────────────────────────────────────────────────
+        # GPU rasterization offloads canvas/CSS compositing to the GPU —
+        # cheaper than software rasterization on integrated graphics.
+        # Zero-copy reduces CPU↔GPU memory transfers for video frames.
+        '--enable-gpu-rasterization',
+        '--enable-zero-copy',
+        '--enable-oop-rasterization',
+
+        # ── Low-end device extra flags ────────────────────────────────────
+        # Reduce GPU memory pressure and disable non-essential compositing.
+        '--disable-smooth-scrolling',
+        #'--disable-accelerated-video-decode',  # trade-off: CPU decode on weak CPU+GPU combos can cause choppy playback; test per-device before enabling
+        #'--memory-pressure-off',               # trade-off: prevents Chromium from releasing cache under OS memory pressure — risky on 2 GB RAM machines
+        '--disable-partial-raster',
+        '--disable-skia-runtime-opts',
+
+
+        # ── V8 / Memory ──────────────────────────────────────────────────────
+        # Cap the V8 old-space heap. A media player UI does not need a large
+        # JS heap — 192 MB is generous. On low-spec machines this prevents
+        # the renderer from ballooning into swap.
+        '--js-flags=--max-old-space-size=128',  # reduced: 128 MB sufficient for media player UI on low-end devices
+
+        # ── Misc ─────────────────────────────────────────────────────────────
+        '--disable-ipc-flooding-protection',  # allow fast pywebview IPC calls
+        '--disable-renderer-backgrounding',   # don't throttle when window loses focus
+        '--disable-backgrounding-occluded-windows',
+    ])
+    _existing = os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', '')
+    if '--enable-features=HardwareMediaKeyHandling' not in _existing:
+        os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = (
+            (_existing + ' ' + _wv2_flags).strip()
+        )
+
+
+
+# ─── LOCAL MEDIA HTTP SERVER ──────────────────────────────────────────────────
+# EdgeWebView2 on Windows blocks <audio>/<video> with file:// src (CORS).
+# Fix: tiny localhost HTTP server that streams any local file via http://.
+# Supports HTTP Range requests so seeking works correctly in <audio>/<video>.
+
+class _MediaRequestHandler(http.server.BaseHTTPRequestHandler):
+    registry: dict = {}  # token -> Path
+
+    def log_message(self, fmt, *args):
+        pass  # suppress request logs
+
+    def _resolve(self):
+        parsed = urllib.parse.urlparse(self.path)
+        parts = parsed.path.strip('/').split('/')
+        if len(parts) != 2 or parts[0] != 'media':
+            return None
+        return _MediaRequestHandler.registry.get(parts[1])
+
+    def _zero_copy_send(self, f, offset, count=None):
+        """Stream file bytes straight from the disk fd to the socket fd.
+
+        Uses socket.sendfile(), which dispatches to the OS-level
+        os.sendfile() syscall on platforms that support it (Linux) —
+        a true kernel-to-kernel copy with no userspace buffer bouncing
+        through self.wfile. On platforms/paths without native sendfile
+        support, socket.sendfile() transparently falls back to a
+        buffered send loop, so this is always at least as fast as the
+        old manual f.read()/wfile.write() loop and often much faster
+        for large video files.
+
+        offset/count let this serve both full-file and HTTP Range
+        requests through the same code path.
+        """
+        self.wfile.flush()  # make sure headers are out before raw socket writes
+        self.connection.sendfile(f, offset=offset, count=count)
+
+    def do_HEAD(self):
+        fp = self._resolve()
+        if not fp or not fp.exists():
+            self.send_error(404); return
+        mime, _ = mimetypes.guess_type(str(fp))
+        self.send_response(200)
+        self.send_header('Content-Type', mime or 'application/octet-stream')
+        self.send_header('Content-Length', str(fp.stat().st_size))
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+    def do_GET(self):
+        fp = self._resolve()
+        if not fp or not fp.exists():
+            self.send_error(404); return
+        mime, _ = mimetypes.guess_type(str(fp))
+        mime = mime or 'application/octet-stream'
+        file_size = fp.stat().st_size
+        range_header = self.headers.get('Range')
+        try:
+            if range_header:
+                range_val = range_header.strip().replace('bytes=', '')
+                start_str, end_str = range_val.split('-')
+                start = int(start_str) if start_str else 0
+                end   = int(end_str)   if end_str   else file_size - 1
+                end   = min(end, file_size - 1)
+                length = end - start + 1
+                self.send_response(206)
+                self.send_header('Content-Type', mime)
+                self.send_header('Content-Range', f'bytes {start}-{end}/{file_size}')
+                self.send_header('Content-Length', str(length))
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                with open(fp, 'rb') as f:
+                    self._zero_copy_send(f, offset=start, count=length)
+            else:
+                self.send_response(200)
+                self.send_header('Content-Type', mime)
+                self.send_header('Content-Length', str(file_size))
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                with open(fp, 'rb') as f:
+                    self._zero_copy_send(f, offset=0)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass  # client disconnected mid-stream (normal during seeks/track changes on Windows)
+
+
+class _SilentTCPServer(socketserver.ThreadingTCPServer):
+    """ThreadingTCPServer backed by a bounded thread pool.
+
+    The default ThreadingTCPServer spawns a new thread per request —
+    unbounded. On low-spec machines, simultaneous requests (seeking,
+    cover-art fetches, playlist loading) can spawn dozens of threads,
+    exhausting the OS thread pool and causing latency spikes.
+
+    Fix: override process_request() to dispatch to a fixed-size
+    ThreadPoolExecutor instead of spawning raw threads.  A pool of
+    MAX_WORKERS threads is more than enough for a local media server —
+    requests are fast (local disk reads) and short-lived.
+    """
+
+    # 4 workers: reduced from 6 for low-end devices.
+    # 4 is sufficient for seeking + art + 1-2 playlist items without exhausting
+    # OS threads on single/dual-core machines.
+    MAX_WORKERS = 4
+
+    allow_reuse_address = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from concurrent.futures import ThreadPoolExecutor
+        self._pool = ThreadPoolExecutor(
+            max_workers=self.MAX_WORKERS,
+            thread_name_prefix='MediaSrv',
+        )
+
+    def process_request(self, request, client_address):
+        """Submit request to thread pool instead of spawning a new thread."""
+        self._pool.submit(self.process_request_thread, request, client_address)
+
+    def server_close(self):
+        self._pool.shutdown(wait=False)
+        super().server_close()
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError,
+                            BrokenPipeError, OSError)):
+            return
+        super().handle_error(request, client_address)
+
+
+class _MediaServer:
+    def __init__(self):
+        self.port = None
+        self._path_to_token: dict = {}
+
+    def start(self):
+        _MediaRequestHandler.registry = {}
+        server = _SilentTCPServer(('127.0.0.1', 0), _MediaRequestHandler)
+        server.daemon_threads = True
+        self.port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        print(f"[MediaServer] Listening on http://127.0.0.1:{self.port}/")
+
+    def register(self, filepath: Path) -> str:
+        key = str(filepath)
+        if key not in self._path_to_token:
+            token = secrets.token_urlsafe(16)
+            self._path_to_token[key] = token
+            _MediaRequestHandler.registry[token] = filepath
+        return f"http://127.0.0.1:{self.port}/media/{self._path_to_token[key]}"
+
+
+# ─── Single instance (declared once, here) ───────────────────────────────────
+_media_server = _MediaServer()
+
+
+# ─── VIDEO THUMBNAIL POOL ──────────────────────────────────────────────────
+# get_video_thumbnail() used to spawn a brand-new threading.Thread() on every
+# cache miss. Fast playlist scrolling can trigger 20-30 cache misses at once
+# (each item requesting its own thumbnail), which meant 20-30 OpenCV decode
+# threads all fighting for CPU simultaneously — a severe spike on low-end
+# machines. A small global pool bounds that to a fixed number of concurrent
+# decodes; everything else just queues instead of piling more OS threads on
+# top of an already-saturated CPU.
+_VIDEO_THUMB_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='VidThumb')
+
+
+# ─── ALBUM ART CACHE ──────────────────────────────────────────────────────────
+
+class AlbumArtCache:
+    """Manages online album art fetching and local SQLite cache."""
+
+    def __init__(self, app_data_dir):
+        self.cache_dir = os.path.join(app_data_dir, "AlbumArtCache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.db_path = os.path.join(self.cache_dir, "art_cache.db")
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA cache_size = -4096")   # 4 MB page cache
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute('''CREATE TABLE IF NOT EXISTS album_art (
+            query_hash TEXT PRIMARY KEY,
+            artist TEXT, title TEXT, local_path TEXT
+        )''')
+        conn.commit()
+        conn.close()
+
+    def _hash(self, artist, title):
+        s = f"{artist}-{title}".lower().strip()
+        return hashlib.md5(s.encode('utf-8')).hexdigest()
+
+    def get_cached(self, artist, title):
+        h = self._hash(artist, title)
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT local_path FROM album_art WHERE query_hash=?", (h,)).fetchone()
+        conn.close()
+        if row and os.path.exists(row[0]):
+            with open(row[0], 'rb') as f:
+                data = f.read()
+            mime = 'image/jpeg'
+            return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+        return None
+
+    def fetch_online(self, artist, title):
+        """Try iTunes API, save to cache. Returns base64 data-URL or None."""
+        if not artist or not title:
+            return None
+        try:
+            term = f"{artist} {title}"
+            resp = requests.get("https://itunes.apple.com/search",
+                                params={"term": term, "media": "music", "entity": "song", "limit": 1},
+                                timeout=6)
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                if results:
+                    art_url = results[0].get("artworkUrl100", "").replace("100x100", "600x600")
+                    if art_url:
+                        img_resp = requests.get(art_url, timeout=10)
+                        if img_resp.status_code == 200:
+                            return self._save_and_return(artist, title, img_resp.content)
+        except Exception as e:
+            print(f"[ArtCache] Network error: {e}")
+        return None
+
+    def _save_and_return(self, artist, title, image_data):
+        h = self._hash(artist, title)
+        file_path = os.path.join(self.cache_dir, f"{h}.jpg")
+        try:
+            if PIL_AVAILABLE:
+                img = Image.open(BytesIO(image_data))
+                img = img.convert("RGB")
+                img.thumbnail((400, 400))  # 400px: smaller footprint on low-end
+                img.save(file_path, "JPEG", quality=80)  # q80: ~30% smaller files
+            else:
+                with open(file_path, 'wb') as f:
+                    f.write(image_data)
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("INSERT OR REPLACE INTO album_art (query_hash,artist,title,local_path) VALUES(?,?,?,?)",
+                         (h, artist, title, file_path))
+            conn.commit()
+            conn.close()
+            with open(file_path, 'rb') as f:
+                data = f.read()
+            return f"data:image/jpeg;base64,{base64.b64encode(data).decode()}"
+        except Exception as e:
+            print(f"[ArtCache] Save error: {e}")
+        return None
+
+
+# ─── LYRIC CACHE ──────────────────────────────────────────────────────────────
+
+class LyricCache:
+    """Local SQLite lyrics store + LRCLIB online fetch."""
+
+    def __init__(self, app_data_dir):
+        self.db_path = os.path.join(app_data_dir, "lyrics.db")
+        self._init_db()
+
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        return conn
+
+    def _init_db(self):
+        conn = self._conn()
+        conn.execute('''CREATE TABLE IF NOT EXISTS lyrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artist TEXT, title TEXT, content TEXT, is_synced INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(artist, title)
+        )''')
+        conn.commit()
+        conn.close()
+
+    def get(self, artist, title):
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT content, is_synced FROM lyrics WHERE lower(artist)=? AND lower(title)=?",
+            (artist.lower().strip(), title.lower().strip())
+        ).fetchone()
+        conn.close()
+        if row:
+            return {"content": row[0], "is_synced": bool(row[1])}
+        return None
+
+    def save(self, artist, title, content, is_synced):
+        try:
+            conn = self._conn()
+            conn.execute("INSERT OR REPLACE INTO lyrics (artist,title,content,is_synced) VALUES(?,?,?,?)",
+                         (artist.lower().strip(), title.lower().strip(), content, int(is_synced)))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[LyricDB] Error: {e}")
+
+    def read_embedded(self, path: str) -> dict | None:
+        """
+        Read lyrics embedded in the audio file's metadata tags.
+        Supports: MP3 (USLT/SYLT ID3), FLAC (LYRICS/UNSYNCEDLYRICS vorbis),
+                  M4A/MP4 (©lyr), OGG/Opus (LYRICS vorbis comment).
+        Returns {content, is_synced} or None.
+        """
+        import re as _re
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            # ── MP3 / ID3 ──────────────────────────────────────────────────
+            if ext in ('.mp3', '.aiff', '.aif'):
+                from mutagen.id3 import ID3, USLT, SYLT
+                try:
+                    tags = ID3(path)
+                except Exception:
+                    return None
+
+                # SYLT — synchronised lyrics (timestamp per syllable/line)
+                sylt_keys = [k for k in tags.keys() if k.startswith('SYLT')]
+                if sylt_keys:
+                    sylt = tags[sylt_keys[0]]
+                    lines = []
+                    for text, ts in sylt.text:
+                        mm = ts // 60000
+                        ss = (ts % 60000) / 1000
+                        lines.append(f'[{mm:02d}:{ss:05.2f}]{text}')
+                    content = '\n'.join(lines)
+                    if content.strip():
+                        return {'content': content, 'is_synced': True}
+
+                # USLT — unsynchronised lyrics (plain text block)
+                uslt_keys = [k for k in tags.keys() if k.startswith('USLT')]
+                if uslt_keys:
+                    content = str(tags[uslt_keys[0]])
+                    if content.strip():
+                        # Check if user embedded LRC timestamps in USLT
+                        is_synced = bool(_re.search(r'\[\d+:\d+', content))
+                        return {'content': content, 'is_synced': is_synced}
+
+            # ── FLAC ───────────────────────────────────────────────────────
+            elif ext == '.flac':
+                from mutagen.flac import FLAC
+                try:
+                    tags = FLAC(path)
+                except Exception:
+                    return None
+                # Try LYRICS first (LRC-format common in FLAC), then UNSYNCEDLYRICS
+                for key in ('LYRICS', 'UNSYNCEDLYRICS', 'lyrics', 'unsyncedlyrics'):
+                    val = tags.get(key)
+                    if val and val[0].strip():
+                        content   = val[0]
+                        is_synced = bool(_re.search(r'\[\d+:\d+', content))
+                        return {'content': content, 'is_synced': is_synced}
+
+            # ── M4A / MP4 (iTunes/AAC) ─────────────────────────────────────
+            elif ext in ('.m4a', '.mp4', '.aac', '.m4b', '.m4p'):
+                from mutagen.mp4 import MP4
+                try:
+                    tags = MP4(path)
+                except Exception:
+                    return None
+                val = tags.get('\xa9lyr')   # ©lyr tag
+                if val and val[0].strip():
+                    content   = val[0]
+                    is_synced = bool(_re.search(r'\[\d+:\d+', content))
+                    return {'content': content, 'is_synced': is_synced}
+
+            # ── OGG / Opus / Vorbis ────────────────────────────────────────
+            elif ext in ('.ogg', '.opus', '.oga'):
+                import mutagen
+                try:
+                    tags = mutagen.File(path)
+                except Exception:
+                    return None
+                if tags is None:
+                    return None
+                for key in ('LYRICS', 'lyrics', 'UNSYNCEDLYRICS', 'unsyncedlyrics'):
+                    val = tags.get(key)
+                    if val and str(val[0]).strip():
+                        content   = str(val[0])
+                        is_synced = bool(_re.search(r'\[\d+:\d+', content))
+                        return {'content': content, 'is_synced': is_synced}
+
+        except Exception as e:
+            print(f'[Lyrics] Embedded read error ({ext}): {e}')
+        return None
+
+    def fetch_online(self, artist, title, duration=None):
+        """Fetch from LRCLIB with Musixmatch fallback, save to DB, return dict or None."""
+        try:
+            clean_artist = artist.split("feat")[0].split("(")[0].strip()
+            clean_title  = title.split("(")[0].strip()
+            params = {"artist_name": clean_artist, "track_name": clean_title}
+            if duration and duration > 0:
+                params["duration"] = int(duration)
+            resp = requests.get("https://lrclib.net/api/get", params=params, timeout=10)
+            if resp.status_code == 200:
+                return self._process(artist, title, resp.json())
+            elif resp.status_code == 404:
+                # fuzzy fallback
+                resp2 = requests.get("https://lrclib.net/api/search",
+                                     params={"q": f"{clean_artist} {clean_title}"}, timeout=10)
+                if resp2.status_code == 200:
+                    results = resp2.json()
+                    if results and isinstance(results, list):
+                        return self._process(artist, title, results[0])
+        except Exception as e:
+            print(f"[LyricDB] LRCLIB fetch error: {e}")
+
+        # ── Musixmatch fallback ───────────────────────────────────────────
+        try:
+            result = self._fetch_musixmatch(artist, title)
+            if result:
+                return result
+        except Exception as e:
+            print(f"[LyricDB] Musixmatch fetch error: {e}")
+
+        return None
+
+    def _fetch_musixmatch(self, artist: str, title: str) -> dict | None:
+        """
+        Scrape lyrics from Musixmatch public embed endpoint.
+        No API key required — uses the public lyrics.musixmatch.com embed page.
+        Falls back gracefully if blocked or rate-limited.
+        """
+        import re as _re
+        clean_artist = artist.split("feat")[0].split("(")[0].strip()
+        clean_title  = title.split("(")[0].strip()
+
+        # Slug: lowercase, replace spaces/specials with hyphens
+        def _slug(s):
+            s = s.lower().strip()
+            s = _re.sub(r"[^a-z0-9\s-]", "", s)
+            s = _re.sub(r"[\s-]+", "-", s).strip("-")
+            return s
+
+        artist_slug = _slug(clean_artist)
+        title_slug  = _slug(clean_title)
+        url = f"https://www.musixmatch.com/lyrics/{artist_slug}/{title_slug}"
+
+        try:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/149.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+            resp = requests.get(url, headers=headers, timeout=12)
+            if resp.status_code != 200:
+                return None
+
+            html = resp.text
+            # Extract lyrics from span.lyrics__content__ok or data-lyrics-type spans
+            spans = _re.findall(
+                r'<span[^>]*class="[^"]*lyrics__content[^"]*"[^>]*>(.*?)</span>',
+                html, _re.DOTALL
+            )
+            if not spans:
+                # Newer Musixmatch markup
+                spans = _re.findall(
+                    r'<p[^>]*data-testid="lyrics-line"[^>]*>(.*?)</p>',
+                    html, _re.DOTALL
+                )
+            if not spans:
+                return None
+
+            # Strip HTML tags from each span, join with newlines
+            def _strip(s):
+                return _re.sub(r'<[^>]+>', '', s).strip()
+
+            lines = [_strip(s) for s in spans if _strip(s)]
+            if not lines:
+                return None
+
+            content = "\n".join(lines)
+            # Musixmatch always returns plain (unsynced) lyrics
+            self.save(artist, title, content, False)
+            print(f"[LyricDB] Musixmatch: found lyrics for '{clean_artist} - {clean_title}'")
+            return {"content": content, "is_synced": False}
+
+        except Exception as e:
+            print(f"[LyricDB] Musixmatch scrape error: {e}")
+            return None
+
+    def _process(self, artist, title, data):
+        content = None
+        is_synced = False
+        if data.get("syncedLyrics"):
+            content = data["syncedLyrics"]
+            is_synced = True
+        elif data.get("plainLyrics"):
+            content = data["plainLyrics"]
+            is_synced = False
+        if content:
+            self.save(artist, title, content, is_synced)
+            return {"content": content, "is_synced": is_synced}
+        return None
+
+
+# ─── MAIN API CLASS ───────────────────────────────────────────────────────────
+
+class MacanMediaAPI:
+    """Bridge Class: Methods callable from JavaScript"""
+
+    def __init__(self):
+        self._window = None
+        self.playlist = []
+        self.settings = {}
+        # FIX: Lock to prevent concurrent save_app_state / _save_settings calls
+        # from multiple JS threads (pywebview calls each JS→Python bridge on its
+        # own thread, so parallel invocations are possible).
+        self._settings_lock   = threading.Lock()
+        self._plugin_handlers = {}   # 'plugin_id:action' → callable
+        # FIX: playlist saves used to run synchronously (DELETE + bulk INSERT)
+        # on every single remove/reorder call, blocking the caller. With big
+        # playlists (5000+ tracks) that's a lot of I/O to redo on every tiny
+        # edit. Now _save_playlist() just marks state dirty and (re)starts a
+        # short debounce timer; a background thread does the actual write,
+        # so a burst of rapid edits (drag-reorder, multi-remove) collapses
+        # into a single write instead of one per mutation.
+        self._playlist_save_lock  = threading.Lock()
+        self._playlist_save_dirty = False
+        self._playlist_save_timer = None
+        # FIX: add_tracks / add_tracks_stream used to create-and-destroy a
+        # ThreadPoolExecutor on every call. Spinning up/tearing down worker
+        # threads repeatedly has its own overhead, and back-to-back bulk
+        # adds (e.g. dragging in several folders) paid that cost each time.
+        # One shared pool, created once here, is reused for every scan.
+        self._scan_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='ScanPool')
+        self._load_settings()
+        app_data = self._get_app_data()
+        self._art_cache   = AlbumArtCache(app_data)
+        self._lyric_cache = LyricCache(app_data)
+
+        # ── "Now Playing" notification bubble (floats above the system
+        #    tray). Windows-only; no-op elsewhere — safe to always construct.
+        # NOTE: only constructed here, NOT started — its worker thread /
+        # window is created later from set_window(), alongside the taskbar
+        # thumbbar init. Starting it this early (before webview.create_window()
+        # even runs) risked shifting the timing of when Explorer creates the
+        # app's taskbar button relative to TaskbarThumbBar's setup, which is
+        # timing-sensitive (see macan_taskbar_thumbbar_webview.py).
+        self._now_playing_bubble = NowPlayingBubble(app_name='Macan Media Player')
+
+    def set_window(self, window):
+        self._window = window
+
+        # ── Taskbar thumbnail toolbar (tombol Prev/Play-Pause/Next saat hover
+        #    di preview taskbar Windows) — no-op otomatis di non-Windows.
+        self._taskbar_thumbbar = TaskbarThumbBar(window=window, window_title='Macan Media Player')
+        self._taskbar_thumbbar.previous_requested.connect(
+            lambda: self._window.evaluate_js('prevTrack()'))
+        self._taskbar_thumbbar.play_pause_requested.connect(
+            lambda: self._window.evaluate_js('togglePlayPause()'))
+        self._taskbar_thumbbar.next_requested.connect(
+            lambda: self._window.evaluate_js('nextTrack()'))
+
+        # [DISABLED] Taskbar autohide detection — disabled for low-end device compatibility.
+        # Uncomment the block below (and _start_taskbar_watcher) to re-enable.
+        # if sys.platform == 'win32':
+        #     self._start_taskbar_watcher()
+
+    def notify_play_state(self, playing: bool):
+        """Dipanggil dari JS (onPlayState) supaya ikon tombol taskbar thumbbar
+        (Play <-> Pause) ikut sinkron dengan status <audio>/<video> di frontend."""
+        tb = getattr(self, '_taskbar_thumbbar', None)
+        if tb is not None:
+            tb.set_playing(bool(playing))
+
+    def show_now_playing_bubble(self, title: str, artist: str = '', artwork_data_url=None):
+        """Dipanggil dari JS (_onTrackStart) setiap kali lagu/video BARU mulai
+        diputar (bukan saat resume dari pause). Menampilkan bubble notifikasi
+        native di atas system tray berisi artist-title + artwork.
+
+        Bisa dimatikan lewat settings: save_settings({'notify_bubble_enabled': false}).
+        """
+        if not self.settings.get('notify_bubble_enabled', True):
+            return False
+        bubble = getattr(self, '_now_playing_bubble', None)
+        if bubble is None:
+            return False
+        try:
+            bubble.show(
+                title=title or '',
+                artist=artist or '',
+                artwork_data_url=artwork_data_url,
+                on_click=lambda: self._window and self._window.restore(),
+            )
+            return True
+        except Exception as e:
+            print(f'[MACAN] show_now_playing_bubble error: {e}')
+            return False
+
+    # ─── TASKBAR AUTOHIDE DETECTION (Windows) ────────────────────────────────
+    # [DISABLED] This feature polls the cursor position every 50 ms and resizes
+    # the window to open a 1-pixel gap for the taskbar peek.  On low-end devices
+    # the continuous thread + Win32 calls add measurable CPU overhead.  The call
+    # site in set_window() is also commented out.  To re-enable: uncomment
+    # everything below and un-comment the _start_taskbar_watcher() call above.
+    #
+    # def _start_taskbar_watcher(self):
+    #     import ctypes, ctypes.wintypes
+    #     THRESHOLD_PX  = 2
+    #     POLL_INTERVAL = 0.05
+    #     self._taskbar_shrunken = False
+    #
+    #     def _get_screen_size():
+    #         try:
+    #             user32 = ctypes.windll.user32
+    #             return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    #         except Exception:
+    #             return 1920, 1080
+    #
+    #     def _get_cursor_y():
+    #         try:
+    #             pt = ctypes.wintypes.POINT()
+    #             ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    #             return pt.y
+    #         except Exception:
+    #             return 0
+    #
+    #     def _watcher():
+    #         import time
+    #         screen_w, screen_h = _get_screen_size()
+    #         while True:
+    #             try:
+    #                 near_bottom = _get_cursor_y() >= screen_h - THRESHOLD_PX
+    #                 if near_bottom and not self._taskbar_shrunken:
+    #                     self._window.resize(screen_w, screen_h - 1)
+    #                     self._taskbar_shrunken = True
+    #                 elif not near_bottom and self._taskbar_shrunken:
+    #                     self._window.resize(screen_w, screen_h)
+    #                     self._taskbar_shrunken = False
+    #             except Exception:
+    #                 pass
+    #             time.sleep(POLL_INTERVAL)
+    #
+    #     threading.Thread(target=_watcher, name='TaskbarWatcher', daemon=True).start()
+
+    # ─── WINDOW MANAGEMENT ───────────────────────────────────────────────────
+
+    def close_app(self):
+        print("[MACAN] Shutdown initiated...")
+        bubble = getattr(self, '_now_playing_bubble', None)
+        if bubble is not None:
+            bubble.shutdown()
+        def delayed_close():
+            import time
+            time.sleep(0.1)
+            self._window.destroy()
+        threading.Thread(target=delayed_close, daemon=True).start()
+
+    def minimize_app(self):
+        self._window.minimize()
+
+    # ─── PLUGIN BRIDGE ───────────────────────────────────────────────────────
+
+    def register_plugin_handler(self, plugin_id: str, action: str, handler):
+        """
+        Register a Python-side handler callable by a JS plugin via plugin_request().
+
+        Usage (in main.py, after api = MacanMediaAPI()):
+            api.register_plugin_handler('my-plugin', 'fetch_data', my_fn)
+
+        The handler receives a single dict argument (the payload from JS)
+        and must return a JSON-serialisable value.
+        """
+        key = f"{plugin_id}:{action}"
+        self._plugin_handlers[key] = handler
+        print(f"[PluginBridge] Handler registered: {key}")
+
+    def plugin_request(self, plugin_id: str, action: str, payload: dict = None):
+        """
+        Generic Python route called by MacanBridge.py(pluginId, action, payload).
+
+        Routes the call to the handler registered with register_plugin_handler().
+        Returns a dict:
+          { 'ok': True,  'result': <value> }   on success
+          { 'ok': False, 'error':  <message> }  on failure / unknown action
+        """
+        key = f"{plugin_id}:{action}"
+        handler = self._plugin_handlers.get(key)
+        if handler is None:
+            return {'ok': False, 'error': f"No handler registered for '{key}'"}
+        try:
+            result = handler(payload or {})
+            return {'ok': True, 'result': result}
+        except Exception as e:
+            print(f"[PluginBridge] Handler '{key}' raised: {e}")
+            return {'ok': False, 'error': str(e)}
+
+    def toggle_fullscreen(self):
+        self._window.toggle_fullscreen()
+        
+    def open_tv_player(self, source_url=None):
+        """Launch the standalone libVLC-based TV player as its own process.
+
+        A separate process is used (not a thread) because libVLC needs a
+        real native window handle to render into, and Qt's QApplication
+        must own the main thread — something WebView2's message loop in
+        this process already occupies. This lets TV streams that the
+        browser's <video> tag can't decode play correctly via libVLC."""
+        try:
+            # Pakai folder tempat exe/script utama berada, bukan __file__
+            # (aman untuk Nuitka --standalone maupun mode dev biasa).
+            base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+            exe_name = 'tv_vlc_player.exe' if sys.platform == 'win32' else 'tv_vlc_player'
+            player_exe = os.path.join(base_dir, exe_name)
+            script     = os.path.join(base_dir, 'tv_vlc_player.py')
+            db_path    = os.path.join(self._get_app_data(), 'tv_channels.db')
+
+            if os.path.exists(player_exe):
+                # Sudah hasil compile (Nuitka) -> jalankan exe-nya langsung
+                cmd = [player_exe, '--db', db_path]
+            elif os.path.exists(script):
+                # Mode dev / belum di-compile -> jalankan lewat python
+                cmd = [sys.executable, script, '--db', db_path]
+            else:
+                raise FileNotFoundError(
+                    f'tv_vlc_player tidak ditemukan di {base_dir} '
+                    f'(cek: {player_exe} / {script})'
+                )
+
+            if source_url:
+                cmd += ['--source', source_url]
+
+            kwargs = {}
+            if sys.platform == 'win32':
+                kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+            subprocess.Popen(cmd, cwd=base_dir, **kwargs)
+            return {'ok': True}
+        except Exception as e:
+            print(f'[MACAN] open_tv_player error: {e}')
+            return {'ok': False, 'error': str(e)}
+
+    # ─── DIALOG & FILE BROWSING ───────────────────────────────────────────────
+
+    def browse_files(self):
+        """Open file dialog. Returns list of file path strings."""
+        file_types = (
+            'Media Files (*.mp3;*.mp4;*.wav;*.flac;*.ogg;*.aac;*.mkv;*.avi;*.webm;*.m4a;*.opus)',
+            'Audio (*.mp3;*.wav;*.flac;*.ogg;*.aac;*.m4a;*.opus)',
+            'Video (*.mp4;*.mkv;*.avi;*.webm)',
+            'All files (*.*)'
+        )
+        result = self._open_dialog(allow_multiple=True, file_types=file_types)
+        if result:
+            return list(result)  # raw file paths — JS calls add_tracks() next
+        return []
+
+    def browse_folder(self):
+        """Open folder dialog. Returns list of media file path strings."""
+        result = self._folder_dialog()
+        if result and len(result) > 0:
+            return self._scan_media_folder_paths(result[0])  # raw paths
+        return []
+
+    def get_file_url(self, path):
+        """Return an http:// URL for a local media file served via MediaServer.
+        Bypasses EdgeWebView2's file:// CORS block on Windows."""
+        try:
+            p = Path(path).resolve()
+            if not p.exists():
+                p = Path(urllib.parse.unquote(path)).resolve()
+            if not p.exists():
+                print(f"[MACAN] File not found: {path}")
+                return None
+            url = _media_server.register(p)
+            print(f"[MACAN] Serving: {url}  ← {p.name}")
+            return url
+        except Exception as e:
+            print(f"[MACAN] get_file_url error: {e}")
+            return None
+
+    def get_subtitle_url(self, video_path):
+        """Look for a same-named .srt file next to the video and serve it via
+        the local media server so the browser can load it cross-origin."""
+        try:
+            p = Path(video_path).resolve()
+            srt = p.with_suffix('.srt')
+            if not srt.exists():
+                # Case-insensitive fallback (useful on Windows-originated paths)
+                for sibling in p.parent.iterdir():
+                    if sibling.stem.lower() == p.stem.lower() and sibling.suffix.lower() == '.srt':
+                        srt = sibling
+                        break
+                else:
+                    return None
+            url = _media_server.register(srt)
+            print(f"[MACAN] Serving subtitle: {url}  ← {srt.name}")
+            return url
+        except Exception as e:
+            print(f"[MACAN] get_subtitle_url error: {e}")
+            return None
+
+    # ─── CACHE MANAGER ───────────────────────────────────────────────────────
+
+    def _dir_size(self, path: str) -> int:
+        """Recursively compute total size in bytes of a directory."""
+        total = 0
+        try:
+            for entry in os.scandir(path):
+                if entry.is_file(follow_symlinks=False):
+                    total += entry.stat().st_size
+                elif entry.is_dir(follow_symlinks=False):
+                    total += self._dir_size(entry.path)
+        except (PermissionError, FileNotFoundError):
+            pass
+        return total
+
+    def _fmt_bytes(self, n: int) -> str:
+        """Return human-readable size string."""
+        for unit in ('B', 'KB', 'MB', 'GB'):
+            if n < 1024:
+                return f"{n:.1f} {unit}" if unit != 'B' else f"{n} B"
+            n /= 1024
+        return f"{n:.1f} TB"
+
+    def get_cache_sizes(self):
+        """Return sizes of all cache locations as a dict with human-readable strings."""
+        app_data   = self._get_app_data()
+        wv2_path   = self._get_webview_storage_path()
+        art_path   = os.path.join(app_data, 'AlbumArtCache')
+        lyrics_db  = os.path.join(app_data, 'lyrics.db')
+
+        wv2_bytes    = self._dir_size(wv2_path)   if os.path.isdir(wv2_path)  else 0
+        art_bytes    = self._dir_size(art_path)    if os.path.isdir(art_path)  else 0
+        lyrics_bytes = os.path.getsize(lyrics_db)  if os.path.isfile(lyrics_db) else 0
+        # Video thumbnail cache is in-memory only — report count × ~5 KB estimate
+        vthumb_count = len(getattr(self, '_video_thumb_cache', {}))
+        vthumb_bytes = vthumb_count * 5 * 1024
+
+        return {
+            'webview2': {
+                'size_bytes': wv2_bytes,
+                'size_str':   self._fmt_bytes(wv2_bytes),
+                'path':       wv2_path,
+            },
+            'albumart': {
+                'size_bytes': art_bytes,
+                'size_str':   self._fmt_bytes(art_bytes),
+                'path':       art_path,
+            },
+            'lyrics': {
+                'size_bytes': lyrics_bytes,
+                'size_str':   self._fmt_bytes(lyrics_bytes),
+                'path':       lyrics_db,
+            },
+            'videothumb': {
+                'size_bytes': vthumb_bytes,
+                'size_str':   f"{vthumb_count} frames (~{self._fmt_bytes(vthumb_bytes)})",
+                'path':       'in-memory',
+            },
+        }
+
+    def clear_cache(self, target: str) -> dict:
+        """
+        Clear a specific cache. target: 'webview2' | 'albumart' | 'lyrics' | 'videothumb' | 'all'
+        Returns { ok: bool, message: str }
+        """
+        import shutil
+        app_data = self._get_app_data()
+        errors   = []
+
+        def _rmdir(path):
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+                os.makedirs(path, exist_ok=True)   # recreate empty dir
+
+        def _clear_webview2():
+            wv2 = self._get_webview_storage_path()
+            # Only delete the known cache sub-folders — leave the profile intact
+            cache_subdirs = ['Cache', 'Code Cache', 'GPUCache',
+                             'Service Worker', 'CacheStorage', 'blob_storage']
+            for sub in cache_subdirs:
+                p = os.path.join(wv2, sub)
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+            # Also remove EBWebView sub-profile caches (WebView2 nests them)
+            ebwv = os.path.join(wv2, 'EBWebView')
+            if os.path.isdir(ebwv):
+                for sub in cache_subdirs:
+                    p = os.path.join(ebwv, sub)
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+
+        def _clear_albumart():
+            art_path = os.path.join(app_data, 'AlbumArtCache')
+            _rmdir(art_path)
+            # Also wipe the SQLite art_cache table so stale references are gone
+            try:
+                with self._db_connect() as conn:
+                    conn.execute("DELETE FROM kv WHERE key LIKE 'art_%'")
+                    conn.commit()
+            except Exception:
+                pass
+
+        def _clear_lyrics():
+            lyrics_db = os.path.join(app_data, 'lyrics.db')
+            try:
+                import sqlite3 as _sq
+                with _sq.connect(lyrics_db) as lconn:
+                    lconn.execute("DELETE FROM lyrics")
+                    lconn.execute("VACUUM")
+                    lconn.commit()
+            except Exception as e:
+                errors.append(f"lyrics: {e}")
+
+        def _clear_videothumb():
+            if hasattr(self, '_video_thumb_cache'):
+                self._video_thumb_cache.clear()
+
+        targets = ['webview2', 'albumart', 'lyrics', 'videothumb'] if target == 'all' else [target]
+
+        dispatch = {
+            'webview2':   _clear_webview2,
+            'albumart':   _clear_albumart,
+            'lyrics':     _clear_lyrics,
+            'videothumb': _clear_videothumb,
+        }
+
+        for t in targets:
+            fn = dispatch.get(t)
+            if fn:
+                try:
+                    fn()
+                    print(f"[CacheManager] Cleared: {t}")
+                except Exception as e:
+                    errors.append(f"{t}: {e}")
+                    print(f"[CacheManager] Error clearing {t}: {e}")
+
+        if errors:
+            return {'ok': False, 'message': 'Partial clear — errors: ' + '; '.join(errors)}
+        return {'ok': True, 'message': f"Cache cleared: {', '.join(targets)}"}
+
+    # ─── PLAYLIST MANAGEMENT ─────────────────────────────────────────────────
+
+    def get_playlist(self):
+        return self.playlist
+
+    def add_tracks(self, file_paths):
+        """Accept list of file path strings, build track metadata in parallel,
+        append to playlist and persist.
+
+        Uses a ThreadPoolExecutor so 100+ files scan concurrently instead of
+        serially — typical speedup is 4–8× on mechanical drives, 10–20× on SSD.
+        Cover art extraction is DEFERRED (lazy) during bulk load: only title,
+        artist, album, duration, and replaygain are read here. JS will request
+        cover art per-track after the queue is rendered, keeping the bridge
+        responsive during the scan.
+        """
+        # Build a set of already-known paths for O(1) dedup
+        known = {t['path'] for t in self.playlist}
+
+        candidates = []
+        for fp in file_paths:
+            abs_path = str(Path(fp).resolve())
+            if abs_path not in known:
+                candidates.append(abs_path)
+                known.add(abs_path)   # prevent dupes within this batch too
+
+        if not candidates:
+            return self.playlist
+
+        # Parallel metadata scan — skip heavy cover_art/video_thumb at this stage.
+        # Reuses the shared self._scan_pool (built once in __init__) instead of
+        # creating/destroying a ThreadPoolExecutor on every call.
+        results = [None] * len(candidates)
+
+        def _scan(idx_path):
+            idx, fp = idx_path
+            try:
+                return idx, self._build_track_meta_fast(fp)
+            except Exception as e:
+                print(f"[MACAN] add_tracks scan error {fp}: {e}")
+                return idx, None
+
+        for idx, track in self._scan_pool.map(_scan, enumerate(candidates)):
+            if track:
+                results[idx] = track
+
+        for track in results:
+            if track:
+                self.playlist.append(track)
+
+        self._save_playlist()
+        return self.playlist
+
+    def add_tracks_stream(self, file_paths):
+        """Streaming variant of add_tracks: scans in parallel and pushes batches
+        of tracks to the JS frontend via evaluate_js() as they complete, so the
+        playlist starts rendering immediately instead of waiting for 100% completion.
+
+        JS side must implement window.onTrackBatchReady(tracks, done) to receive
+        the pushes. Returns True immediately; JS gets data asynchronously.
+        """
+        known = {t['path'] for t in self.playlist}
+        candidates = []
+        for fp in file_paths:
+            abs_path = str(Path(fp).resolve())
+            if abs_path not in known:
+                candidates.append(abs_path)
+                known.add(abs_path)
+
+        if not candidates:
+            # Nothing new — notify JS that we're done with the existing playlist
+            try:
+                import json as _json
+                self._window.evaluate_js(
+                    f'window.onTrackBatchReady({_json.dumps([])}, true)'
+                )
+            except Exception:
+                pass
+            return True
+
+        total     = len(candidates)
+        BATCH_SZ  = 8    # flush to JS every N tracks; smaller = smoother on low-end
+        batch_buf = []
+
+        def _push_batch(tracks, done=False):
+            """Serialize and push a batch to the WebView via evaluate_js."""
+            try:
+                import json as _json
+                payload = _json.dumps(tracks, ensure_ascii=False)
+                self._window.evaluate_js(
+                    f'window.onTrackBatchReady({payload}, {"true" if done else "false"})'
+                )
+            except Exception as e:
+                print(f"[MACAN] add_tracks_stream push error: {e}")
+
+        def _worker_thread():
+            nonlocal batch_buf
+            # Reuses the shared self._scan_pool instead of spinning up a
+            # fresh ThreadPoolExecutor for this call.
+            futures = {self._scan_pool.submit(self._build_track_meta_fast, fp): fp
+                       for fp in candidates}
+            # Collect in submission order to keep natural sort order
+            done_map = {}
+            for fut in futures:
+                fp = futures[fut]
+                try:
+                    done_map[fp] = fut.result()
+                except Exception as e:
+                    print(f"[MACAN] stream scan error {fp}: {e}")
+
+            for fp in candidates:
+                track = done_map.get(fp)
+                if not track:
+                    continue
+                self.playlist.append(track)
+                batch_buf.append(track)
+                if len(batch_buf) >= BATCH_SZ:
+                    _push_batch(batch_buf, done=False)
+                    batch_buf = []
+
+            # Final flush
+            _push_batch(batch_buf, done=True)
+            batch_buf = []
+            self._save_playlist()
+
+        import threading as _th
+        _th.Thread(target=_worker_thread, daemon=True).start()
+        return True
+
+    def _build_track_meta_fast(self, filepath):
+        """Lightweight version of _build_track_meta used during bulk add.
+
+        Differences from _build_track_meta:
+        - NO cover_art extraction (deferred to JS lazy fetch)
+        - NO video_thumbnail generation (deferred)
+        - NO cv2 video resolution probe (deferred)
+        - Reads tags + duration + replaygain only
+        This cuts per-file time from ~80–300ms to ~5–20ms.
+        """
+        p = Path(filepath)
+        ext = p.suffix.lower()
+        is_video = ext in {'.mp4', '.mkv', '.avi', '.webm', '.mov', '.wmv'}
+        abs_path = str(p.resolve())
+
+        meta = self._read_tags(abs_path, ext, is_video)
+        duration = meta.get('duration') or 0
+
+        # NOTE: previously fell back to cv2.VideoCapture() here when mutagen
+        # couldn't parse container duration (some AVI/WMV/MKV variants).
+        # cv2 init is heavy (~tens-hundreds of ms per file); with 100+ such
+        # videos in one scan this stalls the whole thread pool and the app
+        # feels hung. Instead, leave duration at 0 for the fast scan and
+        # resolve it lazily the first time the track is actually played
+        # (see _get_lazy_video_duration / wherever playback starts).
+
+        display_name = meta.get('title') or p.stem
+        artist       = meta.get('artist') or ''
+        album        = meta.get('album')  or ''
+
+        try:
+            file_size = p.stat().st_size
+        except Exception:
+            file_size = 0
+
+        # Cover art: only use what's already in the in-memory cache (from
+        # previous sessions); do NOT call get_cover_art() which does disk I/O
+        cover_art = None
+        if not is_video:
+            try:
+                if artist:
+                    cover_art = self._art_cache.get_cached(artist, display_name)
+            except Exception:
+                pass
+
+        replaygain_db = 0.0
+        if not is_video:
+            try:
+                rg = self._read_replaygain(abs_path, ext)
+                if rg is not None:
+                    replaygain_db = rg
+            except Exception:
+                pass
+
+        return {
+            'name':             display_name,
+            'artist':           artist,
+            'album':            album,
+            'path':             abs_path,
+            'url':              p.resolve().as_uri(),
+            'ext':              ext.lstrip('.').upper(),
+            'is_video':         is_video,
+            'duration':         duration,
+            'duration_str':     self._format_duration(duration),
+            'cover_art':        cover_art,
+            'video_thumb':      None,
+            'file_size':        file_size,
+            'video_resolution': None,
+            'replaygain_db':    replaygain_db,
+        }
+
+
+    def update_track_art(self, path, cover_art):
+        """Called from JS when cover art is fetched asynchronously (online fallback
+        or first-time fetch). Persists art back into playlist.json so restarts
+        and clear+reload cycles don't lose it."""
+        updated = False
+        for track in self.playlist:
+            if track.get('path') == path:
+                track['cover_art'] = cover_art
+                updated = True
+                break
+        if updated:
+            self._save_playlist()
+        return updated
+
+    def update_track_video_thumb(self, path, video_thumb):
+        """Same as update_track_art but for video thumbnails."""
+        updated = False
+        for track in self.playlist:
+            if track.get('path') == path:
+                track['video_thumb'] = video_thumb
+                updated = True
+                break
+        if updated:
+            self._save_playlist()
+        return updated
+
+    def update_track_duration(self, path, duration, duration_str=None):
+        """Backfill a track's duration once it's known for certain.
+
+        Used for the lazy-duration fix: _build_track_meta_fast leaves
+        duration at 0 for videos mutagen couldn't parse (some AVI/WMV/MKV
+        variants), instead of paying for a synchronous cv2 probe on every
+        such file during the bulk scan. The frontend's <video>/<audio>
+        element reads the real duration for free the moment the track is
+        actually played (loadedmetadata event) and calls this to persist
+        it — so no cv2 call is needed anywhere on this path."""
+        updated = False
+        for track in self.playlist:
+            if track.get('path') == path:
+                track['duration'] = int(duration) if duration else 0
+                track['duration_str'] = duration_str or self._format_duration(duration)
+                updated = True
+                break
+        if updated:
+            self._save_playlist()
+        return updated
+
+    def remove_track(self, path):
+        self.playlist = [t for t in self.playlist if t['path'] != path]
+        self._save_playlist()
+        return self.playlist
+
+    def clear_playlist(self):
+        self.playlist = []
+        self._save_playlist()
+        return []
+
+    # ─── MEDIA METADATA ───────────────────────────────────────────────────────
+
+    def get_cover_art(self, path):
+        """Extract Cover Art (MP3, FLAC, M4A/MP4)."""
+        path = str(path)
+        if not os.path.exists(path):
+            return None
+        try:
+            ext = os.path.splitext(path)[1].lower()
+
+            # 1. Handle M4A / MP4
+            if ext in ['.m4a', '.mp4']:
+                audio_file = MP4(path)
+                if 'covr' in audio_file and audio_file['covr']:
+                    data = bytes(audio_file['covr'][0])
+                    encoded = base64.b64encode(data).decode('utf-8')
+                    mime = 'image/png' if data.startswith(b'\x89PNG') else 'image/jpeg'
+                    return f"data:{mime};base64,{encoded}"
+
+            # 2. Handle MP3 (ID3)
+            elif ext == '.mp3':
+                audio_file = ID3(path)
+                for tag in audio_file.values():
+                    if hasattr(tag, 'data') and tag.data and 'APIC' in tag.HashKey:
+                        encoded = base64.b64encode(tag.data).decode('utf-8')
+                        return f"data:image/jpeg;base64,{encoded}"
+
+            # 3. Handle FLAC
+            elif ext == '.flac':
+                audio_file = FLAC(path)
+                if audio_file.pictures:
+                    pic = audio_file.pictures[0]
+                    encoded = base64.b64encode(pic.data).decode('utf-8')
+                    return f"data:{pic.mime};base64,{encoded}"
+
+            # 4. Fallback Generic Mutagen
+            else:
+                audio_file = mutagen.File(path)
+                if audio_file and hasattr(audio_file, 'pictures') and audio_file.pictures:
+                    pic = audio_file.pictures[0]
+                    encoded = base64.b64encode(pic.data).decode('utf-8')
+                    return f"data:{pic.mime};base64,{encoded}"
+
+        except Exception as e:
+            print(f"[Metadata] Error reading art for {path}: {e}")
+
+        return None
+
+    def get_video_preview(self, path, time_sec):
+        """API called from JS when hovering video seekbar.
+        path must be the original file path (track.path), not the http:// URL."""
+        if path.startswith('http'):
+            return None  # can't grab frames from localhost stream via OpenCV
+        return VideoThumbnailer.get_thumbnail_at_time(path, float(time_sec))
+
+    def get_video_thumbnail(self, path):
+        """Return a base64 thumbnail for a video file, extracted at ~10% of duration.
+        Result is cached in memory keyed by path so repeat calls are instant.
+
+        NON-BLOCKING: the actual cv2 decode is heavy (open container + seek +
+        decode + resize + jpeg-encode) and this method runs on the pywebview
+        JS<->Python IPC bridge thread. Doing that work synchronously here
+        freezes every other JS call (play/pause, etc.) until it finishes.
+        So: on a cache miss we kick the work to a background thread and
+        return None immediately; once the thumbnail is ready we push it to
+        the frontend via evaluate_js (same pattern as
+        get_cover_art_with_online_fallback's online-art push).
+        JS side should render a placeholder while waiting for
+        window.onVideoThumbReady.
+        """
+        if not hasattr(self, '_video_thumb_cache'):
+            self._video_thumb_cache = {}
+        if not hasattr(self, '_video_thumb_pending'):
+            self._video_thumb_pending = set()
+
+        if path in self._video_thumb_cache:
+            return self._video_thumb_cache[path]
+
+        if path in self._video_thumb_pending:
+            return None  # already being generated in background
+
+        self._video_thumb_pending.add(path)
+
+        def _bg():
+            data_uri = None
+            try:
+                cap = image_engine.VideoCapture(path)
+                if cap.is_opened():
+                    total = cap.get(image_engine.CAP_PROP_FRAME_COUNT)
+                    fps   = cap.get(image_engine.CAP_PROP_FPS) or 24
+                    # Seek to ~10% of duration, minimum 1 second in
+                    seek_frame = max(int(fps), int(total * 0.10))
+                    cap.set(image_engine.CAP_PROP_POS_FRAMES, seek_frame)
+                    ret, frame = cap.read()
+                    cap.release()
+                    if ret and frame is not None:
+                        # Dimensi langsung dari getter Mat, gak lewat numpy dulu
+                        h, w = frame.rows, frame.cols
+                        # Resize to 120×68 (16:9) — reduced from 160×90 for low-end devices
+                        target_w, target_h = 120, 68
+                        scale = min(target_w / w, target_h / h)
+                        nw, nh = int(w * scale), int(h * scale)
+                        frame = image_engine.resize(frame, (nw, nh), interpolation=image_engine.INTER_AREA)
+                        # Pad to exact size — pakai copy_make_border native, bukan
+                        # np.zeros() + slice-assign manual
+                        pad_x = target_w - nw
+                        pad_y = target_h - nh
+                        left, right = pad_x // 2, pad_x - pad_x // 2
+                        top, bottom = pad_y // 2, pad_y - pad_y // 2
+                        frame = image_engine.copy_make_border(
+                            frame, top, bottom, left, right,
+                            image_engine.BORDER_CONSTANT, (0, 0, 0, 0)
+                        )
+                        # Encode langsung ke JPEG bytes (native, tanpa numpy/PIL).
+                        # Frame masih BGR — jangan cvt_color ke RGB, imencode expect BGR.
+                        ok, buf = image_engine.imencode(
+                            '.jpg', frame, [image_engine.IMWRITE_JPEG_QUALITY, 65]  # q65: lighter on RAM
+                        )
+                        if ok:
+                            data_uri = 'data:image/jpeg;base64,' + base64.b64encode(buf).decode()
+                else:
+                    cap.release()
+            except Exception as e:
+                print(f'[VideoThumb] Error for {path}: {e}')
+            finally:
+                self._video_thumb_cache[path] = data_uri
+                self._video_thumb_pending.discard(path)
+                if data_uri and self._window:
+                    safe_path = path.replace('\\', '\\\\').replace("'", "\\'")
+                    js = f"window.onVideoThumbReady && window.onVideoThumbReady('{safe_path}', `{data_uri}`);"
+                    try:
+                        self._window.evaluate_js(js)
+                    except Exception:
+                        pass
+
+        _VIDEO_THUMB_POOL.submit(_bg)
+        return None
+
+    def reorder_playlist(self, from_index, to_index):
+        """Move a track in the server-side playlist from from_index to to_index.
+        Called after the JS drag-and-drop completes so the DB stays in sync."""
+        with self._settings_lock:
+            if (0 <= from_index < len(self.playlist)) and (0 <= to_index < len(self.playlist)):
+                item = self.playlist.pop(from_index)
+                self.playlist.insert(to_index, item)
+                self._save_playlist()
+        return True
+
+    def get_file_info(self, path):
+        """Return detailed file information for context menu File Properties."""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return None
+            ext = p.suffix.lower()
+            is_video = ext in {'.mp4', '.mkv', '.avi', '.webm', '.mov', '.wmv'}
+            stat = p.stat()
+            file_size = stat.st_size
+
+            def fmt_size(b):
+                for u in ['B', 'KB', 'MB', 'GB']:
+                    if b < 1024:
+                        return f"{b:.1f} {u}"
+                    b /= 1024
+                return f"{b:.1f} TB"
+
+            info = {
+                "name":       p.name,
+                "path":       str(p.resolve()),
+                "size":       fmt_size(file_size),
+                "size_bytes": file_size,
+                "ext":        ext.lstrip('.').upper(),
+                "is_video":   is_video,
+                "modified":   os.path.getmtime(str(p)),
+            }
+
+            if is_video:
+                try:
+                    cap = image_engine.VideoCapture(str(p))
+                    w   = int(cap.get(image_engine.CAP_PROP_FRAME_WIDTH))
+                    h   = int(cap.get(image_engine.CAP_PROP_FRAME_HEIGHT))
+                    fps = cap.get(image_engine.CAP_PROP_FPS)
+                    frames = cap.get(image_engine.CAP_PROP_FRAME_COUNT)
+                    dur = int(frames / fps) if fps and fps > 0 else 0
+                    cap.release()
+                    info["resolution"]   = f"{w}x{h}" if w and h else "Unknown"
+                    info["duration"]     = dur
+                    info["duration_str"] = self._format_duration(dur)
+                    info["fps"]          = round(fps, 2) if fps else 0
+                except Exception:
+                    info["resolution"]   = "Unknown"
+                    info["duration"]     = 0
+                    info["duration_str"] = "--:--"
+                    info["fps"]          = 0
+                    try:
+                        af = mutagen.File(str(p))
+                        if af and af.info:
+                            info["duration"]     = int(af.info.length)
+                            info["duration_str"] = self._format_duration(info["duration"])
+                    except Exception:
+                        pass
+            else:
+                meta = self._read_tags(str(p.resolve()), ext, False)
+                info["duration"]     = meta.get('duration', 0)
+                info["duration_str"] = self._format_duration(info["duration"])
+                info["title"]        = meta.get('title') or p.stem
+                info["artist"]       = meta.get('artist') or ''
+                info["album"]        = meta.get('album')  or ''
+                rg = self._read_replaygain(str(p.resolve()), ext)
+                info["replaygain_db"] = rg if rg is not None else None
+
+            return info
+        except Exception as e:
+            print(f"[MACAN] get_file_info error: {e}")
+            return None
+
+    # ─── TAG EDITOR ───────────────────────────────────────────────────────────
+
+    def get_tags(self, path):
+        """Read all editable tags from an audio file.
+        Returns dict: {title, artist, album, albumartist, tracknumber, discnumber,
+                       date, genre, comment, composer, lyrics} or None on error."""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return None
+            ext = p.suffix.lower()
+            if ext in {'.mp4', '.mkv', '.avi', '.webm', '.mov', '.wmv'}:
+                return None  # video — no tag editing
+
+            tags = {
+                "title": "", "artist": "", "album": "", "albumartist": "",
+                "tracknumber": "", "discnumber": "", "date": "", "genre": "",
+                "comment": "", "composer": "", "lyrics": ""
+            }
+
+            def _first(val):
+                """Return first string value from a mutagen list/str."""
+                if val is None:
+                    return ""
+                if isinstance(val, (list, tuple)):
+                    return str(val[0]).strip() if val else ""
+                return str(val).strip()
+
+            if ext == '.mp3':
+                try:
+                    audio = ID3(path)
+                except Exception:
+                    audio = None
+                if audio:
+                    tags["title"]       = _first(audio.get("TIT2"))
+                    tags["artist"]      = _first(audio.get("TPE1"))
+                    tags["album"]       = _first(audio.get("TALB"))
+                    tags["albumartist"] = _first(audio.get("TPE2"))
+                    tags["tracknumber"] = _first(audio.get("TRCK"))
+                    tags["discnumber"]  = _first(audio.get("TPOS"))
+                    tags["date"]        = _first(audio.get("TDRC"))
+                    tags["genre"]       = _first(audio.get("TCON"))
+                    tags["composer"]    = _first(audio.get("TCOM"))
+                    # Comment
+                    for tag in audio.values():
+                        if tag.FrameID == "COMM":
+                            tags["comment"] = _first(getattr(tag, "text", ""))
+                            break
+                    # Lyrics (unsynchronized)
+                    for tag in audio.values():
+                        if tag.FrameID == "USLT":
+                            tags["lyrics"] = getattr(tag, "text", "")
+                            break
+
+            elif ext == '.flac':
+                audio = FLAC(path)
+                tags["title"]       = _first(audio.get("title"))
+                tags["artist"]      = _first(audio.get("artist"))
+                tags["album"]       = _first(audio.get("album"))
+                tags["albumartist"] = _first(audio.get("albumartist"))
+                tags["tracknumber"] = _first(audio.get("tracknumber"))
+                tags["discnumber"]  = _first(audio.get("discnumber"))
+                tags["date"]        = _first(audio.get("date"))
+                tags["genre"]       = _first(audio.get("genre"))
+                tags["comment"]     = _first(audio.get("comment"))
+                tags["composer"]    = _first(audio.get("composer"))
+                tags["lyrics"]      = _first(audio.get("lyrics"))
+
+            elif ext in ('.m4a', '.aac'):
+                audio = MP4(path)
+                def _mp4(key):
+                    v = audio.tags.get(key) if audio.tags else None
+                    return _first(v)
+                tags["title"]       = _mp4("\xa9nam")
+                tags["artist"]      = _mp4("\xa9ART")
+                tags["album"]       = _mp4("\xa9alb")
+                tags["albumartist"] = _mp4("aART")
+                tags["date"]        = _mp4("\xa9day")
+                tags["genre"]       = _mp4("\xa9gen")
+                tags["comment"]     = _mp4("\xa9cmt")
+                tags["composer"]    = _mp4("\xa9wrt")
+                tags["lyrics"]      = _mp4("\xa9lyr")
+                # Track number: MP4 stores as (number, total) tuple
+                trk = audio.tags.get("trkn") if audio.tags else None
+                if trk and isinstance(trk[0], (tuple, list)):
+                    n, t = trk[0][0], trk[0][1]
+                    tags["tracknumber"] = f"{n}/{t}" if t else str(n)
+                disk = audio.tags.get("disk") if audio.tags else None
+                if disk and isinstance(disk[0], (tuple, list)):
+                    n, t = disk[0][0], disk[0][1]
+                    tags["discnumber"] = f"{n}/{t}" if t else str(n)
+
+            else:
+                # Generic via mutagen easy tags (OGG, OPUS, WMA, WAV, etc.)
+                audio = mutagen.File(path, easy=True)
+                if audio is not None:
+                    tags["title"]       = _first(audio.get("title"))
+                    tags["artist"]      = _first(audio.get("artist"))
+                    tags["album"]       = _first(audio.get("album"))
+                    tags["albumartist"] = _first(audio.get("albumartist"))
+                    tags["tracknumber"] = _first(audio.get("tracknumber"))
+                    tags["discnumber"]  = _first(audio.get("discnumber"))
+                    tags["date"]        = _first(audio.get("date"))
+                    tags["genre"]       = _first(audio.get("genre"))
+                    tags["comment"]     = _first(audio.get("comment"))
+                    tags["composer"]    = _first(audio.get("composer"))
+                    tags["lyrics"]      = _first(audio.get("lyrics"))
+
+            return tags
+
+        except Exception as e:
+            print(f"[TagEditor] get_tags error for {path}: {e}")
+            return None
+
+    def save_tags(self, path, tags):
+        """Write tag dict back to audio file using mutagen.
+        tags: {title, artist, album, albumartist, tracknumber, discnumber,
+               date, genre, comment, composer, lyrics}
+        Returns {ok: bool, error: str|None, updated_track: dict|None}"""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return {"ok": False, "error": "File not found", "updated_track": None}
+            ext = p.suffix.lower()
+
+            def _s(k):
+                return (tags.get(k) or "").strip()
+
+            if ext == '.mp3':
+                from mutagen.id3 import (ID3, TIT2, TPE1, TALB, TPE2, TRCK,
+                                          TPOS, TDRC, TCON, TCOM, COMM, USLT)
+                try:
+                    audio = ID3(path)
+                except Exception:
+                    audio = ID3()
+
+                def _set(frame_cls, key, **kw):
+                    val = _s(key)
+                    if val:
+                        audio[frame_cls.__name__] = frame_cls(encoding=3, text=val, **kw)
+                    else:
+                        audio.delall(frame_cls.__name__)
+
+                _set(TIT2, "title")
+                _set(TPE1, "artist")
+                _set(TALB, "album")
+                _set(TPE2, "albumartist")
+                _set(TRCK, "tracknumber")
+                _set(TPOS, "discnumber")
+                _set(TDRC, "date")
+                _set(TCON, "genre")
+                _set(TCOM, "composer")
+
+                comment = _s("comment")
+                audio.delall("COMM")
+                if comment:
+                    audio["COMM::eng"] = COMM(encoding=3, lang="eng", desc="", text=comment)
+
+                lyrics = _s("lyrics")
+                audio.delall("USLT")
+                if lyrics:
+                    audio["USLT::eng"] = USLT(encoding=3, lang="eng", desc="", text=lyrics)
+
+                audio.save(path)
+
+            elif ext == '.flac':
+                audio = FLAC(path)
+                for field, tag_key in [
+                    ("title","title"), ("artist","artist"), ("album","album"),
+                    ("albumartist","albumartist"), ("tracknumber","tracknumber"),
+                    ("discnumber","discnumber"), ("date","date"), ("genre","genre"),
+                    ("comment","comment"), ("composer","composer"), ("lyrics","lyrics")
+                ]:
+                    val = _s(field)
+                    if val:
+                        audio[tag_key] = [val]
+                    elif tag_key in audio:
+                        del audio[tag_key]
+                audio.save()
+
+            elif ext in ('.m4a', '.aac'):
+                audio = MP4(path)
+                if audio.tags is None:
+                    audio.add_tags()
+
+                def _mp4set(mp4key, field):
+                    val = _s(field)
+                    if val:
+                        audio.tags[mp4key] = [val]
+                    elif mp4key in audio.tags:
+                        del audio.tags[mp4key]
+
+                _mp4set("\xa9nam", "title")
+                _mp4set("\xa9ART", "artist")
+                _mp4set("\xa9alb", "album")
+                _mp4set("aART",   "albumartist")
+                _mp4set("\xa9day", "date")
+                _mp4set("\xa9gen", "genre")
+                _mp4set("\xa9cmt", "comment")
+                _mp4set("\xa9wrt", "composer")
+                _mp4set("\xa9lyr", "lyrics")
+
+                # Track/disc: parse "n/total" or just "n"
+                for mp4key, field in [("trkn","tracknumber"), ("disk","discnumber")]:
+                    val = _s(field)
+                    if val:
+                        parts = val.split("/")
+                        try:
+                            n = int(parts[0])
+                            t = int(parts[1]) if len(parts) > 1 else 0
+                            audio.tags[mp4key] = [(n, t)]
+                        except ValueError:
+                            pass
+                    elif mp4key in audio.tags:
+                        del audio.tags[mp4key]
+
+                audio.save()
+
+            else:
+                # Generic easy tags (OGG, OPUS, WAV, WMA, etc.)
+                audio = mutagen.File(path, easy=True)
+                if audio is None:
+                    return {"ok": False, "error": "Unsupported format", "updated_track": None}
+                for field in ["title","artist","album","albumartist","tracknumber",
+                              "discnumber","date","genre","comment","composer","lyrics"]:
+                    val = _s(field)
+                    if val:
+                        audio[field] = [val]
+                    elif field in audio:
+                        del audio[field]
+                audio.save()
+
+            # Update in-memory playlist so the change is reflected immediately
+            updated_track = None
+            for track in self.playlist:
+                if track.get("path") == str(p.resolve()):
+                    if _s("title"):  track["name"]   = _s("title")
+                    if _s("artist"): track["artist"] = _s("artist")
+                    if _s("album"):  track["album"]  = _s("album")
+                    updated_track = dict(track)
+                    break
+            self._save_playlist()
+
+            print(f"[TagEditor] Saved tags for: {p.name}")
+            return {"ok": True, "error": None, "updated_track": updated_track}
+
+        except Exception as e:
+            print(f"[TagEditor] save_tags error: {e}")
+            return {"ok": False, "error": str(e), "updated_track": None}
+
+    def save_settings(self, settings_dict):
+        with self._settings_lock:
+            self.settings.update(settings_dict)
+            self._save_settings_locked()
+        return True
+
+    def get_settings(self):
+        with self._settings_lock:
+            return dict(self.settings)
+
+    def save_app_state(self, state_dict):
+        """Save full application state: current index, position, volume, EQ bands, etc.
+        FIX: Wrapped in _settings_lock to prevent concurrent writes from parallel
+        JS→Python bridge calls (e.g. periodic 10s saves overlapping with user actions)."""
+        with self._settings_lock:
+            self.settings['app_state'] = state_dict
+            # FIX: Also sync eq_preset_name as a dedicated key so EQ preset
+            # survives even if app_state is partially corrupt or missing eqBands.
+            if isinstance(state_dict, dict):
+                eq_preset = state_dict.get('eqPreset')
+                if eq_preset and isinstance(eq_preset, str):
+                    self.settings['eq_preset_name'] = eq_preset
+                eq_bands = state_dict.get('eqBands')
+                if isinstance(eq_bands, list) and len(eq_bands) == 10:
+                    self.settings['eq_bands_backup'] = eq_bands
+            self._save_settings_locked()
+        return True
+
+    def get_app_state(self):
+        """Retrieve last saved application state.
+        FIX: Also restores eqBands/eqPreset from dedicated backup keys if missing
+        from app_state (handles upgrades from older versions)."""
+        with self._settings_lock:
+            state = dict(self.settings.get('app_state', {}))
+            # Restore EQ from backup keys if app_state doesn't have them
+            if not state.get('eqBands'):
+                backup_bands = self.settings.get('eq_bands_backup')
+                if isinstance(backup_bands, list) and len(backup_bands) == 10:
+                    state['eqBands'] = backup_bands
+            if not state.get('eqPreset'):
+                backup_preset = self.settings.get('eq_preset_name')
+                if backup_preset:
+                    state['eqPreset'] = backup_preset
+            return state
+
+    # ─── NAMED PLAYLISTS — M3U8 files + SQLite registry ───────────────────────────
+    # Each named playlist is stored as a .m3u8 file (Extended M3U, UTF-8).
+    # SQLite kv only holds the lightweight registry:
+    #   { name → { filename, count, created, modified } }
+    # — never the full track payloads. DB stays tiny regardless of playlist count.
+    #
+    # M3U8 format:
+    #   #EXTM3U
+    #   #PLAYLIST:<name>
+    #   #EXTINF:<duration>,<artist> - <title>
+    #   #EXTMACAN:{"ext":"MP3","is_video":false,"album":"..."}
+    #   /absolute/path/to/file.mp3
+    #   ...
+
+    def _get_playlists_dir(self):
+        """Directory where .m3u8 files live."""
+        d = os.path.join(self._get_app_data(), 'Playlists')
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _safe_filename(self, name):
+        """Sanitise playlist name to a safe filename (strips path chars)."""
+        safe = ''.join(c if c.isalnum() or c in ' _-.' else '_' for c in name).strip()
+        return (safe[:80] or 'playlist') + '.m3u8'
+
+    def _write_m3u8(self, name, tracks, existing_filename=None):
+        """Serialise tracks to .m3u8 and return the filename used.
+        Pass existing_filename to reuse a stable filename (avoids DB read inside lock)."""
+        pl_dir   = self._get_playlists_dir()
+        filename = existing_filename or self._safe_filename(name)
+        fpath    = os.path.join(pl_dir, filename)
+
+        lines = ['#EXTM3U', f'#PLAYLIST:{name}', '']
+        for t in tracks:
+            dur    = int(t.get('duration') or 0)
+            artist = (t.get('artist') or '').replace(',', ' ')
+            title  = t.get('name') or os.path.basename(t.get('path', ''))
+            meta   = json.dumps({
+                'ext':      t.get('ext', ''),
+                'is_video': t.get('is_video', False),
+                'album':    t.get('album', ''),
+            }, ensure_ascii=False)
+            lines.append(f'#EXTINF:{dur},{artist} - {title}')
+            lines.append(f'#EXTMACAN:{meta}')
+            lines.append(t.get('path', ''))
+            lines.append('')
+
+        with open(fpath, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        return filename
+
+    def _read_m3u8(self, filename):
+        """Parse a .m3u8 file, return list of track dicts."""
+        fpath = os.path.join(self._get_playlists_dir(), filename)
+        if not os.path.exists(fpath):
+            return []
+        tracks, extinf, extmacan = [], {}, {}
+        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line in ('#EXTM3U',) or line.startswith('#PLAYLIST:'):
+                    continue
+                if line.startswith('#EXTINF:'):
+                    rest  = line[8:]
+                    comma = rest.find(',')
+                    try:    dur = int(rest[:comma]) if comma >= 0 else 0
+                    except: dur = 0
+                    display = rest[comma+1:].strip() if comma >= 0 else rest
+                    if ' - ' in display:
+                        artist, title = display.split(' - ', 1)
+                    else:
+                        artist, title = '', display
+                    extinf = {'duration': dur, 'artist': artist.strip(),
+                              'name': title.strip()}
+                elif line.startswith('#EXTMACAN:'):
+                    try:    extmacan = json.loads(line[10:])
+                    except: extmacan = {}
+                elif not line.startswith('#') and line:
+                    path = line
+                    name = extinf.get('name') or os.path.splitext(
+                               os.path.basename(path))[0]
+                    dur  = extinf.get('duration', 0)
+                    tracks.append({
+                        'path':         path,
+                        'name':         name,
+                        'artist':       extinf.get('artist', ''),
+                        'album':        extmacan.get('album', ''),
+                        'ext':          extmacan.get('ext', '')
+                                        or os.path.splitext(path)[1].lstrip('.').upper(),
+                        'is_video':     extmacan.get('is_video', False),
+                        'duration':     dur,
+                        'duration_str': self._format_duration(dur),
+                        'cover_art':    None,
+                        'url':          '',
+                    })
+                    extinf, extmacan = {}, {}
+        return tracks
+
+    def save_named_playlist(self, name, tracks):
+        """Save one playlist as .m3u8 and update the SQLite registry."""
+        import datetime
+        ts = datetime.datetime.now().isoformat()
+        with self._settings_lock:
+            # Read registry from self.settings (in-memory) to stay consistent —
+            # using _kv_get here would read DB but self.settings may be stale
+            registry = dict(self.settings.get('pl_registry', {}))
+            existing = registry.get(name, {})
+            existing_filename = existing.get('filename')
+            # Write the .m3u8 file
+            filename = self._write_m3u8(name, tracks, existing_filename)
+            # Update registry entry
+            registry[name] = {
+                'name':     name,
+                'filename': filename,
+                'count':    len(tracks),
+                'created':  existing.get('created', ts),
+                'modified': ts,
+            }
+            # FIX: MUST update self.settings so _save_settings_locked() doesn't
+            # overwrite this with stale data the next time save_app_state is called.
+            self.settings['pl_registry'] = registry
+            self._kv_set('pl_registry', registry)
+            print(f'[MACAN] Saved playlist "{name}" → {filename} ({len(tracks)} tracks)')
+        return True
+
+    def get_playlist_registry(self):
+        """Return lightweight registry {name → {name,filename,count,created,modified}}.
+        No track payloads — fast for populating the playlist list UI."""
+        with self._settings_lock:
+            # FIX: Read from self.settings (in-memory) which is always up-to-date
+            # after save_named_playlist updates it. Fallback to DB if not in memory.
+            reg = self.settings.get('pl_registry')
+            if reg is None:
+                reg = self._kv_get('pl_registry', {})
+                self.settings['pl_registry'] = reg
+            return dict(reg)
+
+    def load_named_playlist(self, name):
+        """Return list of lightweight track dicts (path + M3U metadata) for `name`.
+        No heavy metadata rebuild — JS uses paths to call add_tracks() directly."""
+        with self._settings_lock:
+            registry = self.settings.get('pl_registry') or self._kv_get('pl_registry', {})
+            entry    = registry.get(name)
+        if not entry:
+            return []
+        return self._read_m3u8(entry['filename'])
+
+    def get_playlist_paths(self, name):
+        """Return plain list of file path strings for a named playlist.
+        This is the minimal fast call — JS feeds paths straight to add_tracks()."""
+        with self._settings_lock:
+            registry = self.settings.get('pl_registry') or self._kv_get('pl_registry', {})
+            entry    = registry.get(name)
+        if not entry:
+            return []
+        tracks = self._read_m3u8(entry['filename'])
+        return [t['path'] for t in tracks if t.get('path')]
+
+    def replace_playlist(self, file_paths):
+        """Clear the current queue then rebuild via add_tracks pipeline."""
+        self.playlist = []
+        return self.add_tracks(file_paths)
+
+    def delete_named_playlist(self, name):
+        """Remove .m3u8 file and registry entry for a named playlist."""
+        with self._settings_lock:
+            # FIX: Read from self.settings (in-memory) to stay consistent
+            registry = dict(self.settings.get('pl_registry', {}))
+            entry    = registry.pop(name, None)
+            if entry:
+                try:
+                    os.remove(os.path.join(self._get_playlists_dir(),
+                                           entry['filename']))
+                except OSError:
+                    pass
+                # FIX: Update self.settings so _save_settings_locked doesn't restore deleted entry
+                self.settings['pl_registry'] = registry
+                self._kv_set('pl_registry', registry)
+        return True
+
+    def export_named_playlist(self, name):
+        """Return raw .m3u8 text so JS can offer a Save-As download."""
+        with self._settings_lock:
+            registry = self.settings.get('pl_registry') or self._kv_get('pl_registry', {})
+            entry    = registry.get(name)
+        if not entry:
+            return None
+        fpath = os.path.join(self._get_playlists_dir(), entry['filename'])
+        if not os.path.exists(fpath):
+            return None
+        with open(fpath, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    def import_m3u_playlist(self, name, m3u_text):
+        """Import M3U/M3U8 text from JS (FileReader result), parse, save."""
+        import datetime, tempfile, shutil
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.m3u8')
+        try:
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                f.write(m3u_text)
+            # Move to Playlists dir so _read_m3u8 can resolve relative paths
+            pl_dir   = self._get_playlists_dir()
+            filename = self._safe_filename(name)
+            dest     = os.path.join(pl_dir, filename)
+            shutil.move(tmp_path, dest)
+            tracks = self._read_m3u8(filename)
+            ts     = datetime.datetime.now().isoformat()
+            with self._settings_lock:
+                # FIX: Read from self.settings and write back to self.settings
+                registry = dict(self.settings.get('pl_registry', {}))
+                registry[name] = {
+                    'name': name, 'filename': filename,
+                    'count': len(tracks),
+                    'created': ts, 'modified': ts,
+                }
+                # FIX: Update self.settings so _save_settings_locked doesn't overwrite
+                self.settings['pl_registry'] = registry
+                self._kv_set('pl_registry', registry)
+            return {'ok': True, 'count': len(tracks)}
+        except Exception as e:
+            print(f'[MACAN] import_m3u error: {e}')
+            try: os.remove(tmp_path)
+            except: pass
+            return {'ok': False, 'error': str(e)}
+
+    # ─── Legacy shims (JS may still call old names during transition) ────────────────
+    def save_named_playlists(self, playlists_dict):
+        """Bulk-save shim: migrates old JSON-blob named playlists to M3U8."""
+        for name, entry in playlists_dict.items():
+            tracks = entry.get('tracks', [])
+            if tracks:
+                self.save_named_playlist(name, tracks)
+        return True
+
+    def get_named_playlists(self):
+        """Legacy shim — returns registry dict (no tracks) for old UI code."""
+        return self.get_playlist_registry()
+
+    def save_eq_custom(self, bands):
+        """Persist the 10-band custom EQ preset values (list of 10 floats)."""
+        with self._settings_lock:
+            self.settings['eq_custom_preset'] = bands
+            self._kv_set('eq_custom_preset', bands)
+        return True
+
+    def get_eq_custom(self):
+        """Return the saved custom EQ preset, or a flat all-zeros preset if none."""
+        with self._settings_lock:
+            return list(self.settings.get('eq_custom_preset',
+                                          self._kv_get('eq_custom_preset', [0]*10)))
+
+    def save_eq_preset_name(self, preset_name):
+        """Persist the last-selected EQ preset name (e.g. 'Rock', 'Custom', 'Flat').
+        Stored as a dedicated kv key so it survives even if app_state is missing."""
+        if not isinstance(preset_name, str) or not preset_name:
+            return False
+        with self._settings_lock:
+            self.settings['eq_preset_name'] = preset_name
+            self._kv_set('eq_preset_name', preset_name)
+        return True
+
+    def get_eq_preset_name(self):
+        """Return the last saved EQ preset name, or 'Flat' as default."""
+        with self._settings_lock:
+            return self.settings.get('eq_preset_name',
+                                     self._kv_get('eq_preset_name', 'Flat'))
+
+    # ─── CONVERTER BRIDGE ────────────────────────────────────────────────────
+    # Wraps core/converter.py into pywebview-callable methods.
+    # Progress is pushed to the frontend via evaluate_js so the JS layer never
+    # needs to poll — identical pattern to get_cover_art_with_online_fallback().
+
+    def converter_get_formats(self):
+        """Return supported formats and bitrates for the UI to populate dropdowns."""
+        from core.converter import AUDIO_FORMATS, VIDEO_FORMATS, AUDIO_BITRATES, VIDEO_ENCODERS
+        return {
+            'audio_formats':  AUDIO_FORMATS,
+            'video_formats':  VIDEO_FORMATS,
+            'audio_bitrates': AUDIO_BITRATES,
+            'video_encoders': VIDEO_ENCODERS,
+        }
+
+    def converter_browse_files(self, mode: str) -> list | None:
+        """Open a file dialog filtered by mode: 'audio' | 'video'."""
+        if mode == 'audio':
+            types = ('Audio Files (*.mp3;*.wav;*.aac;*.flac;*.ogg;*.m4a)',)
+        elif mode == 'video':
+            types = ('Video Files (*.mp4;*.mkv;*.avi;*.mov;*.webm)',)
+        else:
+            types = ()
+        result = self._open_dialog(allow_multiple=True, file_types=types)
+        return list(result) if result else None
+
+    def converter_browse_output_folder(self) -> str | None:
+        """Open a folder picker for the output directory."""
+        result = self._folder_dialog()
+        if result:
+            return result[0] if isinstance(result, (list, tuple)) else result
+        return None
+
+    def converter_start(self, job_id: str, files: list[str], output_dir: str,
+                        mode: str, options: dict) -> dict:
+        """
+        Start a conversion job in a background thread.
+
+        mode:    'audio' | 'video' | 'extract_audio'
+        options: dict matching AudioConverter / VideoConverter kwargs
+        job_id:  opaque string used to route JS progress callbacks
+
+        Returns immediately with {'ok': True} or {'ok': False, 'error': '...'}.
+        Progress updates are pushed via evaluate_js:
+            window.converterProgress(job_id, index, total, percent, status)
+        Completion:
+            window.converterDone(job_id, success, message)
+        """
+        from core.converter import (
+            find_ffmpeg, AudioConverter, VideoConverter,
+            ExtractAudioConverter, BatchRunner
+        )
+
+        if not files:
+            return {'ok': False, 'error': 'No files provided.'}
+        if not output_dir or not os.path.isdir(output_dir):
+            return {'ok': False, 'error': 'Invalid output folder.'}
+
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            return {'ok': False, 'error':
+                    'ffmpeg not found. Place ffmpeg.exe next to the application '
+                    'or add it to your system PATH.'}
+
+        total = len(files)
+        # Shared mutable state for batch tracking
+        state = {'index': 0, 'cancelled': False}
+
+        def make_progress_cb(idx):
+            def cb(pct, status):
+                if self._window:
+                    js = (f"window.converterProgress && "
+                          f"window.converterProgress({json.dumps(job_id)}, "
+                          f"{idx}, {total}, {pct}, {json.dumps(status)});")
+                    try:
+                        self._window.evaluate_js(js)
+                    except Exception:
+                        pass
+            return cb
+
+        def make_done_cb(idx, fname):
+            def cb(success, message):
+                if not success:
+                    state['cancelled'] = True
+                if self._window:
+                    js = (f"window.converterItemDone && "
+                          f"window.converterItemDone({json.dumps(job_id)}, "
+                          f"{idx}, {total}, {json.dumps(success)}, "
+                          f"{json.dumps(fname)}, {json.dumps(message)});")
+                    try:
+                        self._window.evaluate_js(js)
+                    except Exception:
+                        pass
+            return cb
+
+        tasks = []
+        for idx, fpath in enumerate(files):
+            fname    = os.path.basename(fpath)
+            prog_cb  = make_progress_cb(idx)
+            done_cb  = make_done_cb(idx, fname)
+
+            if mode == 'audio':
+                task = AudioConverter(
+                    ffmpeg_path  = ffmpeg,
+                    input_path   = fpath,
+                    output_dir   = output_dir,
+                    out_format   = options.get('out_format', 'mp3'),
+                    bitrate      = options.get('bitrate', '192k'),
+                    progress_cb  = prog_cb,
+                    done_cb      = done_cb,
+                )
+            elif mode == 'extract_audio':
+                task = ExtractAudioConverter(
+                    ffmpeg_path  = ffmpeg,
+                    input_path   = fpath,
+                    output_dir   = output_dir,
+                    out_format   = options.get('out_format', 'mp3'),
+                    bitrate      = options.get('bitrate', '192k'),
+                    progress_cb  = prog_cb,
+                    done_cb      = done_cb,
+                )
+            elif mode == 'video':
+                task = VideoConverter(
+                    ffmpeg_path  = ffmpeg,
+                    input_path   = fpath,
+                    output_dir   = output_dir,
+                    out_format   = options.get('out_format', 'mp4'),
+                    resolution   = options.get('resolution', 'original'),
+                    quality      = options.get('quality', 'medium'),
+                    use_gpu      = options.get('use_gpu', False),
+                    advanced     = options.get('advanced', False),
+                    v_bitrate    = options.get('v_bitrate', 'auto'),
+                    fps          = options.get('fps', 'original'),
+                    v_encoder    = options.get('v_encoder', 'libx264'),
+                    a_encoder    = options.get('a_encoder', 'aac'),
+                    a_bitrate    = options.get('a_bitrate', 'original'),
+                    a_channels   = options.get('a_channels', 'original'),
+                    a_samplerate = options.get('a_samplerate', 'original'),
+                    custom_flags = options.get('custom_flags', ''),
+                    ref_frames   = options.get('ref_frames', 0),
+                    use_cabac    = options.get('use_cabac', True),
+                    progress_cb  = prog_cb,
+                    done_cb      = done_cb,
+                )
+            else:
+                return {'ok': False, 'error': f'Unknown mode: {mode}'}
+
+            tasks.append(task)
+
+        def on_item_start(idx, total, fname):
+            if self._window:
+                js = (f"window.converterItemStart && "
+                      f"window.converterItemStart({json.dumps(job_id)}, "
+                      f"{idx}, {total}, {json.dumps(fname)});")
+                try:
+                    self._window.evaluate_js(js)
+                except Exception:
+                    pass
+
+        def on_all_done(ok_count, fail_count):
+            if self._window:
+                js = (f"window.converterDone && "
+                      f"window.converterDone({json.dumps(job_id)}, "
+                      f"{ok_count}, {fail_count});")
+                try:
+                    self._window.evaluate_js(js)
+                except Exception:
+                    pass
+            # Remove batch runner from registry
+            self._converter_jobs.pop(job_id, None)
+
+        runner = BatchRunner(tasks, on_item_start, on_all_done)
+        # Store reference so we can cancel
+        if not hasattr(self, '_converter_jobs'):
+            self._converter_jobs = {}
+        self._converter_jobs[job_id] = runner
+        runner.start()
+        return {'ok': True}
+
+    def converter_cancel(self, job_id: str) -> dict:
+        """Cancel an active conversion job."""
+        if not hasattr(self, '_converter_jobs'):
+            return {'ok': False, 'error': 'No active jobs.'}
+        runner = self._converter_jobs.get(job_id)
+        if runner:
+            runner.stop()
+            self._converter_jobs.pop(job_id, None)
+            return {'ok': True}
+        return {'ok': False, 'error': 'Job not found.'}
+
+    def converter_open_folder(self, folder_path: str) -> dict:
+        """Open the output folder in the OS file explorer."""
+        import subprocess as sp
+        if not os.path.isdir(folder_path):
+            return {'ok': False, 'error': 'Folder not found.'}
+        try:
+            if sys.platform == 'win32':
+                os.startfile(folder_path)
+            elif sys.platform == 'darwin':
+                sp.Popen(['open', folder_path])
+            else:
+                sp.Popen(['xdg-open', folder_path])
+            return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    # ─── PLUGIN MANAGER ──────────────────────────────────────────────────────
+    # Plugins are .js files stored in assets/plugins/.
+    # plugins.config.js references them by path — pm_set_enabled toggles
+    # the comment-out status of a line in plugins.config.js.
+
+    def _get_plugins_dir(self) -> Path:
+        base = Path(os.path.dirname(os.path.abspath(__file__))) / 'assets' / 'plugins'
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    def _get_plugins_config_path(self) -> Path:
+        return Path(os.path.dirname(os.path.abspath(__file__))) / 'assets' / 'plugins.config.js'
+
+    def pm_list_plugins(self) -> list:
+        """Return list of dicts: {filename, enabled, size_bytes, size_str}."""
+        plugins_dir = self._get_plugins_dir()
+        config_path = self._get_plugins_config_path()
+
+        # Read enabled plugin paths from plugins.config.js
+        enabled_set = set()
+        try:
+            import re as _re
+            config_text = config_path.read_text(encoding='utf-8')
+            # Match uncommented lines like: 'plugins/foo.js',
+            for m in _re.finditer(r"^\s*'(plugins/[^']+\.js)'", config_text, _re.MULTILINE):
+                enabled_set.add(m.group(1).split('/')[-1])
+        except Exception as e:
+            print(f"[PluginManager] Could not read plugins.config.js: {e}")
+
+        result = []
+        try:
+            for p in sorted(plugins_dir.iterdir()):
+                if p.suffix.lower() == '.js' and p.is_file():
+                    sz = p.stat().st_size
+                    result.append({
+                        'filename':   p.name,
+                        'enabled':    p.name in enabled_set,
+                        'size_bytes': sz,
+                        'size_str':   self._fmt_bytes(sz),
+                    })
+        except Exception as e:
+            print(f"[PluginManager] pm_list_plugins error: {e}")
+        return result
+
+    def pm_add_plugin(self) -> dict:
+        """Open a file dialog to pick a .js plugin file, copy it to assets/plugins/."""
+        try:
+            result = self._open_dialog(
+                allow_multiple=False,
+                file_types=('JavaScript Plugin (*.js)', 'All files (*.*)')
+            )
+            if not result or len(result) == 0:
+                return {'ok': False, 'error': 'cancelled'}
+
+            src = Path(result[0])
+            if not src.exists() or src.suffix.lower() != '.js':
+                return {'ok': False, 'error': 'Invalid file. Must be a .js file.'}
+
+            dest = self._get_plugins_dir() / src.name
+            import shutil as _shutil
+            _shutil.copy2(str(src), str(dest))
+            print(f"[PluginManager] Added plugin: {dest.name}")
+            return {'ok': True, 'filename': dest.name}
+        except Exception as e:
+            print(f"[PluginManager] pm_add_plugin error: {e}")
+            return {'ok': False, 'error': str(e)}
+
+    def pm_remove_plugin(self, filename: str) -> dict:
+        """Delete a plugin .js file from assets/plugins/ and remove it from config."""
+        try:
+            dest = self._get_plugins_dir() / Path(filename).name
+            if dest.exists():
+                dest.unlink()
+            # Also disable in config if present
+            self.pm_set_enabled(filename, False)
+            print(f"[PluginManager] Removed plugin: {filename}")
+            return {'ok': True}
+        except Exception as e:
+            print(f"[PluginManager] pm_remove_plugin error: {e}")
+            return {'ok': False, 'error': str(e)}
+
+    def pm_set_enabled(self, filename: str, enabled: bool) -> dict:
+        """Toggle a plugin line in plugins.config.js by commenting/uncommenting it."""
+        import re as _re
+        config_path = self._get_plugins_config_path()
+        try:
+            text = config_path.read_text(encoding='utf-8')
+            safe_name = Path(filename).name
+            plugin_path = f"plugins/{safe_name}"
+
+            if enabled:
+                # Uncomment: '// \'plugins/foo.js\''  →  '\'plugins/foo.js\','
+                # Handle lines that are commented out
+                new_text = _re.sub(
+                    r"(\s*)//\s*('\"?)(" + _re.escape(plugin_path) + r")('\"?,?)",
+                    lambda m: f"{m.group(1)}'{plugin_path}',",
+                    text
+                )
+                # If still not present at all, inject before the closing bracket
+                if plugin_path not in new_text:
+                    new_text = new_text.replace(
+                        '    // ───────────────────────────────────────────────────────',
+                        f"    '{plugin_path}',\n    // ───────────────────────────────────────────────────────",
+                        1
+                    )
+                    # Fallback: insert before the closing ] of PLUGINS
+                    if plugin_path not in new_text:
+                        new_text = _re.sub(
+                            r'(const PLUGINS\s*=\s*\[)',
+                            r"\1\n    '" + plugin_path + "',",
+                            new_text,
+                            count=1
+                        )
+            else:
+                # Comment out the active line
+                new_text = _re.sub(
+                    r"^(\s*)('\"?)(" + _re.escape(plugin_path) + r")('\"?,?)\s*$",
+                    lambda m: f"{m.group(1)}// '{plugin_path}',",
+                    text,
+                    flags=_re.MULTILINE
+                )
+
+            config_path.write_text(new_text, encoding='utf-8')
+            action = 'enabled' if enabled else 'disabled'
+            print(f"[PluginManager] Plugin {action}: {safe_name}")
+            return {'ok': True}
+        except Exception as e:
+            print(f"[PluginManager] pm_set_enabled error: {e}")
+            return {'ok': False, 'error': str(e)}
+
+    # ─── PRIVATE: DIALOG WRAPPERS ─────────────────────────────────────────────
+
+    def _open_dialog(self, allow_multiple=False, file_types=()):
+        try:
+            from webview import FileDialog
+            dialog_type = FileDialog.OPEN
+        except ImportError:
+            try:
+                from webview.util import FileDialog
+                dialog_type = FileDialog.OPEN
+            except ImportError:
+                dialog_type = webview.OPEN_DIALOG
+        try:
+            return self._window.create_file_dialog(
+                dialog_type, allow_multiple=allow_multiple, file_types=file_types)
+        except Exception as e:
+            print(f"[MACAN] Open dialog error: {e}")
+            return None
+
+    def _folder_dialog(self):
+        try:
+            from webview import FileDialog
+            dialog_type = FileDialog.FOLDER
+        except ImportError:
+            try:
+                from webview.util import FileDialog
+                dialog_type = FileDialog.FOLDER
+            except ImportError:
+                dialog_type = webview.FOLDER_DIALOG
+        try:
+            return self._window.create_file_dialog(dialog_type)
+        except Exception as e:
+            print(f"[MACAN] Folder dialog error: {e}")
+            return None
+
+    # ─── PRIVATE: TRACK / SCAN HELPERS ───────────────────────────────────────
+
+    def _build_track_meta(self, filepath):
+        p = Path(filepath)
+        ext = p.suffix.lower()
+        is_video = ext in {'.mp4', '.mkv', '.avi', '.webm', '.mov', '.wmv'}
+        abs_path = str(p.resolve())
+
+        # Read metadata (title, artist, album) from tags
+        meta = self._read_tags(abs_path, ext, is_video)
+        duration = meta.get('duration') or self._get_duration(abs_path)
+
+        # Display name: prefer tag title, else filename stem
+        display_name = meta.get('title') or p.stem
+        artist       = meta.get('artist') or ''
+        album        = meta.get('album')  or ''
+
+        # File size
+        try:
+            file_size = p.stat().st_size
+        except Exception:
+            file_size = 0
+
+        # Pre-fetch cover art for audio files
+        # Priority: 1) embedded tags  2) SQLite online art cache (from previous sessions)
+        cover_art = None
+        if not is_video:
+            try:
+                cover_art = self.get_cover_art(abs_path)
+            except Exception:
+                cover_art = None
+            # If no embedded art, check the local SQLite art cache populated by
+            # previous online fetches — this survives clear+reload cycles
+            if not cover_art:
+                try:
+                    meta_for_cache = meta  # already read above
+                    artist = meta_for_cache.get('artist') or ''
+                    title  = meta_for_cache.get('title')  or p.stem
+                    if artist:
+                        cover_art = self._art_cache.get_cached(artist, title)
+                except Exception:
+                    cover_art = None
+
+        # Pre-generate thumbnail for video files (cached in memory)
+        video_thumb = None
+        if is_video:
+            try:
+                video_thumb = self.get_video_thumbnail(abs_path)
+            except Exception:
+                video_thumb = None
+
+        # Video resolution (width x height)
+        video_resolution = None
+        if is_video:
+            try:
+                cap = image_engine.VideoCapture(abs_path)
+                w = int(cap.get(image_engine.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(image_engine.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
+                if w and h:
+                    video_resolution = f"{w}x{h}"
+            except Exception:
+                video_resolution = None
+
+        # ReplayGain tag reading for audio normalization
+        replaygain_db = 0.0
+        if not is_video:
+            try:
+                rg = self._read_replaygain(abs_path, ext)
+                if rg is not None:
+                    replaygain_db = rg
+            except Exception:
+                pass
+
+        return {
+            "name":             display_name,
+            "artist":           artist,
+            "album":            album,
+            "path":             abs_path,
+            "url":              p.resolve().as_uri(),
+            "ext":              ext.lstrip('.').upper(),
+            "is_video":         is_video,
+            "duration":         duration,
+            "duration_str":     self._format_duration(duration),
+            "cover_art":        cover_art,
+            "video_thumb":      video_thumb,
+            "file_size":        file_size,
+            "video_resolution": video_resolution,
+            "replaygain_db":    replaygain_db,
+        }
+
+    def _read_replaygain(self, path, ext):
+        """Read ReplayGain track gain tag from audio file. Returns dB float or None."""
+        try:
+            if ext == '.mp3':
+                audio = ID3(path)
+                # Standard TXXX:REPLAYGAIN_TRACK_GAIN
+                for tag in audio.values():
+                    if hasattr(tag, 'desc') and 'REPLAYGAIN_TRACK_GAIN' in tag.desc.upper():
+                        val = str(tag.text[0]) if tag.text else ''
+                        return float(val.split()[0])
+            elif ext == '.flac':
+                audio = FLAC(path)
+                gain = audio.get('REPLAYGAIN_TRACK_GAIN', [None])[0]
+                if gain:
+                    return float(gain.split()[0])
+            elif ext in ('.m4a', '.mp4'):
+                audio = mutagen.File(path)
+                if audio and audio.tags:
+                    gain_bytes = audio.tags.get('----:com.apple.iTunes:REPLAYGAIN_TRACK_GAIN', [None])[0]
+                    if gain_bytes:
+                        return float(gain_bytes.decode('utf-8').split()[0])
+            else:
+                audio = mutagen.File(path)
+                if audio and audio.tags:
+                    for k, v in audio.tags.items():
+                        if 'REPLAYGAIN_TRACK_GAIN' in k.upper():
+                            val = str(v[0]) if isinstance(v, list) else str(v)
+                            return float(val.split()[0])
+        except Exception:
+            pass
+        return None
+
+    def _scan_media_folder_paths(self, folder):
+        """Recursively scan folder and return list of media file path strings."""
+        extensions = {'.mp3', '.mp4', '.wav', '.flac', '.ogg', '.aac',
+                      '.mkv', '.avi', '.webm', '.m4a', '.opus', '.mov', '.wmv'}
+        paths = []
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for f in sorted(files):
+                if Path(f).suffix.lower() in extensions:
+                    paths.append(os.path.join(root, f))
+        return paths
+
+    def _read_tags(self, path, ext, is_video):
+        """Read title, artist, album, duration from file tags.
+
+        For video files, tag fields (title/artist/album) are skipped, but
+        duration IS read via mutagen's container parser (MP4/MKV/etc.) —
+        this is fast (no ffprobe spawn) and works for most common formats.
+        """
+        result = {}
+        if is_video:
+            # FIX: read duration from container metadata for videos too.
+            # mutagen.File() parses MP4/MOV/MKV/WEBM/AVI atoms/headers without
+            # spawning ffprobe — cheap enough for bulk scans.
+            try:
+                media_file = mutagen.File(path)
+                if media_file and media_file.info and getattr(media_file.info, 'length', 0):
+                    result['duration'] = int(media_file.info.length)
+            except Exception as e:
+                print(f"[Tags] Could not read video duration for {path}: {e}")
+            return result
+        try:
+            audio_file = mutagen.File(path, easy=True)
+            if audio_file is None:
+                return result
+            # EasyID3 / EasyMP4 use lowercase list values
+            def _get(key):
+                val = audio_file.get(key)
+                if val and isinstance(val, (list, tuple)) and val[0]:
+                    return str(val[0]).strip()
+                return None
+            result['title']    = _get('title')
+            result['artist']   = _get('artist')
+            result['album']    = _get('album')
+            if audio_file.info:
+                result['duration'] = int(audio_file.info.length)
+        except Exception as e:
+            print(f"[Tags] Could not read tags for {path}: {e}")
+        return result
+
+    # ─── ONLINE ART FALLBACK ──────────────────────────────────────────────────
+
+    def get_cover_art_with_online_fallback(self, path):
+        """Get cover art: embedded tags → local cache → iTunes API."""
+        # 1. Try embedded art first
+        embedded = self.get_cover_art(path)
+        if embedded:
+            return embedded
+
+        # 2. Need artist + title for online search
+        p = Path(path)
+        ext = p.suffix.lower()
+        meta = self._read_tags(str(p.resolve()), ext, False)
+        artist = meta.get('artist') or ''
+        title  = meta.get('title')  or p.stem
+
+        if not artist:
+            return None  # can't search without artist
+
+        # 3. Check local SQLite cache
+        cached = self._art_cache.get_cached(artist, title)
+        if cached:
+            return cached
+
+        # 4. Fetch from iTunes API in background thread (non-blocking) — 
+        #    return None now; JS will call this again or use polling
+        def _bg():
+            result = self._art_cache.fetch_online(artist, title)
+            if result and self._window:
+                # Push art update to frontend via JS eval
+                safe_path = path.replace('\\', '\\\\').replace("'", "\\'")
+                js = f"window.onOnlineArtReady && window.onOnlineArtReady('{safe_path}', `{result}`);"
+                try:
+                    self._window.evaluate_js(js)
+                except Exception:
+                    pass
+        threading.Thread(target=_bg, daemon=True).start()
+        return None
+
+    # ─── LYRICS ───────────────────────────────────────────────────────────────
+
+    def get_lyrics(self, path, artist, title, duration=None):
+        """Get lyrics for a track.
+        Priority:
+          1) Embedded metadata (USLT/SYLT/©lyr/vorbis LYRICS)
+          2) Local .lrc sidecar file
+          3) Local SQLite DB (previously fetched)
+          4) LRCLIB online (synced preferred)
+          5) Musixmatch online fallback (plain lyrics)
+        Returns {content, is_synced} or None.
+        """
+        import re as _re
+
+        # Normalise inputs — use tag data as fallback
+        if not artist or not title:
+            p = Path(path)
+            meta = self._read_tags(str(p.resolve()), p.suffix.lower(), False)
+            artist = artist or meta.get('artist') or ''
+            title  = title  or meta.get('title')  or p.stem
+
+        # 1. Embedded metadata lyrics (highest priority — offline, zero latency)
+        try:
+            embedded = self._lyric_cache.read_embedded(path)
+            if embedded:
+                print(f"[Lyrics] Found embedded lyrics in: {Path(path).name}")
+                # Cache to DB so future loads skip the file read
+                if artist and title:
+                    self._lyric_cache.save(
+                        artist, title,
+                        embedded['content'], embedded['is_synced']
+                    )
+                return embedded
+        except Exception as e:
+            print(f"[Lyrics] Embedded read error: {e}")
+
+        # 2. Local .lrc sidecar — same folder, same stem as the audio file
+        try:
+            lrc_path = Path(path).with_suffix('.lrc')
+            if lrc_path.exists():
+                lrc_text = lrc_path.read_text(encoding='utf-8', errors='replace').strip()
+                if lrc_text:
+                    print(f"[Lyrics] Found local .lrc: {lrc_path.name}")
+                    is_synced = bool(_re.search(r'\[\d+:\d+', lrc_text))
+                    if artist and title:
+                        self._lyric_cache.save(artist, title, lrc_text, is_synced)
+                    return {'content': lrc_text, 'is_synced': is_synced}
+        except Exception as e:
+            print(f"[Lyrics] .lrc read error: {e}")
+
+        if not artist or not title:
+            return None
+
+        # 3. Local SQLite DB (previously fetched online result)
+        cached = self._lyric_cache.get(artist, title)
+        if cached:
+            return cached
+
+        # 4 + 5. Online fetch — LRCLIB first, Musixmatch fallback (inside fetch_online)
+        result = self._lyric_cache.fetch_online(artist, title, duration)
+        return result
+
+
+    def get_cover_art_blob(self, path):
+        """Return cover art as base64 PNG for use with navigator.mediaSession.
+        Falls back to None if no art is available."""
+        # Reuse the existing art cache logic
+        try:
+            art = self._art_cache.get_art(path)
+            if art:
+                return art  # already base64 data-url
+        except Exception:
+            pass
+        return None
+
+    def _get_duration(self, path):
+        """Fallback duration reader using mutagen for any file type."""
+        try:
+            audio_file = mutagen.File(path)
+            if audio_file and audio_file.info:
+                return int(audio_file.info.length)
+        except Exception:
+            pass
+        # For video files, try image_engine
+        try:
+            cap = image_engine.VideoCapture(path)
+            fps    = cap.get(image_engine.CAP_PROP_FPS)
+            frames = cap.get(image_engine.CAP_PROP_FRAME_COUNT)
+            cap.release()
+            if fps and fps > 0 and frames > 0:
+                return int(frames / fps)
+        except Exception:
+            pass
+        return 0
+
+    def _format_duration(self, seconds):
+        if not seconds:
+            return "--:--"
+        m, s = divmod(int(seconds), 60)
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    # ─── PRIVATE: PERSISTENCE ─────────────────────────────────────────────────
+
+    # ─── PRIVATE: PATH HELPERS ────────────────────────────────────────────────
+
+    def _get_app_data(self):
+        """Return the persistent app-data directory for Macan Media Player.
+        On Windows: %LOCALAPPDATA%\\MacanMediaPlayer
+        On other:   ~/.macan_media_player"""
+        if os.name == 'nt':
+            return os.path.join(os.getenv('LOCALAPPDATA', ''), 'MacanMediaPlayer')
+        return os.path.join(os.path.expanduser('~'), '.macan_media_player')
+
+    def _get_webview_storage_path(self):
+        """Return the WebView2 user-data / storage path.
+        Keeping this inside the app-data dir mirrors how Shrine/Chrome store
+        their profile data: app_data/WebView2Profile/
+        This directory is passed to webview.start(storage_path=...) so that
+        localStorage, IndexedDB, cookies, and service workers all persist
+        across restarts — exactly like a real browser profile."""
+        return os.path.join(self._get_app_data(), 'WebView2Profile')
+
+    # ─── PRIVATE: SQLite DATABASE (replaces settings.json + playlist.json) ────
+    # Single macan.db file — WAL mode for concurrency, zero-copy for blobs.
+    # Schema:
+    #   kv(key TEXT PK, value TEXT)         ← settings & named-playlist map
+    #   playlist(pos INTEGER PK, data TEXT) ← current queue, one row per track
+    # Migration from legacy JSON files runs once on first startup.
+
+    def _db_connect(self):
+        """Open a connection to macan.db with WAL mode and a short busy timeout."""
+        app_data = self._get_app_data()
+        os.makedirs(app_data, exist_ok=True)
+        db_path = os.path.join(app_data, 'macan.db')
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-4096")   # 4 MB page cache (reduced for low-end)
+        return conn
+
+    def _db_init(self):
+        """Create tables and migrate legacy JSON files (idempotent)."""
+        with self._db_connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS kv (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS playlist (
+                    pos  INTEGER PRIMARY KEY,
+                    data TEXT    NOT NULL
+                )
+            """)
+            conn.commit()
+
+        self._db_migrate_from_json()
+
+    def _db_migrate_from_json(self):
+        """One-time migration: read legacy settings.json / playlist.json into SQLite,
+        then rename them so migration never re-runs."""
+        app_data = self._get_app_data()
+        migrated_any = False
+
+        # ── settings.json → kv table ─────────────────────────────────────────
+        settings_path = os.path.join(app_data, 'settings.json')
+        for candidate in [settings_path, settings_path + '.tmp']:
+            if not os.path.exists(candidate):
+                continue
+            try:
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    with self._db_connect() as conn:
+                        for k, v in data.items():
+                            conn.execute(
+                                "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
+                                (k, json.dumps(v, ensure_ascii=False))
+                            )
+                        conn.commit()
+                    print(f"[MACAN] Migrated {len(data)} keys from settings.json → SQLite")
+                    migrated_any = True
+                os.rename(candidate, candidate + '.migrated')
+                break
+            except Exception as e:
+                print(f"[MACAN] settings.json migration error: {e}")
+
+        # ── playlist.json → playlist table ───────────────────────────────────
+        playlist_path = os.path.join(app_data, 'playlist.json')
+        for candidate in [playlist_path, playlist_path + '.tmp']:
+            if not os.path.exists(candidate):
+                continue
+            try:
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    with self._db_connect() as conn:
+                        conn.execute("DELETE FROM playlist")
+                        for pos, track in enumerate(data):
+                            conn.execute(
+                                "INSERT INTO playlist(pos,data) VALUES(?,?)",
+                                (pos, json.dumps(track, ensure_ascii=False))
+                            )
+                        conn.commit()
+                    print(f"[MACAN] Migrated {len(data)} tracks from playlist.json → SQLite")
+                    migrated_any = True
+                os.rename(candidate, candidate + '.migrated')
+                break
+            except Exception as e:
+                print(f"[MACAN] playlist.json migration error: {e}")
+
+        if migrated_any:
+            print("[MACAN] Legacy JSON migration complete.")
+
+    # ── KV helpers ────────────────────────────────────────────────────────────
+
+    def _kv_get(self, key, default=None):
+        """Read one value from the kv table. Returns parsed Python object."""
+        try:
+            with self._db_connect() as conn:
+                row = conn.execute(
+                    "SELECT value FROM kv WHERE key=?", (key,)
+                ).fetchone()
+            return json.loads(row[0]) if row else default
+        except Exception as e:
+            print(f"[MACAN] _kv_get({key}) error: {e}")
+            return default
+
+    def _kv_set(self, key, value):
+        """Write one value to the kv table. Explicit commit + close."""
+        conn = None
+        try:
+            conn = self._db_connect()
+            conn.execute(
+                "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
+                (key, json.dumps(value, ensure_ascii=False))
+            )
+            conn.commit()
+        except Exception as e:
+            print(f"[MACAN] _kv_set({key}) error: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def _kv_set_many(self, mapping):
+        """Write multiple kv pairs atomically. Explicit commit + close."""
+        conn = None
+        try:
+            conn = self._db_connect()
+            conn.executemany(
+                "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
+                [(k, json.dumps(v, ensure_ascii=False)) for k, v in mapping.items()]
+            )
+            conn.commit()
+        except Exception as e:
+            print(f"[MACAN] _kv_set_many error: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+    # ── Settings load / save ──────────────────────────────────────────────────
+
+    def _load_settings(self):
+        """Bootstrap: init DB (+ migrate JSON), then load settings + playlist
+        from SQLite into self.settings and self.playlist."""
+        self._db_init()
+
+        # Load all kv rows into self.settings
+        try:
+            with self._db_connect() as conn:
+                rows = conn.execute("SELECT key, value FROM kv").fetchall()
+            self.settings = {k: json.loads(v) for k, v in rows}
+        except Exception as e:
+            print(f"[MACAN] Load settings from DB error: {e}")
+            self.settings = {}
+
+        # Load playlist from playlist table
+        try:
+            with self._db_connect() as conn:
+                rows = conn.execute(
+                    "SELECT data FROM playlist ORDER BY pos"
+                ).fetchall()
+            self.playlist = [json.loads(r[0]) for r in rows]
+        except Exception as e:
+            print(f"[MACAN] Load playlist from DB error: {e}")
+            self.playlist = []
+
+        print(f"[MACAN] DB loaded — {len(self.settings)} settings keys, "
+              f"{len(self.playlist)} playlist tracks")
+
+    def _save_settings(self):
+        """Public-safe wrapper — acquires lock then saves."""
+        with self._settings_lock:
+            self._save_settings_locked()
+
+    def _save_settings_locked(self):
+        """Persist self.settings to the kv table.
+        Must only be called while _settings_lock is held.
+        SQLite WAL mode makes this safe and fast even with large payloads."""
+        try:
+            self._kv_set_many(self.settings)
+        except Exception as e:
+            print(f"[MACAN] Save settings error: {e}")
+
+    def _save_playlist(self):
+        """Public-facing entry point, called after every playlist mutation
+        (remove, reorder, add, clear, ...).
+
+        FIX: this used to run the DELETE-then-bulk-INSERT synchronously on
+        the caller's thread every single time it was invoked. On a 5000+
+        track playlist, a single drag-reorder or a "remove 20 tracks" batch
+        could trigger that many full-table rewrites back to back, hammering
+        disk I/O and stalling whatever UI action triggered it. Now this just
+        marks the playlist dirty and (re)arms a short debounce timer; the
+        actual write happens on a background thread via
+        _save_playlist_worker(), so a burst of rapid edits coalesces into
+        one write ~0.4s after the last one, instead of one write per edit.
+        """
+        with self._playlist_save_lock:
+            self._playlist_save_dirty = True
+            if self._playlist_save_timer is not None:
+                self._playlist_save_timer.cancel()
+            self._playlist_save_timer = threading.Timer(0.4, self._save_playlist_worker)
+            self._playlist_save_timer.daemon = True
+            self._playlist_save_timer.start()
+
+    def _save_playlist_worker(self):
+        """Runs on the debounce Timer's thread. Snapshots the current
+        playlist under the lock (so it doesn't race a concurrent mutation),
+        then does the actual DB write outside the lock."""
+        with self._playlist_save_lock:
+            if not self._playlist_save_dirty:
+                return
+            self._playlist_save_dirty = False
+            snapshot = list(self.playlist)
+        self._save_playlist_sync(snapshot)
+
+    def flush_playlist_save(self):
+        """Force any pending debounced save to happen immediately and
+        synchronously. Call this on app shutdown (window 'closing' event)
+        so the last few edits before exit are never silently dropped by
+        the debounce window."""
+        with self._playlist_save_lock:
+            if self._playlist_save_timer is not None:
+                self._playlist_save_timer.cancel()
+                self._playlist_save_timer = None
+            if not self._playlist_save_dirty:
+                return
+            self._playlist_save_dirty = False
+            snapshot = list(self.playlist)
+        self._save_playlist_sync(snapshot)
+
+    def _save_playlist_sync(self, snapshot):
+        """Persist a given playlist snapshot to the playlist table.
+        Replaces the entire table in a single transaction — fast even with
+        hundreds of tracks because SQLite is an in-process library. Only
+        called from the debounce worker / flush, never directly from a
+        JS-triggered call site (use _save_playlist() for that)."""
+        try:
+            with self._db_connect() as conn:
+                conn.execute("DELETE FROM playlist")
+                conn.executemany(
+                    "INSERT INTO playlist(pos,data) VALUES(?,?)",
+                    [(pos, json.dumps(track, ensure_ascii=False))
+                     for pos, track in enumerate(snapshot)]
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"[MACAN] Save playlist error: {e}")
+
+
+def _register_aumid_for_smtc():
+    """
+    Register the App User Model ID (AUMID) into the registry and set it on
+    the current process so Windows SMTC (System Media Transport Controls)
+    can resolve the correct application name and icon.
+
+    Without this, the OS media overlay / system tray shows "Unknown App"
+    even if SetCurrentProcessExplicitAppUserModelID() is called, because
+    Windows still needs a registry entry under:
+        HKCU\\Software\\Classes\\AppUserModelId\\<AUMID>
+    to map the ID to a human-readable name and executable icon.
+
+    This writes to HKEY_CURRENT_USER only — no admin privilege required.
+    The key is created/updated on every launch so it survives profile wipes.
+    """
+    if sys.platform != 'win32':
+        return
+
+    AUMID       = 'MacanAngkasa.MacanMediaPlayer'
+    APP_NAME    = 'Macan Media Player'
+    REG_PATH    = r'Software\Classes\AppUserModelId\{}'.format(AUMID)
+    EXE_PATH    = sys.executable  # path to python.exe or the frozen .exe
+
+    # If running as a PyInstaller bundle, sys.executable is the actual .exe
+    # If running as a script, use python.exe — icon won't be custom, but
+    # the app name will still show correctly in SMTC.
+    try:
+        frozen_exe = getattr(sys, '_MEIPASS', None)
+        if frozen_exe:
+            # PyInstaller bundle: use the bundle's own executable
+            EXE_PATH = os.path.abspath(sys.executable)
+        else:
+            # Dev mode: try to find main2.py's directory for a possible icon
+            EXE_PATH = os.path.abspath(sys.executable)
+    except Exception:
+        pass
+
+    import winreg
+    try:
+        key = winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            REG_PATH,
+            0,
+            winreg.KEY_SET_VALUE | winreg.KEY_CREATE_SUB_KEY,
+        )
+        # DisplayName  — shown in SMTC overlay, system tray, notification centre
+        winreg.SetValueEx(key, 'DisplayName',       0, winreg.REG_SZ, APP_NAME)
+        # ApplicationName — fallback name used by some older SMTC surfaces
+        winreg.SetValueEx(key, 'ApplicationName',   0, winreg.REG_SZ, APP_NAME)
+        # IconUri — path to the executable whose embedded icon Windows extracts.
+        # Format must be "shell:<path>,<icon_index>" or a direct file path.
+        winreg.SetValueEx(key, 'IconUri',           0, winreg.REG_SZ, EXE_PATH)
+        winreg.CloseKey(key)
+        print(f'[MACAN] AUMID registry entry written: {AUMID}')
+    except Exception as e:
+        print(f'[MACAN] AUMID registry write failed (non-fatal): {e}')
+
+    # Always set the AUMID on the process regardless of registry success —
+    # this is the minimum required for grouping in taskbar + SMTC recognition.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(AUMID)
+        print(f'[MACAN] AUMID set on process: {AUMID}')
+    except Exception as e:
+        print(f'[MACAN] SetCurrentProcessExplicitAppUserModelID failed: {e}')
+
+
+# ─── MULTI-INSTANCE SUPPORT: WebView2 profile locking ────────────────────────
+# EdgeWebView2 requires EXCLUSIVE access to its user-data folder — only one
+# running process can hold a given profile directory at a time. Because
+# _get_webview_storage_path() always returns the same fixed path, launching a
+# second instance of this app (or any other WebView2 app pointed at the same
+# profile folder) causes WebView2 environment creation to fail SILENTLY in the
+# background. The window still opens, but pywebview's local content server
+# never finishes wiring up correctly, which surfaces as the
+# "404 index.live.html — File does not exist" screen.
+#
+# Fix: claim the preferred profile folder with an OS-level file lock that is
+# automatically released by Windows if the process exits or crashes. If the
+# lock is already held (another instance is running), fall back to a sibling
+# folder (_2, _3, ...) so each instance gets its own independent WebView2
+# profile and can run concurrently.
+_profile_lock_handle = None  # kept open for the process lifetime; do not close
+
+
+def _acquire_webview_profile(preferred_path: str) -> str:
+    global _profile_lock_handle
+
+    if sys.platform != 'win32':
+        # Non-Windows builds use the Qt backend, not WebView2 — no locking needed.
+        os.makedirs(preferred_path, exist_ok=True)
+        return preferred_path
+
+    import msvcrt
+
+    candidate = preferred_path
+    attempt = 1
+    while True:
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            lock_path = os.path.join(candidate, '.instance.lock')
+            f = open(lock_path, 'a+b')
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                f.close()
+                raise
+            _profile_lock_handle = f  # keep handle alive -> lock held until process exits/crashes
+            if attempt > 1:
+                print(f'[Macan] Profile "{preferred_path}" busy (another instance running) '
+                      f'— using "{candidate}" instead.')
+            return candidate
+        except OSError:
+            attempt += 1
+            candidate = f'{preferred_path}_{attempt}'
+            if attempt > 20:
+                # Extremely unlikely, but don't loop forever — fall back to an
+                # unlocked, PID-suffixed folder rather than hang.
+                candidate = f'{preferred_path}_{os.getpid()}'
+                os.makedirs(candidate, exist_ok=True)
+                print(f'[Macan] Warning: could not acquire a locked profile after '
+                      f'20 attempts, using unlocked "{candidate}".')
+                return candidate
+
+
+def main():
+    _register_aumid_for_smtc()
+
+    # Start media server BEFORE creating the window
+    _media_server.start()
+
+    api = MacanMediaAPI()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    entry_point = os.path.join(base_dir, 'assets', 'index.html')
+
+    # ── WebView2 persistent storage profile ───────────────────────────────────
+    # Passing storage_path tells EdgeWebView2 to use a fixed user-data directory.
+    # This makes localStorage, IndexedDB, cookies, and cache survive restarts.
+    # On non-Windows builds (Qt backend) pywebview ignores the kwarg gracefully.
+    # Claim a WebView2 profile folder this process can exclusively own.
+    # Falls back to a sibling folder (_2, _3, ...) if another instance
+    # already holds the preferred one — this is what enables multiple
+    # instances to run at the same time instead of hitting the 404 screen.
+    webview_storage = _acquire_webview_profile(api._get_webview_storage_path())
+
+    # ── Auto cache-bust: clear WebView2 disk cache when assets change ─────────
+    # Problem: WebView2 aggressively caches HTML/CSS/JS on disk. When source
+    # files are updated, the old cached versions are served instead — the app
+    # visually looks unchanged even after a code update.
+    #
+    # Solution: on every startup, hash all frontend asset files. If the hash
+    # differs from the one stored in the profile (from the last run), wipe ONLY
+    # the disk-cache subdirectories (Cache, Code Cache, GPUCache, Service Worker).
+    # localStorage / IndexedDB / cookies are NOT touched — user data is safe.
+    #
+    # Hash file location: <WebView2Profile>/asset_hash.txt
+    # Cleared folders: Cache, Code Cache, GPUCache, Service Worker,
+    #                  CacheStorage, blob_storage (and their EBWebView mirrors).
+
+    import hashlib, shutil as _shutil
+
+    def _hash_assets(assets_dir: str) -> str:
+        """SHA-256 over the content of every .html/.css/.js file in assets_dir."""
+        h = hashlib.sha256()
+        exts = {'.html', '.css', '.js'}
+        try:
+            for root, dirs, files in os.walk(assets_dir):
+                dirs.sort()   # deterministic walk order
+                for fname in sorted(files):
+                    if os.path.splitext(fname)[1].lower() in exts:
+                        fpath = os.path.join(root, fname)
+                        try:
+                            with open(fpath, 'rb') as f:
+                                h.update(f.read())
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+        return h.hexdigest()
+
+    def _clear_wv2_disk_cache(wv2_root: str) -> None:
+        """Delete only disk-cache subdirs inside the WebView2 profile.
+        Leaves LocalStorage, IndexedDB, Cookies, etc. untouched."""
+        cache_dirs = [
+            'Cache', 'Code Cache', 'GPUCache',
+            'Service Worker', 'CacheStorage', 'blob_storage',
+        ]
+        for sub in cache_dirs:
+            p = os.path.join(wv2_root, sub)
+            if os.path.isdir(p):
+                _shutil.rmtree(p, ignore_errors=True)
+        # WebView2 nests a second profile layer under EBWebView/
+        ebwv = os.path.join(wv2_root, 'EBWebView')
+        if os.path.isdir(ebwv):
+            for sub in cache_dirs:
+                p = os.path.join(ebwv, sub)
+                if os.path.isdir(p):
+                    _shutil.rmtree(p, ignore_errors=True)
+
+    _hash_file   = os.path.join(webview_storage, 'asset_hash.txt')
+    _assets_dir  = os.path.join(base_dir, 'assets')
+    _current_hash = _hash_assets(_assets_dir)
+    _ver_tag      = _current_hash[:12]   # short tag used in ?v= query strings
+
+    _stored_hash = ''
+    try:
+        with open(_hash_file, 'r', encoding='utf-8') as _f:
+            _stored_hash = _f.read().strip()
+    except OSError:
+        pass   # first run — no hash file yet
+
+    if _current_hash != _stored_hash:
+        # Assets changed (or first run) → clear WebView2 disk cache
+        print(f'[Macan] Asset hash changed — clearing WebView2 disk cache '
+              f'({_stored_hash[:8] or "none"!r} → {_current_hash[:8]!r})')
+        _clear_wv2_disk_cache(webview_storage)
+        try:
+            with open(_hash_file, 'w', encoding='utf-8') as _f:
+                _f.write(_current_hash)
+        except OSError as _e:
+            print(f'[Macan] Warning: could not write asset_hash.txt: {_e}')
+    else:
+        print(f'[Macan] Assets unchanged (hash {_current_hash[:8]!r}) — WebView2 cache kept')
+
+    # ── Cache-bust: rewrite asset URLs in index.html with absolute file:// paths ─
+    # Problem: WebView2 caches JS/CSS aggressively. Disk-cache clearing alone is
+    # not always sufficient because compiled bytecode can survive in-process.
+    # Solution: inject ?v=<hash> into asset URLs so WebView2 treats updated files
+    # as new resources it has never seen. We must also convert relative paths to
+    # absolute file:// URLs because the busted HTML is served from the assets dir
+    # itself — relative paths remain valid that way.
+    #
+    # The busted file is written INSIDE the assets folder so that relative
+    # src/href paths (script.js, style.css, etc.) still resolve correctly.
+    #
+    # MULTI-INSTANCE FIX: this filename used to be the fixed "index.live.html"
+    # for every launch. When two instances started at the same time they'd
+    # race to write/read/delete that same file — one instance could end up
+    # requesting it mid-write (or right after another instance's cleanup),
+    # producing the "File does not exist" 404. Suffixing with the PID gives
+    # each running instance its own file so they can never collide.
+    import re as _re
+    _orig_html  = os.path.join(_assets_dir, 'index.html')
+    _bust_html  = os.path.join(_assets_dir, f'index.live.{os.getpid()}.html')
+
+    # Best-effort cleanup of stale index.live.*.html left behind by instances
+    # that crashed or were killed without cleaning up after themselves.
+    try:
+        import glob as _glob
+        for _stale in _glob.glob(os.path.join(_assets_dir, 'index.live.*.html')):
+            if _stale != _bust_html:
+                try:
+                    os.remove(_stale)
+                except OSError:
+                    pass  # still in use by another running instance — leave it
+    except Exception:
+        pass
+
+    try:
+        with open(_orig_html, 'r', encoding='utf-8') as _f:
+            _html_content = _f.read()
+
+        def _inject_ver(m):
+            attr, url = m.group(1), m.group(2)
+            # Skip external / data / blob URLs — only touch local relative paths
+            if url.startswith(('http', 'data:', 'blob:', '//', '#', 'file:')):
+                return m.group(0)
+            # Strip any previous ?v= tag cleanly
+            base = _re.sub(r'[?&]v=[^&"#]*', '', url).rstrip('?&')
+            sep  = '&' if '?' in base else '?'
+            return f'{attr}"{base}{sep}v={_ver_tag}"'
+
+        _html_content = _re.sub(
+            r'(src=|href=)"([^"]*)"',
+            _inject_ver,
+            _html_content
+        )
+        with open(_bust_html, 'w', encoding='utf-8') as _f:
+            _f.write(_html_content)
+        entry_point = _bust_html
+        print(f'[Macan] Cache-bust HTML written to assets/{os.path.basename(_bust_html)} (v={_ver_tag})')
+
+        import atexit as _atexit
+        def _cleanup_bust_html(_path=_bust_html):
+            try:
+                os.remove(_path)
+            except OSError:
+                pass
+        _atexit.register(_cleanup_bust_html)
+    except Exception as _e:
+        print(f'[Macan] Warning: cache-bust HTML failed, using original: {_e}')
+        # entry_point stays as the original index.html — safe fallback
+
+    # ── Avoid pywebview's implicit Bottle HTTP server for the main window ──────
+    # pywebview's is_local_url() treats ANY bare filesystem path (even an
+    # absolute one) as "needing a server", so passing entry_point as-is makes
+    # pywebview silently spin up its own internal Bottle server on a random
+    # 127.0.0.1 port just to serve index.live.<pid>.html. That's a SECOND local
+    # server (separate from our own _MediaServer) — extra surface area that can
+    # get interfered with by other local WebView2/browser apps (e.g. Shrine
+    # Browser Lite) running at the same time. Explicitly using a file:// URI
+    # bypasses is_local_url()'s check entirely, so pywebview loads the window
+    # natively via file:// and never starts that extra Bottle server.
+    _entry_url = Path(entry_point).resolve().as_uri()
+
+    window = webview.create_window(
+        title='Macan Media Player',
+        url=_entry_url,
+        js_api=api,
+        frameless=True,
+        fullscreen=True,
+        background_color='#030303',
+        text_select=False,
+        easy_drag=False,
+    )
+
+    api.set_window(window)
+
+    # FIX: _save_playlist() is now debounced (see class docstring on
+    # flush_playlist_save). Force a synchronous flush on close so edits
+    # made in the last ~0.4s before quitting aren't lost.
+    window.events.closing += api.flush_playlist_save
+
+    # ── Taskbar thumbnail toolbar: HWND cuma valid setelah window benar-benar
+    #    tampil, jadi init_buttons() dipanggil lewat event 'shown'. shutdown()
+    #    dipanggil di 'closing' biar window proc di-restore sebelum app mati.
+    if sys.platform == 'win32':
+        window.events.shown += api._taskbar_thumbbar.init_buttons
+        window.events.closing += api._taskbar_thumbbar.shutdown
+
+        # ── "Now Playing" bubble: started AFTER taskbar thumbbar init_buttons
+        #    (registered second -> runs second on the same 'shown' event) so
+        #    its window/thread creation never races with Explorer setting up
+        #    the app's taskbar button. See NowPlayingBubble docstring.
+        window.events.shown += api._now_playing_bubble.start
+        window.events.closing += api._now_playing_bubble.shutdown
+
+    webview.start(
+        debug=False,
+        gui=GUI_BACKEND,
+        storage_path=webview_storage,   # persistent profile: localStorage / cookies / cache
+        private_mode=False,             # must be False so storage_path is actually used
+    )
+
+
+if __name__ == '__main__':
+    main()
