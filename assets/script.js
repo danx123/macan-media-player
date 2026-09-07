@@ -35,6 +35,8 @@ const S = {
   vcSeekDragging: false,
   vcHideTimer:  null,
   vcCursorTimer: null,  // auto-hide cursor timer in video fullscreen
+  suppressMainVideoPauseEvent: false, // swallow the next main-video 'pause' event (see MiniPlayer.open)
+  mpSeekDragging: false, // dragging the mini player seekbar
   previewThrottle: null,
   isPreviewFetching: false,
   lyricsOpen:   false,
@@ -693,6 +695,9 @@ const MiniPlayer = (() => {
   // Resize state
   let resizing = false, resStartX = 0, resStartW = 0, resStartH = 0;
 
+  // Seekbar elements/state
+  let mpSeekbar = null, mpSeekTrack = null, mpSeekFill = null, mpSeekThumb = null;
+
   const MARGIN   = 12;
   const MIN_W    = 240;
   const MIN_H    = 135;
@@ -723,8 +728,68 @@ const MiniPlayer = (() => {
     document.addEventListener('mousemove', onResize);
     document.addEventListener('mouseup',   stopResize);
 
+    // Seekbar — same interaction pattern as the fullscreen vc-seekbar,
+    // but reads/writes mpVideo directly since mpVideo (not the main
+    // <video>) is what's actually advancing while mini player is open.
+    mpSeekbar   = document.getElementById('mp-seekbar');
+    mpSeekTrack = mpSeekbar ? mpSeekbar.querySelector('.mp-seek-track') : null;
+    mpSeekFill  = document.getElementById('mp-seek-fill');
+    mpSeekThumb = document.getElementById('mp-seek-thumb');
+    setupMpSeekbar();
+
+    // Keep the mini seekbar in sync while mpVideo is actually playing.
+    mpVideo.addEventListener('timeupdate', () => {
+      if (S.mpSeekDragging) return;
+      setMpSeekFill(_mpPct());
+    });
+
     // Position — bottom-right by default
     resetPosition();
+  }
+
+  function _mpPct() {
+    if (!mpVideo.duration || isNaN(mpVideo.duration)) return 0;
+    return Math.max(0, Math.min(1, mpVideo.currentTime / mpVideo.duration));
+  }
+
+  function setMpSeekFill(pct) {
+    if (!mpSeekFill || !mpSeekThumb) return;
+    _setProgressFill(mpSeekFill, pct);
+    mpSeekThumb.style.left = (pct * 100) + '%';
+  }
+
+  function setupMpSeekbar() {
+    if (!mpSeekbar || !mpSeekTrack) return;
+
+    function getPercent(e) {
+      const r = mpSeekTrack.getBoundingClientRect();
+      return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+    }
+    function applySeek(pct) {
+      if (!mpVideo.duration || isNaN(mpVideo.duration)) return;
+      mpVideo.currentTime = pct * mpVideo.duration;
+    }
+
+    mpSeekbar.addEventListener('mousedown', e => {
+      e.preventDefault();
+      S.mpSeekDragging = true;
+      mpSeekbar.classList.add('dragging');
+      setMpSeekFill(getPercent(e));
+    });
+
+    window.addEventListener('mousemove', e => {
+      if (!S.mpSeekDragging) return;
+      setMpSeekFill(getPercent(e));
+    });
+
+    window.addEventListener('mouseup', e => {
+      if (!S.mpSeekDragging) return;
+      S.mpSeekDragging = false;
+      mpSeekbar.classList.remove('dragging');
+      applySeek(getPercent(e));
+    });
+
+    mpSeekbar.addEventListener('click', e => applySeek(getPercent(e)));
   }
 
   function resetPosition() {
@@ -803,7 +868,14 @@ const MiniPlayer = (() => {
     mpVideo.muted        = mainVideo.muted;
     mpVideo.playbackRate = mainVideo.playbackRate;
 
-    // Pause the main video — mpVideo takes over output
+    // Pause the main video — mpVideo takes over output.
+    // Only flag suppression if it's actually going to fire a 'pause' event
+    // (i.e. it was playing); if it's already paused, no event fires and
+    // the flag must stay false or it would wrongly swallow the NEXT
+    // legitimate pause.
+    if (!mainVideo.paused) {
+      S.suppressMainVideoPauseEvent = true;
+    }
     mainVideo.pause();
     mainVideo.muted = true;  // silence but keep src for expand-back
 
@@ -818,6 +890,7 @@ const MiniPlayer = (() => {
 
     updateMiniInfo();
     syncMiniPlayState(S.isPlaying);
+    setMpSeekFill(_mpPct()); // show correct position immediately, don't wait for first timeupdate
     console.log('[MACAN] Mini player opened');
   }
 
@@ -857,6 +930,7 @@ const MiniPlayer = (() => {
 
     mpEl.style.display = 'none';
     active = false;
+    setMpSeekFill(0);
 
     // Return to main layout (not fullscreen)
     videoLayer.classList.remove('active');
@@ -2838,7 +2912,18 @@ function setupVideoEvents() {
   video.addEventListener('loadedmetadata',onMeta);
   video.addEventListener('ended',         onEnded);
   video.addEventListener('play',          () => onPlayState(true));
-  video.addEventListener('pause',         () => onPlayState(false));
+  video.addEventListener('pause',         () => {
+    // MiniPlayer.open() intentionally pauses the main <video> element
+    // (mpVideo takes over playback) — that programmatic pause fires this
+    // same 'pause' event, which would otherwise call onPlayState(false)
+    // and cascade into MiniPlayer.syncMiniPlayState(false), pausing
+    // mpVideo right after it started playing. Skip once when flagged.
+    if (S.suppressMainVideoPauseEvent) {
+      S.suppressMainVideoPauseEvent = false;
+      return;
+    }
+    onPlayState(false);
+  });
   video.addEventListener('canplay',       () => console.log('[MACAN] Video: canplay fired'));
   video.addEventListener('error', e => {
     const err = video.error;
