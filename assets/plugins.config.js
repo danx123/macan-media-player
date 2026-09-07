@@ -16,7 +16,9 @@
     // 'plugins/lastfm-scrobbler.js',
     // 'plugins/discord-rpc.js',
     // 'plugins/theme-switcher.js',
+    'plugins/fullscreen-player.js',
     // ───────────────────────────────────────────────────────
+	// 'plugins/video_countdown.js',
   ];
 
   if (!window.MacanBridge) {
