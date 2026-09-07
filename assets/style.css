@@ -1071,6 +1071,15 @@ input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider)::-webk
 
 #video-layer.active { display: block; }
 
+/* Cursor auto-hide (toggled via JS after inactivity in fullscreen video).
+   Must affect the layer AND all descendants (video element, overlays)
+   since some children set their own `cursor` rules that would otherwise
+   override a plain `cursor: none` on the container alone. */
+#video-layer.cursor-hidden,
+#video-layer.cursor-hidden * {
+  cursor: none !important;
+}
+
 /* ── Center play/pause overlay ──
    Visibility is 100% controlled by JS (same autohide as #video-controls).
    No CSS hover-based show/hide — pointer-events:none when hidden. */
@@ -3370,10 +3379,60 @@ video::cue {
   flex-shrink: 0;
   background: rgba(4,4,4,0.97);
   border-top: 1px solid rgba(255,255,255,0.06);
-  padding: 5px 8px 6px;
+  padding: 4px 8px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.mp-bottom-row {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+/* Mini player seekbar — compact version of .vc-seekbar */
+.mp-seekbar {
+  width: 100%;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+}
+.mp-seek-track {
+  width: 100%;
+  height: 3px;
+  background: rgba(255,255,255,0.2);
+  border-radius: 2px;
+  position: relative;
+  transition: height 0.15s;
+}
+.mp-seekbar:hover .mp-seek-track,
+.mp-seekbar.dragging .mp-seek-track { height: 5px; }
+.mp-seek-fill {
+  height: 100%;
+  width: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 0.1s linear;
+}
+.mp-seek-thumb {
+  position: absolute;
+  top: 50%;
+  left: 0%;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: translate(-50%, -50%) scale(0);
+  transition: transform 0.15s;
+  pointer-events: none;
+}
+.mp-seekbar:hover .mp-seek-thumb,
+.mp-seekbar.dragging .mp-seek-thumb {
+  transform: translate(-50%, -50%) scale(1);
 }
 .mp-info {
   flex: 1;
