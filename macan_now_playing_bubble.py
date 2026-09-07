@@ -40,6 +40,7 @@ import time
 import base64
 import queue
 import ctypes
+import colorsys
 import threading
 from ctypes import wintypes
 
@@ -286,6 +287,94 @@ if _IS_WINDOWS:
     ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
     ole32.CoUninitialize.restype  = None
     ole32.CoUninitialize.argtypes = []
+
+
+# ─── Artwork-driven theming ──────────────────────────────────────────────
+# Extracts a vivid representative color from the current track's artwork
+# and derives the bubble's panel/accent colors from it, so the bubble
+# feels tinted by the album art instead of always showing the same fixed
+# near-black-with-blue-accent look. Falls back to the static BG_COLOR /
+# BORDER_COLOR / EYEBROW_COLOR constants whenever there's no real artwork
+# (placeholder tile) or extraction fails for any reason.
+
+_THEME_BG_MIX = 0.78        # how much accent hue bleeds into the dark panel
+_THEME_BG_VALUE = 0.24      # kept low-ish so TITLE_COLOR (near-white) stays readable
+_THEME_BORDER_ALPHA = 70
+_MIN_ACCENT_SATURATION = 0.55
+_MIN_ACCENT_VALUE = 0.75
+
+
+def _extract_accent_color(rgb_source_img, num_colors=6):
+    """Pick one vivid color out of an artwork image to theme the bubble with.
+
+    Downsamples + quantizes the artwork to a handful of palette colors,
+    then scores each by population * saturation * brightness so plain
+    near-black/near-white/gray pixels (common on album-art borders/mattes)
+    don't win out over the cover's actual accent color — same rough idea
+    as the "colorize from artwork" feature in Spotify/iTunes/Windows Media.
+    Returns an (r, g, b) tuple, or None if extraction isn't possible.
+    """
+    try:
+        small = rgb_source_img.convert('RGB').resize((48, 48), Image.LANCZOS)
+        quant = small.quantize(colors=num_colors, method=Image.MEDIANCUT)
+        palette = quant.getpalette()
+        counts = quant.getcolors()  # [(count, palette_index), ...]
+        if not counts:
+            return None
+
+        best_score, best_rgb = -1.0, None
+        for count, idx in counts:
+            r, g, b = palette[idx * 3: idx * 3 + 3]
+            h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+            if v < 0.12 or v > 0.95:
+                continue  # skip near-black / near-white
+            score = count * (0.35 + 0.65 * s) * (0.4 + 0.6 * v)
+            if score > best_score:
+                best_score, best_rgb = score, (r, g, b)
+
+        if best_rgb is None:
+            # Every candidate was too dark/light (e.g. grayscale cover art) —
+            # just fall back to whichever palette color is most common.
+            _, idx = max(counts, key=lambda c: c[0])
+            best_rgb = tuple(palette[idx * 3: idx * 3 + 3])
+        return best_rgb
+    except Exception as e:
+        print(f'[NowPlayingBubble] Accent color extraction failed: {e}')
+        return None
+
+
+def _theme_from_accent(rgb):
+    """Derive (bg_color, border_color, eyebrow_color) from one accent RGB.
+
+    TITLE_COLOR/ARTIST_COLOR are intentionally left fixed (near-white/gray)
+    regardless of theme — the panel background is kept dark and low-value
+    so text contrast never depends on how bright the source artwork is.
+    """
+    r, g, b = rgb
+    h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+
+    # Accent (eyebrow label + border): boost saturation/brightness so even
+    # a muted source color reads clearly as a colored accent.
+    acc_s = min(1.0, max(s, _MIN_ACCENT_SATURATION))
+    acc_v = min(1.0, max(v, _MIN_ACCENT_VALUE))
+    ar, ag, ab = colorsys.hsv_to_rgb(h, acc_s, acc_v)
+    eyebrow_color = (int(ar * 255), int(ag * 255), int(ab * 255), 255)
+
+    # Panel background: same hue, pulled dark, blended into the original
+    # near-black panel so the tint is subtle rather than a colored block.
+    bg_h, bg_s, bg_v = h, min(0.55, s * 0.6), _THEME_BG_VALUE
+    br, bg_g, bb = colorsys.hsv_to_rgb(bg_h, bg_s, bg_v)
+    base = (24, 24, 27)
+    mix = _THEME_BG_MIX
+    bg_color = (
+        int(base[0] * (1 - mix) + br * 255 * mix),
+        int(base[1] * (1 - mix) + bg_g * 255 * mix),
+        int(base[2] * (1 - mix) + bb * 255 * mix),
+        235,
+    )
+
+    border_color = (eyebrow_color[0], eyebrow_color[1], eyebrow_color[2], _THEME_BORDER_ALPHA)
+    return bg_color, border_color, eyebrow_color
 
 
 class NowPlayingBubble:
@@ -587,21 +676,34 @@ class NowPlayingBubble:
     # ─── Rendering (Pillow → RGBA image) ────────────────────────────────
 
     def _render_bubble_image(self, title, artist, artwork_data_url):
+        art, accent_rgb = self._load_artwork(artwork_data_url)
+
+        # Theme the panel from the artwork's accent color when we actually
+        # decoded real cover art; the placeholder tile keeps the static
+        # look since there's no real color to key off of.
+        if accent_rgb is not None:
+            try:
+                bg_color, border_color, eyebrow_color = _theme_from_accent(accent_rgb)
+            except Exception as e:
+                print(f'[NowPlayingBubble] Theming from accent failed, using defaults: {e}')
+                bg_color, border_color, eyebrow_color = BG_COLOR, BORDER_COLOR, EYEBROW_COLOR
+        else:
+            bg_color, border_color, eyebrow_color = BG_COLOR, BORDER_COLOR, EYEBROW_COLOR
+
         img = Image.new('RGBA', (BUBBLE_W, BUBBLE_H), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         draw.rounded_rectangle(
             [0, 0, BUBBLE_W - 1, BUBBLE_H - 1], radius=CORNER_RADIUS,
-            fill=BG_COLOR, outline=BORDER_COLOR, width=1,
+            fill=bg_color, outline=border_color, width=1,
         )
 
-        art = self._load_artwork(artwork_data_url)
         art_x, art_y = ART_MARGIN, (BUBBLE_H - ART_SIZE) // 2
         img.paste(art, (art_x, art_y), art)
 
         text_x = art_x + ART_SIZE + 14
         text_w = BUBBLE_W - text_x - 14
 
-        draw.text((text_x, 14), 'NOW PLAYING', font=self._font_eyebrow, fill=EYEBROW_COLOR)
+        draw.text((text_x, 14), 'NOW PLAYING', font=self._font_eyebrow, fill=eyebrow_color)
 
         title_txt = self._ellipsize(draw, title or 'Unknown Title', self._font_title, text_w)
         draw.text((text_x, 32), title_txt, font=self._font_title, fill=TITLE_COLOR)
@@ -612,18 +714,28 @@ class NowPlayingBubble:
         return img
 
     def _load_artwork(self, data_url):
+        """Returns (art_rgba_image, accent_rgb_or_None).
+
+        accent_rgb is the vivid theme color pulled from the real artwork
+        (see _extract_accent_color), or None for the placeholder tile —
+        callers use that None to know the static default theme applies.
+        """
         if data_url and isinstance(data_url, str) and data_url.startswith('data:') and ';base64,' in data_url:
             try:
                 b64 = data_url.split(';base64,', 1)[1]
                 raw = base64.b64decode(b64)
                 art = Image.open(io.BytesIO(raw)).convert('RGBA')
                 art = ImageOps.fit(art, (ART_SIZE, ART_SIZE), Image.LANCZOS)
+                # Extract the accent color before masking — putalpha() only
+                # touches the alpha channel, but grabbing it here keeps the
+                # "what we themed off of" step visually next to the source.
+                accent_rgb = _extract_accent_color(art)
                 mask = Image.new('L', (ART_SIZE, ART_SIZE), 0)
                 ImageDraw.Draw(mask).rounded_rectangle(
                     [0, 0, ART_SIZE - 1, ART_SIZE - 1], radius=ART_CORNER_RADIUS, fill=255,
                 )
                 art.putalpha(mask)
-                return art
+                return art, accent_rgb
             except Exception as e:
                 print(f'[NowPlayingBubble] Artwork decode failed, using placeholder: {e}')
 
@@ -634,7 +746,7 @@ class NowPlayingBubble:
         d.ellipse([21, 39, 31, 49], fill=PLACEHOLDER_FG)
         d.ellipse([39, 33, 49, 43], fill=PLACEHOLDER_FG)
         d.line([26, 44, 26, 20, 44, 16, 44, 38], fill=PLACEHOLDER_FG, width=2)
-        return art
+        return art, None
 
     @staticmethod
     def _ellipsize(draw, text, font, max_width):
