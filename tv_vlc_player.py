@@ -354,7 +354,8 @@ class TvVlcWindow(QWidget):
         self.switcher.favToggled.connect(self._toggle_favorite)
         self.switcher.hide()
 
-        # top bar (always visible, not auto-hidden)
+        # top bar — floats over the video, auto-hides with url_bar/switcher
+        # after 3.5s idle (see _show_switcher_briefly / _hide_switcher)
         self.top_bar = QWidget(self)
         self.top_bar.setStyleSheet("background: rgba(0,0,0,150);")
         tb = QHBoxLayout(self.top_bar)
@@ -398,7 +399,7 @@ class TvVlcWindow(QWidget):
         tb.addWidget(self.btn_record)
         tb.addWidget(self.btn_close)
 
-        # bottom custom-url bar (always visible, small)
+        # bottom custom-url bar — auto-hides together with top_bar/switcher
         self.url_bar = QWidget(self)
         self.url_bar.setStyleSheet("background: rgba(0,0,0,150);")
         ub = QHBoxLayout(self.url_bar)
@@ -444,7 +445,13 @@ class TvVlcWindow(QWidget):
         # go fullscreen immediately
         self.showFullScreen()
         QTimer.singleShot(0, self._bind_hwnd)
+        QTimer.singleShot(0, self._disable_rounded_corners)
         QTimer.singleShot(0, self._reposition_overlays)
+
+        # Bars start visible on launch, then fall into the same auto-hide
+        # cycle as the channel switcher once the idle timer fires.
+        self._bars_visible = True
+        self._hide_timer.start(3500)
 
         self._fetch_source(self.current_source, force=False)
 
@@ -457,6 +464,27 @@ class TvVlcWindow(QWidget):
             self.vlc_player.set_nsobject(wid)
         else:
             self.vlc_player.set_xwindow(wid)
+
+    def _disable_rounded_corners(self):
+        """Windows 11's DWM still rounds a top-level window's corners even
+        when it's borderless/fullscreen, which shows up as a thin dark
+        sliver cut into each corner over the video. Explicitly opt this
+        window out via DwmSetWindowAttribute so corners stay perfectly
+        square."""
+        if not sys.platform.startswith('win'):
+            return
+        try:
+            import ctypes
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWCP_DONOTROUND = 1
+            hwnd = int(self.winId())
+            pref = ctypes.c_int(DWMWCP_DONOTROUND)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(pref), ctypes.sizeof(pref)
+            )
+        except Exception:
+            pass
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -509,11 +537,20 @@ class TvVlcWindow(QWidget):
             self.switcher.show()
             self.switcher.raise_()
             self._switcher_visible = True
+        if not self._bars_visible:
+            self.top_bar.show()
+            self.url_bar.show()
+            self.top_bar.raise_()
+            self.url_bar.raise_()
+            self._bars_visible = True
         self._hide_timer.start(3500)
 
     def _hide_switcher(self):
         self.switcher.hide()
         self._switcher_visible = False
+        self.top_bar.hide()
+        self.url_bar.hide()
+        self._bars_visible = False
 
     def keyPressEvent(self, event):
         key = event.key()
