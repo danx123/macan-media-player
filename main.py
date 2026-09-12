@@ -31,6 +31,8 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+import image_engine
+
 from core.video_utils import VideoThumbnailer
 from macan_taskbar_thumbbar_webview import TaskbarThumbBar
 from macan_now_playing_bubble import NowPlayingBubble
@@ -359,6 +361,108 @@ class AlbumArtCache:
         return None
 
 
+# ─── VIDEO THUMBNAIL DISK CACHE ───────────────────────────────────────────────
+# The old video-thumb cache (_video_thumb_cache dict on MacanMediaAPI) was
+# in-memory ONLY — every single app restart threw it away, so every video in
+# the library got re-decoded (open container + seek + read frame + resize +
+# jpeg-encode) from scratch on every launch, and again any time a video was
+# removed and re-added (e.g. a different playlist, or clear+reload). Cover
+# art for audio never had this problem because AlbumArtCache above already
+# persists to SQLite + disk. This mirrors that same pattern for videos:
+# - Keyed by file path, but validated against mtime+size so an edited/
+#   re-encoded file at the same path doesn't serve a stale thumbnail.
+# - get_cached() is a plain SQLite lookup + small file read — no cv2 involved,
+#   so it's cheap enough to call during the fast bulk-add scan (see
+#   _build_track_meta_fast) instead of always deferring to the lazy fetch.
+class VideoThumbCache:
+    """Persistent on-disk cache for video thumbnails, survives app restarts
+    and playlist clear/re-add cycles."""
+
+    def __init__(self, app_data_dir):
+        self.cache_dir = os.path.join(app_data_dir, "VideoThumbCache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.db_path = os.path.join(self.cache_dir, "video_thumb_cache.db")
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA cache_size = -2048")   # 2 MB page cache
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute('''CREATE TABLE IF NOT EXISTS video_thumbs (
+            path_hash  TEXT PRIMARY KEY,
+            path       TEXT,
+            mtime      REAL,
+            size       INTEGER,
+            local_path TEXT
+        )''')
+        conn.commit()
+        conn.close()
+
+    def _hash(self, path):
+        return hashlib.md5(path.encode('utf-8')).hexdigest()
+
+    def get_cached(self, path):
+        """Fast lookup — SQLite row + small JPEG read, no cv2. Returns a
+        base64 data-URI, or None on a miss / stale entry (source file's
+        mtime or size no longer matches what was cached)."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        h = self._hash(path)
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute(
+            "SELECT mtime, size, local_path FROM video_thumbs WHERE path_hash=?", (h,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        mtime, size, local_path = row
+        if abs(mtime - st.st_mtime) > 1 or size != st.st_size:
+            return None  # file changed since we cached it — treat as a miss
+        try:
+            with open(local_path, 'rb') as f:
+                data = f.read()
+            return f"data:image/jpeg;base64,{base64.b64encode(data).decode('utf-8')}"
+        except OSError:
+            return None
+
+    def save(self, path, jpeg_bytes):
+        """Persist an already-encoded JPEG thumbnail (raw bytes) for path."""
+        h = self._hash(path)
+        local_path = os.path.join(self.cache_dir, f"{h}.jpg")
+        try:
+            with open(local_path, 'wb') as f:
+                f.write(jpeg_bytes)
+            st = os.stat(path)
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "INSERT OR REPLACE INTO video_thumbs "
+                "(path_hash,path,mtime,size,local_path) VALUES(?,?,?,?,?)",
+                (h, path, st.st_mtime, st.st_size, local_path)
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[VideoThumbCache] Save error: {e}")
+
+    def clear(self):
+        try:
+            for fname in os.listdir(self.cache_dir):
+                if fname.endswith('.jpg'):
+                    try:
+                        os.remove(os.path.join(self.cache_dir, fname))
+                    except OSError:
+                        pass
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("DELETE FROM video_thumbs")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[VideoThumbCache] Clear error: {e}")
+
+
 # ─── LYRIC CACHE ──────────────────────────────────────────────────────────────
 
 class LyricCache:
@@ -642,6 +746,7 @@ class MacanMediaAPI:
         app_data = self._get_app_data()
         self._art_cache   = AlbumArtCache(app_data)
         self._lyric_cache = LyricCache(app_data)
+        self._video_thumb_disk_cache = VideoThumbCache(app_data)
 
         # ── "Now Playing" notification bubble (floats above the system
         #    tray). Windows-only; no-op elsewhere — safe to always construct.
@@ -931,17 +1036,19 @@ class MacanMediaAPI:
 
     def get_cache_sizes(self):
         """Return sizes of all cache locations as a dict with human-readable strings."""
-        app_data   = self._get_app_data()
-        wv2_path   = self._get_webview_storage_path()
-        art_path   = os.path.join(app_data, 'AlbumArtCache')
-        lyrics_db  = os.path.join(app_data, 'lyrics.db')
+        app_data    = self._get_app_data()
+        wv2_path    = self._get_webview_storage_path()
+        art_path    = os.path.join(app_data, 'AlbumArtCache')
+        lyrics_db   = os.path.join(app_data, 'lyrics.db')
+        vthumb_path = os.path.join(app_data, 'VideoThumbCache')
 
-        wv2_bytes    = self._dir_size(wv2_path)   if os.path.isdir(wv2_path)  else 0
+        wv2_bytes    = self._dir_size(wv2_path)    if os.path.isdir(wv2_path)  else 0
         art_bytes    = self._dir_size(art_path)    if os.path.isdir(art_path)  else 0
         lyrics_bytes = os.path.getsize(lyrics_db)  if os.path.isfile(lyrics_db) else 0
-        # Video thumbnail cache is in-memory only — report count × ~5 KB estimate
-        vthumb_count = len(getattr(self, '_video_thumb_cache', {}))
-        vthumb_bytes = vthumb_count * 5 * 1024
+        # Now backed by VideoThumbCache on disk (was an in-memory-only
+        # estimate before) — report the real folder size like the other
+        # persistent caches.
+        vthumb_bytes = self._dir_size(vthumb_path) if os.path.isdir(vthumb_path) else 0
 
         return {
             'webview2': {
@@ -961,8 +1068,8 @@ class MacanMediaAPI:
             },
             'videothumb': {
                 'size_bytes': vthumb_bytes,
-                'size_str':   f"{vthumb_count} frames (~{self._fmt_bytes(vthumb_bytes)})",
-                'path':       'in-memory',
+                'size_str':   self._fmt_bytes(vthumb_bytes),
+                'path':       vthumb_path,
             },
         }
 
@@ -1022,6 +1129,10 @@ class MacanMediaAPI:
         def _clear_videothumb():
             if hasattr(self, '_video_thumb_cache'):
                 self._video_thumb_cache.clear()
+            try:
+                self._video_thumb_disk_cache.clear()
+            except Exception as e:
+                errors.append(f"videothumb: {e}")
 
         targets = ['webview2', 'albumart', 'lyrics', 'videothumb'] if target == 'all' else [target]
 
@@ -1179,8 +1290,11 @@ class MacanMediaAPI:
         """Lightweight version of _build_track_meta used during bulk add.
 
         Differences from _build_track_meta:
-        - NO cover_art extraction (deferred to JS lazy fetch)
-        - NO video_thumbnail generation (deferred)
+        - NO cover_art extraction beyond the cheap disk-cache lookup below
+          (online fallback still deferred to JS lazy fetch)
+        - NO fresh cv2 video_thumbnail generation (deferred to JS lazy fetch —
+          but see the disk-cache check below, which is cheap and skips the
+          defer entirely for videos we've already thumbnailed before)
         - NO cv2 video resolution probe (deferred)
         - Reads tags + duration + replaygain only
         This cuts per-file time from ~80–300ms to ~5–20ms.
@@ -1229,6 +1343,25 @@ class MacanMediaAPI:
             except Exception:
                 pass
 
+        # Video thumbnail: check the persistent disk cache (SQLite lookup +
+        # small JPEG read, no cv2 decode) before deferring to the JS lazy
+        # fetch. This is the fix for "loading many videos re-generates every
+        # thumbnail" — a video that was already thumbnailed in ANY previous
+        # session or playlist now shows instantly on add/scan instead of
+        # waiting on a lazy round-trip + full cv2 decode again.
+        video_thumb = None
+        if is_video:
+            try:
+                video_thumb = self._video_thumb_disk_cache.get_cached(abs_path)
+                if video_thumb:
+                    # Warm the in-memory cache too so a same-session
+                    # get_video_thumbnail() call is also an instant hit.
+                    if not hasattr(self, '_video_thumb_cache'):
+                        self._video_thumb_cache = {}
+                    self._video_thumb_cache[abs_path] = video_thumb
+            except Exception:
+                video_thumb = None
+
         return {
             'name':             display_name,
             'artist':           artist,
@@ -1240,7 +1373,7 @@ class MacanMediaAPI:
             'duration':         duration,
             'duration_str':     self._format_duration(duration),
             'cover_art':        cover_art,
-            'video_thumb':      None,
+            'video_thumb':      video_thumb,
             'file_size':        file_size,
             'video_resolution': None,
             'replaygain_db':    replaygain_db,
@@ -1361,13 +1494,21 @@ class MacanMediaAPI:
 
     def get_video_thumbnail(self, path):
         """Return a base64 thumbnail for a video file, extracted at ~10% of duration.
-        Result is cached in memory keyed by path so repeat calls are instant.
+
+        Three-tier cache, cheapest first:
+        1. In-memory dict  — zero I/O, instant, but cleared on app restart.
+        2. Disk cache (VideoThumbCache) — SQLite lookup + small JPEG read,
+           survives restarts AND playlist clear/re-add. This is what makes
+           re-opening the app with a big video library fast: nothing gets
+           re-decoded that was already thumbnailed in any earlier session.
+        3. Fresh cv2 decode — only on a real miss (first time this exact
+           file, at this exact mtime/size, has ever been thumbnailed).
 
         NON-BLOCKING: the actual cv2 decode is heavy (open container + seek +
         decode + resize + jpeg-encode) and this method runs on the pywebview
         JS<->Python IPC bridge thread. Doing that work synchronously here
         freezes every other JS call (play/pause, etc.) until it finishes.
-        So: on a cache miss we kick the work to a background thread and
+        So: on a full cache miss we kick the work to a background thread and
         return None immediately; once the thumbnail is ready we push it to
         the frontend via evaluate_js (same pattern as
         get_cover_art_with_online_fallback's online-art push).
@@ -1382,6 +1523,17 @@ class MacanMediaAPI:
         if path in self._video_thumb_cache:
             return self._video_thumb_cache[path]
 
+        # Disk cache check happens on the calling (IPC bridge) thread — it's
+        # just a SQLite lookup + reading a few KB off disk, not a cv2 decode,
+        # so it's cheap enough not to need its own background thread.
+        try:
+            cached = self._video_thumb_disk_cache.get_cached(path)
+        except Exception:
+            cached = None
+        if cached:
+            self._video_thumb_cache[path] = cached
+            return cached
+
         if path in self._video_thumb_pending:
             return None  # already being generated in background
 
@@ -1390,31 +1542,48 @@ class MacanMediaAPI:
         def _bg():
             data_uri = None
             try:
-                import cv2
-                cap = cv2.VideoCapture(path)
-                if cap.isOpened():
-                    total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                    fps   = cap.get(cv2.CAP_PROP_FPS) or 24
+                cap = image_engine.VideoCapture(path)
+                if cap.is_opened():
+                    total = cap.get(image_engine.CAP_PROP_FRAME_COUNT)
+                    fps   = cap.get(image_engine.CAP_PROP_FPS) or 24
                     # Seek to ~10% of duration, minimum 1 second in
                     seek_frame = max(int(fps), int(total * 0.10))
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, seek_frame)
+                    cap.set(image_engine.CAP_PROP_POS_FRAMES, seek_frame)
                     ret, frame = cap.read()
                     cap.release()
                     if ret and frame is not None:
+                        # Dimensi langsung dari getter Mat, gak lewat numpy dulu
+                        h, w = frame.rows, frame.cols
                         # Resize to 120×68 (16:9) — reduced from 160×90 for low-end devices
-                        h, w = frame.shape[:2]
                         target_w, target_h = 120, 68
                         scale = min(target_w / w, target_h / h)
                         nw, nh = int(w * scale), int(h * scale)
-                        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
-                        # Pad to exact size
-                        canvas = __import__('numpy').zeros((target_h, target_w, 3), dtype='uint8')
-                        x_off = (target_w - nw) // 2
-                        y_off = (target_h - nh) // 2
-                        canvas[y_off:y_off+nh, x_off:x_off+nw] = frame
-                        ret2, buf = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 65])  # q65: lighter on RAM
-                        if ret2:
-                            data_uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.tobytes()).decode()
+                        frame = image_engine.resize(frame, (nw, nh), interpolation=image_engine.INTER_AREA)
+                        # Pad to exact size — pakai copy_make_border native, bukan
+                        # np.zeros() + slice-assign manual
+                        pad_x = target_w - nw
+                        pad_y = target_h - nh
+                        left, right = pad_x // 2, pad_x - pad_x // 2
+                        top, bottom = pad_y // 2, pad_y - pad_y // 2
+                        frame = image_engine.copy_make_border(
+                            frame, top, bottom, left, right,
+                            image_engine.BORDER_CONSTANT, (0, 0, 0, 0)
+                        )
+                        # Encode langsung ke JPEG bytes (native, tanpa numpy/PIL).
+                        # Frame masih BGR — jangan cvt_color ke RGB, imencode expect BGR.
+                        ok, buf = image_engine.imencode(
+                            '.jpg', frame, [image_engine.IMWRITE_JPEG_QUALITY, 65]  # q65: lighter on RAM
+                        )
+                        if ok:
+                            jpeg_bytes = bytes(buf)
+                            data_uri = 'data:image/jpeg;base64,' + base64.b64encode(jpeg_bytes).decode()
+                            # Persist to disk so this exact video never needs
+                            # a cv2 decode again (next launch, next playlist,
+                            # after clear+re-add, etc.)
+                            try:
+                                self._video_thumb_disk_cache.save(path, jpeg_bytes)
+                            except Exception as e:
+                                print(f'[VideoThumb] Disk cache save error: {e}')
                 else:
                     cap.release()
             except Exception as e:
@@ -1473,12 +1642,11 @@ class MacanMediaAPI:
 
             if is_video:
                 try:
-                    import cv2
-                    cap = cv2.VideoCapture(str(p))
-                    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    cap = image_engine.VideoCapture(str(p))
+                    w   = int(cap.get(image_engine.CAP_PROP_FRAME_WIDTH))
+                    h   = int(cap.get(image_engine.CAP_PROP_FRAME_HEIGHT))
+                    fps = cap.get(image_engine.CAP_PROP_FPS)
+                    frames = cap.get(image_engine.CAP_PROP_FRAME_COUNT)
                     dur = int(frames / fps) if fps and fps > 0 else 0
                     cap.release()
                     info["resolution"]   = f"{w}x{h}" if w and h else "Unknown"
@@ -2500,10 +2668,9 @@ class MacanMediaAPI:
         video_resolution = None
         if is_video:
             try:
-                import cv2
-                cap = cv2.VideoCapture(abs_path)
-                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap = image_engine.VideoCapture(abs_path)
+                w = int(cap.get(image_engine.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(image_engine.CAP_PROP_FRAME_HEIGHT))
                 cap.release()
                 if w and h:
                     video_resolution = f"{w}x{h}"
@@ -2741,12 +2908,11 @@ class MacanMediaAPI:
                 return int(audio_file.info.length)
         except Exception:
             pass
-        # For video files, try cv2
+        # For video files, try image_engine
         try:
-            import cv2
-            cap = cv2.VideoCapture(path)
-            fps    = cap.get(cv2.CAP_PROP_FPS)
-            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            cap = image_engine.VideoCapture(path)
+            fps    = cap.get(image_engine.CAP_PROP_FPS)
+            frames = cap.get(image_engine.CAP_PROP_FRAME_COUNT)
             cap.release()
             if fps and fps > 0 and frames > 0:
                 return int(frames / fps)
