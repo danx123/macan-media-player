@@ -126,8 +126,8 @@
       height: min(64vh, 46vw, 620px);
     }
 
-    #plgfs-overlay #track-info    { grid-column: 2; grid-row: 1; width: 100%; text-align: left; }
-    #plgfs-overlay #controls      { grid-column: 2; grid-row: 2; width: 100%; justify-content: flex-start; gap: clamp(10px, 1vw, 18px); }
+    #plgfs-overlay #track-info    { grid-column: 2; grid-row: 1; width: 100%; text-align: center; }
+    #plgfs-overlay #controls      { grid-column: 2; grid-row: 2; width: 100%; justify-content: center; gap: clamp(10px, 1vw, 18px); }
     #plgfs-overlay #progress-container { grid-column: 2; grid-row: 3; width: 100%; }
     #plgfs-overlay #mini-vis      { grid-column: 2; grid-row: 4; width: 100%; height: 100%; min-height: 64px; align-self: stretch; }
     #plgfs-overlay #extra-controls { grid-column: 2; grid-row: 5; width: 100%; }
@@ -139,7 +139,7 @@
 
     #plgfs-overlay #track-title    { font-size: clamp(2.2rem, 3.4vw, 3.6rem); }
     #plgfs-overlay #track-artist   { font-size: clamp(0.75rem, 1vw, 0.95rem); margin-top: 10px; }
-    #plgfs-overlay #track-meta-row { justify-content: flex-start; margin-top: 14px; }
+    #plgfs-overlay #track-meta-row { justify-content: center; margin-top: 14px; }
     #plgfs-overlay .meta-badge     { font-size: clamp(0.6rem, 0.85vw, 0.75rem); padding: 5px 12px; }
 
     #plgfs-overlay .ctrl-btn.ctrl-secondary { width: clamp(42px, 2.6vw, 52px); height: clamp(42px, 2.6vw, 52px); }
