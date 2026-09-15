@@ -1,11 +1,13 @@
 // ═══════════════════════════════════════════════════════════════
 // MACAN MEDIA PLAYER — PLUGIN: FULLSCREEN PLAYER (Focus Mode)
 //
-// Blows up #now-playing-panel (art, title, seekbar, controls, volume,
-// add-files row) to fill the whole window, hides the playlist, and
-// gives it a dark ambient backdrop — no queue, just the player.
+// Blows up #now-playing-panel (art, title, seekbar, controls, volume)
+// into a two-column "Now Playing" screen — big art on one side, a
+// stacked info/controls column on the other — hides the playlist,
+// and lets the app's own album-art ambient glow (#art-blur-bg) show
+// through behind it.
 //
-// Implementation note: instead of rebuilding the player's controls
+// Implementation note #1: instead of rebuilding the player's controls
 // from scratch (which would mean re-wiring play/pause/seek/shuffle/
 // repeat and re-syncing every bit of state by hand), this plugin
 // simply REPARENTS the real #now-playing-panel DOM node into a
@@ -13,18 +15,47 @@
 // clone — every existing event listener, id-based lookup and bridge
 // hook (track:load, art:load, player:play/pause, player:seek) keeps
 // working exactly as before with zero duplicated logic.
+//
+// Implementation note #2: the two-column layout is done with CSS
+// Grid, explicitly placing each existing child (art-frame, track-info,
+// controls, progress-container, mini-vis, extra-controls) into a
+// column/row — no wrapper divs, no DOM restructuring, so nothing about
+// how those elements are found or listened to changes. Every size is
+// vw/vh/clamp()-based so it's genuinely fluid — it re-flows on its own
+// as the window resizes, no JS measuring or scaling required. A
+// narrow/portrait media query falls back to a single stacked column.
+//
+// Implementation note #3: this is meant to be a *true* fullscreen —
+// #top-bar (the MACAN logo/menu/clock header) is actually hidden
+// while active (not just covered), and the overlay sits at a plain
+// `inset: 0` like a real fullscreen surface. The header's original
+// inline display value is restored on close.
+//
+// Implementation note #4: #mini-canvas (the waveform) has a hardcoded
+// 320×44 backing bitmap in the HTML that script.js never resizes. If
+// we display it much bigger without touching that, it'll look blurry/
+// pixelated. syncMiniCanvasResolution() fixes this by bumping the
+// canvas's actual width/height attributes (in device pixels) to match
+// its real rendered size whenever fullscreen opens or the window
+// resizes, and restores the original attributes on close.
 // ═══════════════════════════════════════════════════════════════
 
 (() => {
   const PLUGIN_ID = 'fullscreen-player';
 
   let overlayEl      = null;
-  let closeBtn        = null;
-  let toggleBtn       = null;
-  let npp              = null; // #now-playing-panel node
-  let nppParent        = null; // its original parent (#main-layout)
-  let nppNextSibling   = null; // its original position marker
-  let active           = false;
+  let closeBtn       = null;
+  let toggleBtn      = null;
+  let npp            = null; // #now-playing-panel node
+  let nppParent      = null; // its original parent (#main-layout)
+  let nppNextSibling = null; // its original position marker
+  let active         = false;
+
+  let miniCanvasOrigW = null;
+  let miniCanvasOrigH = null;
+
+  let topBarEl        = null;
+  let topBarOrigDisplay = '';
 
   const ICON_EXPAND =
     '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
@@ -38,35 +69,104 @@
     #plgfs-overlay {
       position: fixed;
       inset: 0;
-      z-index: 900; /* above #top-bar (100) and #main-layout (10) */
+      z-index: 900;
       display: none;
       align-items: center;
       justify-content: center;
-      background: radial-gradient(ellipse at center, rgba(20,20,20,0.55) 0%, rgba(0,0,0,0.94) 72%);
+      /* Darker on the right (behind text/controls, for legibility),
+         lighter/more transparent toward the left (behind the art) so
+         the app's existing #art-blur-bg ambient glow reads through
+         instead of getting smothered by a flat black backdrop. */
+      background: radial-gradient(ellipse 75% 100% at 24% 50%,
+        rgba(0,0,0,0.18) 0%,
+        rgba(0,0,0,0.58) 48%,
+        rgba(0,0,0,0.92) 82%);
       opacity: 0;
-      transition: opacity 0.25s ease;
+      transition: opacity 0.3s ease;
+      overflow: hidden;
     }
     #plgfs-overlay.plgfs-active {
       display: flex;
       opacity: 1;
     }
 
-    /* #now-playing-panel, reparented in here, gets a fullscreen-friendly
-       reskin — the selector only applies while it's actually inside the
-       overlay, so its normal in-layout appearance is untouched. */
+    /* #now-playing-panel, reparented in here, loses the sidebar "card"
+       look (no background/border/blur/radius/shadow) and becomes a
+       two-column CSS Grid: art on the left, everything else stacked
+       in a column on the right. Every existing child keeps its own
+       id/listeners — only *where* it sits changes. The selector only
+       applies while the panel is actually inside the overlay, so its
+       normal in-layout sidebar appearance is untouched. */
     #plgfs-overlay #now-playing-panel {
       border-right: none !important;
-      width: min(94vw, 460px);
-      max-height: 90vh;
-      border-radius: 18px;
-      border: 1px solid rgba(232,255,0,0.12);
-      box-shadow: 0 30px 100px rgba(0,0,0,0.75), 0 0 0 1px rgba(232,255,0,0.04);
-      padding: 44px 36px 32px;
-      gap: 24px;
+      width: 100%;
+      height: 100%;
+      max-width: none;
+      max-height: none;
+      background: transparent;
+      backdrop-filter: none;
+      border: none;
+      border-radius: 0;
+      box-shadow: none;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) min(460px, 42vw);
+      grid-template-rows: auto auto auto 1fr auto;
+      align-items: center;
+      column-gap: clamp(32px, 5vw, 96px);
+      row-gap: clamp(14px, 2vh, 26px);
+      padding: clamp(28px, 5vh, 64px) clamp(28px, 5vw, 80px);
     }
+
     #plgfs-overlay #art-frame {
-      width: 260px;
-      height: 260px;
+      grid-column: 1;
+      grid-row: 1 / 6;
+      justify-self: center;
+      align-self: center;
+      width: min(64vh, 46vw, 620px);
+      height: min(64vh, 46vw, 620px);
+    }
+
+    #plgfs-overlay #track-info    { grid-column: 2; grid-row: 1; width: 100%; text-align: left; }
+    #plgfs-overlay #controls      { grid-column: 2; grid-row: 2; width: 100%; justify-content: flex-start; gap: clamp(10px, 1vw, 18px); }
+    #plgfs-overlay #progress-container { grid-column: 2; grid-row: 3; width: 100%; }
+    #plgfs-overlay #mini-vis      { grid-column: 2; grid-row: 4; width: 100%; height: 100%; min-height: 64px; align-self: stretch; }
+    #plgfs-overlay #extra-controls { grid-column: 2; grid-row: 5; width: 100%; }
+
+    /* Declutter for focus mode — Add Files / Add Folder / Clear / the
+       Fullscreen toggle itself aren't needed once you're already in
+       here; Esc or the close button handles exiting. */
+    #plgfs-overlay #action-row { display: none; }
+
+    #plgfs-overlay #track-title    { font-size: clamp(2.2rem, 3.4vw, 3.6rem); }
+    #plgfs-overlay #track-artist   { font-size: clamp(0.75rem, 1vw, 0.95rem); margin-top: 10px; }
+    #plgfs-overlay #track-meta-row { justify-content: flex-start; margin-top: 14px; }
+    #plgfs-overlay .meta-badge     { font-size: clamp(0.6rem, 0.85vw, 0.75rem); padding: 5px 12px; }
+
+    #plgfs-overlay .ctrl-btn.ctrl-secondary { width: clamp(42px, 2.6vw, 52px); height: clamp(42px, 2.6vw, 52px); }
+    #plgfs-overlay .ctrl-btn.ctrl-primary   { width: clamp(58px, 3.8vw, 74px); height: clamp(58px, 3.8vw, 74px); }
+
+    #plgfs-overlay #progress-container span { font-size: clamp(0.6rem, 0.75vw, 0.75rem); }
+
+    /* Narrow / portrait windows: fall back to a single stacked column
+       (art on top, everything else below) instead of squeezing two
+       columns into too little width. */
+    @media (max-width: 820px), (max-aspect-ratio: 4/5) {
+      #plgfs-overlay #now-playing-panel {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto auto auto auto 1fr auto;
+        justify-items: center;
+      }
+      #plgfs-overlay #art-frame {
+        grid-column: 1; grid-row: 1;
+        width: min(50vh, 68vw, 380px);
+        height: min(50vh, 68vw, 380px);
+      }
+      #plgfs-overlay #track-info      { grid-row: 2; text-align: center; }
+      #plgfs-overlay #track-meta-row  { justify-content: center; }
+      #plgfs-overlay #controls        { grid-row: 3; justify-content: center; }
+      #plgfs-overlay #progress-container { grid-row: 4; }
+      #plgfs-overlay #mini-vis        { grid-row: 5; height: auto; min-height: 56px; align-self: unset; }
+      #plgfs-overlay #extra-controls  { grid-row: 6; }
     }
 
     #plgfs-close-btn {
@@ -97,18 +197,50 @@
       color: var(--accent, #E8FF00);
       border-color: rgba(232,255,0,0.35);
     }
-
-    @media (max-width: 640px) {
-      #plgfs-overlay #now-playing-panel {
-        width: 100vw;
-        height: 100vh;
-        max-height: 100vh;
-        border-radius: 0;
-        justify-content: center;
-      }
-      #plgfs-overlay #art-frame { width: 200px; height: 200px; }
-    }
   `;
+
+  // ── Waveform canvas resolution sync ─────────────────────────
+  // Draw code in script.js reads miniCanvas.width/height directly as
+  // its pixel-space coordinate system every animation frame, so
+  // bumping these attributes here is picked up automatically on the
+  // very next frame — no redraw call needed.
+  function syncMiniCanvasResolution() {
+    const canvas = document.getElementById('mini-canvas');
+    if (!canvas) return;
+
+    if (miniCanvasOrigW === null) {
+      miniCanvasOrigW = canvas.width;
+      miniCanvasOrigH = canvas.height;
+    }
+
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(1, Math.round(rect.width * dpr));
+    const h = Math.max(1, Math.round(rect.height * dpr));
+
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+  }
+
+  function restoreMiniCanvasResolution() {
+    if (miniCanvasOrigW === null) return;
+    const canvas = document.getElementById('mini-canvas');
+    if (canvas) {
+      canvas.width = miniCanvasOrigW;
+      canvas.height = miniCanvasOrigH;
+    }
+    miniCanvasOrigW = null;
+    miniCanvasOrigH = null;
+  }
+
+  let resizeRAF = null;
+  function onWindowResize() {
+    if (!active) return;
+    if (resizeRAF) cancelAnimationFrame(resizeRAF);
+    resizeRAF = requestAnimationFrame(syncMiniCanvasResolution);
+  }
 
   // ── Overlay (created once, lazily) ─────────────────────────
   function ensureOverlay() {
@@ -134,6 +266,8 @@
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape' && active) close();
     });
+
+    window.addEventListener('resize', onWindowResize);
   }
 
   // ── Open / close ────────────────────────────────────────────
@@ -144,7 +278,7 @@
 
     ensureOverlay();
 
-    nppParent    = npp.parentNode;
+    nppParent      = npp.parentNode;
     nppNextSibling = npp.nextSibling;
 
     overlayEl.appendChild(npp);
@@ -154,13 +288,26 @@
     const playlistPanel = document.getElementById('playlist-panel');
     if (playlistPanel) playlistPanel.style.display = 'none';
 
+    // True fullscreen — hide the header too, not just cover it.
+    topBarEl = document.getElementById('top-bar');
+    if (topBarEl) {
+      topBarOrigDisplay = topBarEl.style.display;
+      topBarEl.style.display = 'none';
+    }
+
     active = true;
     if (toggleBtn) toggleBtn.classList.add('plgfs-on');
     MacanBridge.api.showToast('FULLSCREEN PLAYER — Esc to exit');
+
+    // Wait a frame so the grid layout has actually settled into its
+    // new (much bigger) size before measuring the waveform canvas.
+    requestAnimationFrame(syncMiniCanvasResolution);
   }
 
   function close() {
     if (!active || !npp) return;
+
+    restoreMiniCanvasResolution();
 
     // Put the panel back exactly where it came from.
     if (nppNextSibling) nppParent.insertBefore(npp, nppNextSibling);
@@ -171,6 +318,11 @@
 
     const playlistPanel = document.getElementById('playlist-panel');
     if (playlistPanel) playlistPanel.style.display = '';
+
+    if (topBarEl) {
+      topBarEl.style.display = topBarOrigDisplay;
+      topBarEl = null;
+    }
 
     active = false;
     if (toggleBtn) toggleBtn.classList.remove('plgfs-on');
