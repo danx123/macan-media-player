@@ -37,6 +37,113 @@ from core.video_utils import VideoThumbnailer
 from macan_taskbar_thumbbar_webview import TaskbarThumbBar
 from macan_now_playing_bubble import NowPlayingBubble
 
+# ── Global media hotkeys (Windows-only) ──────────────────────────────────────
+# CTRL+ALT+SPACE = Play/Pause, CTRL+ALT+RIGHT = Next, CTRL+ALT+LEFT = Previous.
+# System-wide via the Win32 RegisterHotKey API — works even when the player
+# window isn't focused. A hotkey registered with hWnd=None is delivered to
+# the *thread* that registered it, so a dedicated thread is needed that both
+# calls RegisterHotKey() and runs its own GetMessage() loop; a plain
+# background thread without a message loop would register the hotkey but
+# never actually see WM_HOTKEY fire.
+if sys.platform == 'win32':
+    import ctypes.wintypes as _wintypes
+
+    _MOD_ALT      = 0x0001
+    _MOD_CONTROL  = 0x0002
+    _MOD_NOREPEAT = 0x4000  # don't refire repeatedly while the combo is held
+    _WM_HOTKEY    = 0x0312
+    _WM_QUIT      = 0x0012
+    _VK_SPACE     = 0x20
+    _VK_LEFT      = 0x25
+    _VK_RIGHT     = 0x27
+
+    class GlobalMediaHotkeys(threading.Thread):
+        """Registers system-wide Play/Pause/Next/Previous hotkeys and routes
+        them to callbacks. Runs its own Win32 message loop on a dedicated
+        thread (required by RegisterHotKey when hWnd=None). No-op stand-in
+        is used automatically on non-Windows (see the else-branch below)."""
+
+        # (hotkey id, modifiers, virtual-key, callback attribute name)
+        _HOTKEYS = [
+            (1, _MOD_CONTROL | _MOD_ALT | _MOD_NOREPEAT, _VK_SPACE, 'on_play_pause'),
+            (2, _MOD_CONTROL | _MOD_ALT | _MOD_NOREPEAT, _VK_RIGHT, 'on_next'),
+            (3, _MOD_CONTROL | _MOD_ALT | _MOD_NOREPEAT, _VK_LEFT,  'on_previous'),
+        ]
+
+        def __init__(self, on_play_pause=None, on_next=None, on_previous=None):
+            super().__init__(daemon=True, name='GlobalMediaHotkeys')
+            self.on_play_pause    = on_play_pause
+            self.on_next          = on_next
+            self.on_previous      = on_previous
+            self._thread_id       = None
+            self._ready           = threading.Event()
+            self._registered_ids  = []
+
+        def run(self):
+            user32 = ctypes.windll.user32
+            self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+
+            for hk_id, mods, vk, _attr in self._HOTKEYS:
+                if user32.RegisterHotKey(None, hk_id, mods, vk):
+                    self._registered_ids.append(hk_id)
+                else:
+                    # Combo already claimed by another running app — skip it
+                    # rather than crash the whole player over one hotkey.
+                    print(f'[Macan] Warning: global hotkey id={hk_id} '
+                          f'(mods={mods:#x}, vk={vk:#x}) could not be '
+                          f'registered — likely already in use by another app')
+
+            self._ready.set()
+
+            msg = _wintypes.MSG()
+            while True:
+                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret == 0 or ret == -1:
+                    break  # WM_QUIT, or an error tore down the message queue
+                if msg.message == _WM_HOTKEY:
+                    hk_id = msg.wParam
+                    for _id, _mods, _vk, attr in self._HOTKEYS:
+                        if _id == hk_id:
+                            cb = getattr(self, attr, None)
+                            if callable(cb):
+                                try:
+                                    cb()
+                                except Exception as e:
+                                    print(f'[Macan] Global hotkey callback error: {e}')
+                            break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+
+            for hk_id in self._registered_ids:
+                user32.UnregisterHotKey(None, hk_id)
+
+        def start_and_wait(self, timeout: float = 2.0):
+            """Start the listener thread and block until hotkeys are (attempted
+            to be) registered, so callers know setup has finished before
+            continuing (mirrors TaskbarThumbBar's init timing conventions)."""
+            self.start()
+            self._ready.wait(timeout)
+
+        def shutdown(self):
+            """Post WM_QUIT into the hotkey thread's own message queue so its
+            GetMessage() loop exits and the hotkeys get unregistered."""
+            if self._thread_id is not None:
+                ctypes.windll.user32.PostThreadMessageW(self._thread_id, _WM_QUIT, 0, 0)
+                self.join(timeout=2.0)
+else:
+    class GlobalMediaHotkeys:
+        """No-op stand-in for non-Windows platforms — RegisterHotKey is a
+        Win32-only API, so global hotkeys are simply unavailable there."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start_and_wait(self, timeout: float = 2.0):
+            pass
+
+        def shutdown(self):
+            pass
+
 if hasattr(webview, 'settings'):
     webview.settings['ALLOW_DOWNLOADS'] = True
 
@@ -770,6 +877,16 @@ class MacanMediaAPI:
             lambda: self._window.evaluate_js('togglePlayPause()'))
         self._taskbar_thumbbar.next_requested.connect(
             lambda: self._window.evaluate_js('nextTrack()'))
+
+        # ── Global media hotkeys (system-wide, works even when the window
+        #    isn't focused): CTRL+ALT+SPACE=Play/Pause, CTRL+ALT+RIGHT=Next,
+        #    CTRL+ALT+LEFT=Previous. No-op automatically on non-Windows.
+        self._global_hotkeys = GlobalMediaHotkeys(
+            on_play_pause=lambda: self._window.evaluate_js('togglePlayPause()'),
+            on_next=lambda: self._window.evaluate_js('nextTrack()'),
+            on_previous=lambda: self._window.evaluate_js('prevTrack()'),
+        )
+        self._global_hotkeys.start_and_wait()
 
         # [DISABLED] Taskbar autohide detection — disabled for low-end device compatibility.
         # Uncomment the block below (and _start_taskbar_watcher) to re-enable.
@@ -3527,6 +3644,7 @@ def main():
     if sys.platform == 'win32':
         window.events.shown += api._taskbar_thumbbar.init_buttons
         window.events.closing += api._taskbar_thumbbar.shutdown
+        window.events.closing += api._global_hotkeys.shutdown
 
         # ── "Now Playing" bubble: started AFTER taskbar thumbbar init_buttons
         #    (registered second -> runs second on the same 'shown' event) so
