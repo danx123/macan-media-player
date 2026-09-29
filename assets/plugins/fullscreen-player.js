@@ -38,6 +38,21 @@
 // canvas's actual width/height attributes (in device pixels) to match
 // its real rendered size whenever fullscreen opens or the window
 // resizes, and restores the original attributes on close.
+//
+// Implementation note #5: cursor auto-hide. After IDLE_HIDE_MS without
+// real mouse movement the overlay gets `.plgfs-cursor-hidden`
+// (cursor: none on everything inside it, and the close button fades
+// out too); any movement brings both back.
+// Movement is compared against the last position so the phantom
+// mousemove events some webviews fire when the cursor is hidden don't
+// instantly un-hide it.
+//
+// Implementation note #6: edge-reveal playlist. Same reparenting trick
+// as the player panel — the real #playlist-panel node is moved into a
+// fixed left-side drawer (#plgfs-drawer) that slides in when the
+// pointer touches the left screen edge (EDGE_TRIGGER_PX) and slides
+// out once the pointer moves away from it. It's the same node, so
+// track clicks, search filter, drag-reorder etc. all keep working.
 // ═══════════════════════════════════════════════════════════════
 
 (() => {
@@ -56,6 +71,20 @@
 
   let topBarEl        = null;
   let topBarOrigDisplay = '';
+
+  // Cursor auto-hide + playlist edge drawer
+  const IDLE_HIDE_MS     = 2500; // idle time before the cursor hides
+  const EDGE_TRIGGER_PX  = 6;    // distance from left edge that reveals the playlist
+  const DRAWER_LEAVE_PAD = 48;   // how far past the drawer the pointer must go to close it
+
+  let drawerEl        = null;
+  let plPanel         = null; // #playlist-panel node
+  let plParent        = null;
+  let plNextSibling   = null;
+  let drawerOpen      = false;
+  let idleTimer       = null;
+  let lastMouseX      = -1;
+  let lastMouseY      = -1;
 
   const ICON_EXPAND =
     '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
@@ -183,7 +212,7 @@
       cursor: pointer;
       z-index: 901;
       backdrop-filter: blur(6px);
-      transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.15s;
+      transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.15s, opacity 0.35s ease;
     }
     #plgfs-close-btn:hover {
       color: var(--accent, #E8FF00);
@@ -192,6 +221,52 @@
       transform: scale(1.06);
     }
     #plgfs-close-btn.plgfs-visible { display: flex; }
+
+    /* ── Cursor auto-hide ─────────────────────────────────────
+       Some children set their own cursor (buttons, seekbar...), so
+       the rule has to hit every descendant with !important. */
+    #plgfs-overlay.plgfs-cursor-hidden,
+    #plgfs-overlay.plgfs-cursor-hidden *,
+    #plgfs-close-btn.plgfs-cursor-hidden {
+      cursor: none !important;
+    }
+
+    /* Close button fades out together with the cursor while idle and
+       comes back on the next mouse movement. pointer-events:none keeps
+       an invisible button from catching stray clicks; Esc still exits. */
+    #plgfs-close-btn.plgfs-cursor-hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    /* ── Playlist drawer (slides in from the left edge) ──────── */
+    #plgfs-drawer {
+      position: fixed;
+      top: 0; bottom: 0; left: 0;
+      width: min(440px, 90vw);
+      z-index: 902;
+      display: none;
+      transform: translateX(-102%);
+      transition: transform 0.28s cubic-bezier(0.22, 0.8, 0.3, 1),
+                  box-shadow 0.28s ease;
+      box-shadow: none;
+    }
+    #plgfs-drawer.plgfs-drawer-mounted { display: block; }
+    #plgfs-drawer.plgfs-drawer-open {
+      transform: translateX(0);
+      box-shadow: 12px 0 48px rgba(0,0,0,0.6);
+    }
+    #plgfs-drawer #playlist-panel {
+      width: 100%;
+      height: 100%;
+      background: rgba(8,8,8,0.9);
+      border-right: 1px solid rgba(255,255,255,0.08);
+    }
+
+    /* Drawer is just for picking a track — hide the header (QUEUE title,
+       tool buttons row, filter box). The header stays in the DOM, so
+       its buttons/listeners are untouched and it's back on close. */
+    #plgfs-drawer .pl-header-right { display: none; }
 
     #plgfs-toggle-btn.plgfs-on {
       color: var(--accent, #E8FF00);
@@ -242,6 +317,101 @@
     resizeRAF = requestAnimationFrame(syncMiniCanvasResolution);
   }
 
+  // ── Cursor auto-hide ────────────────────────────────────────
+  function setCursorHidden(hidden) {
+    if (!overlayEl) return;
+    overlayEl.classList.toggle('plgfs-cursor-hidden', hidden);
+    if (closeBtn) closeBtn.classList.toggle('plgfs-cursor-hidden', hidden);
+  }
+
+  function scheduleCursorHide() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      if (!active) return;
+      // Keep the cursor while the playlist is open (user is browsing it).
+      if (drawerOpen) { scheduleCursorHide(); return; }
+      setCursorHidden(true);
+    }, IDLE_HIDE_MS);
+  }
+
+  // ── Playlist drawer ─────────────────────────────────────────
+  function mountPlaylist() {
+    plPanel = document.getElementById('playlist-panel');
+    if (!plPanel) return;
+
+    if (!drawerEl) {
+      drawerEl = document.createElement('div');
+      drawerEl.id = 'plgfs-drawer';
+      document.body.appendChild(drawerEl);
+    }
+
+    plParent      = plPanel.parentNode;
+    plNextSibling = plPanel.nextSibling;
+
+    plPanel.style.display = '';
+    drawerEl.appendChild(plPanel);
+    drawerEl.classList.add('plgfs-drawer-mounted');
+  }
+
+  function unmountPlaylist() {
+    closeDrawer(true);
+    if (drawerEl) drawerEl.classList.remove('plgfs-drawer-mounted');
+
+    if (plPanel && plParent) {
+      if (plNextSibling && plNextSibling.parentNode === plParent) {
+        plParent.insertBefore(plPanel, plNextSibling);
+      } else {
+        plParent.appendChild(plPanel);
+      }
+    }
+    plPanel = plParent = plNextSibling = null;
+  }
+
+  function openDrawer() {
+    if (drawerOpen || !drawerEl || !plPanel) return;
+    drawerOpen = true;
+    drawerEl.classList.add('plgfs-drawer-open');
+    setCursorHidden(false);
+  }
+
+  function closeDrawer(immediate) {
+    if (!drawerOpen) return;
+    drawerOpen = false;
+    if (drawerEl) drawerEl.classList.remove('plgfs-drawer-open');
+    if (!immediate) scheduleCursorHide();
+  }
+
+  // ── Global mouse handling (only acts while fullscreen is active) ──
+  function onMouseMove(e) {
+    if (!active) return;
+
+    // Ignore phantom events with no real movement.
+    if (e.clientX === lastMouseX && e.clientY === lastMouseY) return;
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+
+    setCursorHidden(false);
+
+    if (e.clientX <= EDGE_TRIGGER_PX) {
+      openDrawer();
+    } else if (drawerOpen && drawerEl) {
+      const drawerRight = drawerEl.getBoundingClientRect().right;
+      const ae = document.activeElement;
+      const busy =
+        e.buttons !== 0 ||                                     // mid-drag (reorder, etc.)
+        (ae && drawerEl.contains(ae) && ae.tagName === 'INPUT'); // typing in the filter box
+      if (!busy && e.clientX > drawerRight + DRAWER_LEAVE_PAD) closeDrawer();
+    }
+
+    scheduleCursorHide();
+  }
+
+  // Pointer left the window through the left edge — treat as an edge hit.
+  function onMouseLeave(e) {
+    if (!active) return;
+    if (e.clientX <= EDGE_TRIGGER_PX) openDrawer();
+  }
+
   // ── Overlay (created once, lazily) ─────────────────────────
   function ensureOverlay() {
     if (overlayEl) return;
@@ -268,6 +438,8 @@
     });
 
     window.addEventListener('resize', onWindowResize);
+    document.addEventListener('mousemove', onMouseMove, { passive: true });
+    document.documentElement.addEventListener('mouseleave', onMouseLeave);
   }
 
   // ── Open / close ────────────────────────────────────────────
@@ -285,8 +457,9 @@
     overlayEl.classList.add('plgfs-active');
     closeBtn.classList.add('plgfs-visible');
 
-    const playlistPanel = document.getElementById('playlist-panel');
-    if (playlistPanel) playlistPanel.style.display = 'none';
+    // Playlist starts hidden in a left-edge drawer; it slides in when
+    // the pointer touches the left edge of the screen.
+    mountPlaylist();
 
     // True fullscreen — hide the header too, not just cover it.
     topBarEl = document.getElementById('top-bar');
@@ -296,8 +469,10 @@
     }
 
     active = true;
+    lastMouseX = lastMouseY = -1;
+    scheduleCursorHide();
     if (toggleBtn) toggleBtn.classList.add('plgfs-on');
-    MacanBridge.api.showToast('FULLSCREEN PLAYER — Esc to exit');
+    MacanBridge.api.showToast('FULLSCREEN PLAYER — Esc to exit · Move the mouse to the left edge = playlist');
 
     // Wait a frame so the grid layout has actually settled into its
     // new (much bigger) size before measuring the waveform canvas.
@@ -309,15 +484,19 @@
 
     restoreMiniCanvasResolution();
 
+    clearTimeout(idleTimer);
+    setCursorHidden(false);
+
+    // Playlist goes back first so the now-playing panel's recorded
+    // sibling position is valid again when it's re-inserted below.
+    unmountPlaylist();
+
     // Put the panel back exactly where it came from.
     if (nppNextSibling) nppParent.insertBefore(npp, nppNextSibling);
     else nppParent.appendChild(npp);
 
     overlayEl.classList.remove('plgfs-active');
     closeBtn.classList.remove('plgfs-visible');
-
-    const playlistPanel = document.getElementById('playlist-panel');
-    if (playlistPanel) playlistPanel.style.display = '';
 
     if (topBarEl) {
       topBarEl.style.display = topBarOrigDisplay;
@@ -365,7 +544,7 @@
   window.MacanBridge.register({
     id: PLUGIN_ID,
     name: 'Fullscreen Player',
-    version: '1.0.0',
+    version: '1.1.0',
     styles: STYLES,
     menu: {
       label: 'FULLSCREEN PLAYER',
