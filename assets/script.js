@@ -3992,6 +3992,12 @@ function togglePlayPause() {
   ensureAudioCtx();
 
   const p = activePlayer();
+  // Sumber track aktif sudah dilepas (mis. setelah dikirim ke Tag Editor) ->
+  // Play memuat ulang track itu, supaya tombol Play gak "mati" diam-diam.
+  if (p.paused && (!p.src || p.src === window.location.href)) {
+    loadTrack(S.currentIndex, true);
+    return;
+  }
   if (p.paused) {
     doPlay(p);
   } else {
@@ -4770,8 +4776,92 @@ async function showFileProperties(track) {
   modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
 }
 
-// ─── TAG EDITOR ───────────────────────────────────────────────
+// ─── TAG EDITOR (Advanced Tag Editor — lazy, proses terpisah) ──
+// Edit tag sekarang dikirim ke advanced_tag_editor. Editor TIDAK di-load saat
+// startup: Python baru men-spawn-nya saat fungsi ini dipanggil pertama kali.
+let _tagSyncTimer = null;
+
 async function showTagEditor(track) {
+  if (!pw()) { setStatus('pywebview required for tag editing'); return; }
+
+  // 1) Kalau file ini sedang dimuat di player (main / pause), stop dulu dan
+  //    lepas sumbernya supaya file tidak terkunci waktu editor menyimpan.
+  //    Kalau bukan track yang sedang dimuat, langsung kirim tanpa menyentuh player.
+  const cur = S.currentIndex >= 0 ? S.playlist[S.currentIndex] : null;
+  if (cur && cur.path === track.path) {
+    const p = activePlayer();
+    p.pause();
+    p.src = '';
+    onPlayState(false);
+    setStatus(`STOPPED — ${track.name}`);
+  }
+
+  // 2) Kirim file ke advanced_tag_editor
+  let res = null;
+  try {
+    res = await pywebview.api.open_tag_editor(track.path);
+  } catch (e) {
+    res = { ok: false, error: String(e) };
+  }
+
+  if (!res || !res.ok) {
+    // Editor tidak bisa dijalankan (mis. file/PySide6 tidak ada) -> pakai editor bawaan
+    setStatus(`ADVANCED TAG EDITOR UNAVAILABLE — ${(res && res.error) || 'UNKNOWN'}`);
+    showInlineTagEditor(track);
+    return;
+  }
+
+  setStatus(`TAG EDITOR — ${track.name}`);
+  _startTagEditorSync();
+}
+
+// Selama editor terbuka, cek berkala apakah ada tag yang disimpan, lalu
+// segarkan playlist. Berhenti sendiri begitu editor ditutup.
+function _startTagEditorSync() {
+  if (_tagSyncTimer) return;
+  _tagSyncTimer = setInterval(async () => {
+    let r = null;
+    try {
+      r = await pywebview.api.refresh_edited_tracks();
+    } catch (e) {
+      _stopTagEditorSync();
+      return;
+    }
+    if (!r) return;
+    if (r.updated && r.updated.length) _applyTagUpdates(r.updated);
+    if (!r.active) _stopTagEditorSync();
+  }, 2000);
+}
+
+function _stopTagEditorSync() {
+  if (_tagSyncTimer) { clearInterval(_tagSyncTimer); _tagSyncTimer = null; }
+}
+
+function _applyTagUpdates(list) {
+  let changed = 0;
+  for (const u of list) {
+    S.playlist.forEach((t, idx) => {
+      if (t.path !== u.path) return;
+      t.name   = u.name;
+      t.artist = u.artist;
+      t.album  = u.album;
+      if (u.duration) { t.duration = u.duration; t.duration_str = u.duration_str; }
+      t.file_size     = u.file_size;
+      t.replaygain_db = u.replaygain_db;
+      if (idx === S.currentIndex) updateTrackInfo(t);
+      changed++;
+    });
+  }
+  if (!changed) return;
+  _rebuildTotalDuration();
+  renderPlaylist();
+  updatePlaylistMeta();
+  setStatus(`TAGS UPDATED — ${list.length} FILE${list.length !== 1 ? 'S' : ''}`);
+}
+
+// Editor tag bawaan (modal di dalam player) — dipertahankan hanya sebagai
+// fallback kalau advanced_tag_editor tidak bisa dijalankan.
+async function showInlineTagEditor(track) {
   if (!pw()) { setStatus('pywebview required for tag editing'); return; }
 
   // Remove any existing tag editor
