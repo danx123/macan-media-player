@@ -3389,6 +3389,16 @@ function _onTrackStart(track) {
       track.artist || '',
       track.cover_art || null
     ).catch(() => {});
+
+    // Taskbar thumbnail (hover / minimize): gambar ulang kartu dengan lagu
+    // baru. Ini juga yang bikin thumbnail sinkron setelah klik Prev/Next di
+    // tombol thumbbar. Kalau art belum ada, kartu pakai placeholder dulu dan
+    // di-update lagi dari applyArt() begitu art ketemu.
+    pywebview.api.update_taskbar_track(
+      track.name || '',
+      track.artist || '',
+      track.cover_art || null
+    ).catch(() => {});
   }
 }
 
@@ -3700,6 +3710,16 @@ function applyArt(src) {
     artBlurBg.style.opacity = '0.38';
     // Dynamic Aura: extract dominant color from loaded art
     if (window.Settings) Settings.onArtLoaded(albumArt);
+    // Warna aksen (Dynamic Aura) -> latar kartu thumbnail taskbar. Dikasih jeda
+    // singkat karena ekstraksi warna bisa selesai sedikit setelah onArtLoaded.
+    if (pw()) {
+      setTimeout(() => {
+        try {
+          const c = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+          if (c) pywebview.api.update_taskbar_accent(c).catch(() => {});
+        } catch (_) {}
+      }, 250);
+    }
     // Bridge: art loaded
     window.MacanBridge?.emit('art:load', { src, track: S.playlist[S.currentIndex] || null });
   };
@@ -3741,6 +3761,8 @@ function applyArt(src) {
       // async fetch came back).
       if (pw() && S.playlist[S.currentIndex] === track) {
         pywebview.api.show_now_playing_bubble(track.name || '', track.artist || '', src).catch(() => {});
+        // Sama alasannya: kartu thumbnail taskbar baru dapat art sekarang.
+        pywebview.api.update_taskbar_track(track.name || '', track.artist || '', src).catch(() => {});
       }
     }
   }
