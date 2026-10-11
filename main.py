@@ -865,6 +865,13 @@ class MacanMediaAPI:
         # timing-sensitive (see macan_taskbar_thumbbar_webview.py).
         self._now_playing_bubble = NowPlayingBubble(app_name='Macan Media Player')
 
+        # ── Advanced Tag Editor (lazy): TIDAK di-import / di-spawn di sini.
+        #    Proses editor baru dibuat pertama kali open_tag_editor() dipanggil,
+        #    jadi startup player gak kena biaya apa pun dari editor.
+        self._tag_editor_lock = threading.Lock()
+        self._tag_editor_proc = None   # subprocess.Popen editor yang sedang hidup
+        self._tag_edit_watch  = {}     # abs_path -> mtime saat dikirim ke editor
+
     def set_window(self, window):
         self._window = window
 
@@ -899,6 +906,34 @@ class MacanMediaAPI:
         tb = getattr(self, '_taskbar_thumbbar', None)
         if tb is not None:
             tb.set_playing(bool(playing))
+
+    def update_taskbar_track(self, title: str = '', artist: str = '', artwork_data_url=None):
+        """Dipanggil dari JS (_onTrackStart / applyArt) setiap lagu ganti atau
+        artwork-nya baru ketemu, supaya thumbnail taskbar (hover / minimize)
+        digambar ulang dengan info lagu yang benar — termasuk setelah klik
+        Prev/Next dari tombol thumbbar. No-op kalau thumbbar gak aktif."""
+        tb = getattr(self, '_taskbar_thumbbar', None)
+        if tb is None:
+            return False
+        try:
+            tb.update_track(title or '', artist or '', artwork_data_url)
+            return True
+        except Exception as e:
+            print(f'[MACAN] update_taskbar_track error: {e}')
+            return False
+
+    def update_taskbar_accent(self, color: str = ''):
+        """Dipanggil dari JS setelah Dynamic Aura selesai ngitung warna cover,
+        biar latar kartu thumbnail taskbar ikut nuansa warna aksen."""
+        tb = getattr(self, '_taskbar_thumbbar', None)
+        if tb is None or not color:
+            return False
+        try:
+            tb.set_accent(color)
+            return True
+        except Exception as e:
+            print(f'[MACAN] update_taskbar_accent error: {e}')
+            return False
 
     def show_now_playing_bubble(self, title: str, artist: str = '', artwork_data_url=None):
         """Dipanggil dari JS (_onTrackStart) setiap kali lagu/video BARU mulai
@@ -1067,6 +1102,163 @@ class MacanMediaAPI:
         except Exception as e:
             print(f'[MACAN] open_tv_player error: {e}')
             return {'ok': False, 'error': str(e)}
+
+    # ─── ADVANCED TAG EDITOR (lazy, proses terpisah) ──────────────────────────
+
+    def open_tag_editor(self, path):
+        """Kirim satu file audio ke Advanced Tag Editor.
+
+        Editor jalan sebagai PROSES TERPISAH (sama alasannya dengan
+        open_tv_player: QApplication butuh main thread, sedangkan main thread
+        proses ini sudah dipakai message loop WebView2) dan baru di-spawn saat
+        fungsi ini pertama kali dipanggil -> gak ada import/init editor di
+        startup player.
+
+        - Editor belum jalan  -> spawn dengan `--file <path>`.
+        - Editor sudah jalan  -> file ditaruh di folder inbox; editor yang
+          sedang terbuka memungutnya sendiri (polling) lalu menampilkannya.
+
+        Caller (JS) bertanggung jawab melepas file dari player dulu kalau
+        file itu sedang dimuat. Return {'ok': bool, 'mode': 'launched'|'forwarded'}.
+        """
+        import time
+        try:
+            p = Path(path)
+            if not p.is_file():
+                return {'ok': False, 'error': 'File not found'}
+            abs_path = str(p.resolve())
+
+            base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            inbox    = os.path.join(self._get_app_data(), 'tag_editor_inbox')
+            os.makedirs(inbox, exist_ok=True)
+
+            with self._tag_editor_lock:
+                # Catat mtime sekarang -> refresh_edited_tracks() tahu kalau
+                # editor mengubah file ini.
+                try:
+                    self._tag_edit_watch[abs_path] = os.stat(abs_path).st_mtime
+                except OSError:
+                    self._tag_edit_watch[abs_path] = 0
+
+                proc  = self._tag_editor_proc
+                alive = proc is not None and proc.poll() is None
+
+                if alive:
+                    # Tulis ke .tmp dulu lalu rename, supaya editor gak pernah
+                    # membaca file yang setengah tertulis.
+                    name = f'{time.time_ns()}_{secrets.token_hex(4)}'
+                    tmp  = os.path.join(inbox, name + '.tmp')
+                    with open(tmp, 'w', encoding='utf-8') as f:
+                        f.write(abs_path)
+                    os.replace(tmp, os.path.join(inbox, name + '.txt'))
+                    return {'ok': True, 'mode': 'forwarded'}
+
+                # Bersihkan sisa inbox dari sesi sebelumnya
+                for n in os.listdir(inbox):
+                    try:
+                        os.remove(os.path.join(inbox, n))
+                    except OSError:
+                        pass
+
+                exe_name = 'advanced_tag_editor.exe' if sys.platform == 'win32' else 'advanced_tag_editor'
+                editor_exe = os.path.join(base_dir, exe_name)
+                script     = os.path.join(base_dir, 'advanced_tag_editor.py')
+
+                if os.path.exists(editor_exe):
+                    cmd = [editor_exe]
+                elif os.path.exists(script):
+                    cmd = [sys.executable, script]
+                else:
+                    self._tag_edit_watch.pop(abs_path, None)
+                    raise FileNotFoundError(
+                        f'advanced_tag_editor tidak ditemukan di {base_dir} '
+                        f'(cek: {editor_exe} / {script})'
+                    )
+                cmd += ['--file', abs_path, '--inbox', inbox]
+
+                kwargs = {}
+                if sys.platform == 'win32':
+                    kwargs['creationflags'] = (
+                        subprocess.CREATE_NEW_PROCESS_GROUP
+                        | getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+                    )
+                self._tag_editor_proc = subprocess.Popen(cmd, cwd=base_dir, **kwargs)
+            return {'ok': True, 'mode': 'launched'}
+        except Exception as e:
+            print(f'[MACAN] open_tag_editor error: {e}')
+            return {'ok': False, 'error': str(e)}
+
+    def refresh_edited_tracks(self):
+        """Dipanggil JS secara berkala selama editor terbuka.
+
+        Cek file yang pernah dikirim ke editor; kalau mtime-nya berubah (editor
+        menyimpan tag), baca ulang tag-nya ke playlist in-memory. Return:
+          {'updated': [{path, name, artist, album, duration, duration_str,
+                        file_size, replaygain_db}, ...],
+           'active':  bool}   # False = editor sudah ditutup, JS boleh berhenti polling
+        Sengaja hanya mengirim field kecil (tanpa cover_art base64)."""
+        import time
+        updated = []
+        try:
+            with self._tag_editor_lock:
+                proc   = self._tag_editor_proc
+                active = proc is not None and proc.poll() is None
+
+                for path, old_mtime in list(self._tag_edit_watch.items()):
+                    try:
+                        mt = os.stat(path).st_mtime
+                    except OSError:
+                        # File dihapus / di-rename dari editor -> stop memantau
+                        self._tag_edit_watch.pop(path, None)
+                        continue
+                    if mt == old_mtime:
+                        continue
+                    # Tunggu mtime "tenang" ~0.5s supaya gak baca file yang
+                    # masih ditulis (kecuali editor sudah tutup: cek final).
+                    if active and (time.time() - mt) < 0.5:
+                        continue
+                    self._tag_edit_watch[path] = mt
+                    info = self._reload_track_tags(path)
+                    if info:
+                        updated.append(info)
+
+                if not active:
+                    self._tag_edit_watch.clear()
+
+            if updated:
+                self._save_playlist()
+            return {'updated': updated, 'active': active}
+        except Exception as e:
+            print(f'[MACAN] refresh_edited_tracks error: {e}')
+            return {'updated': [], 'active': False}
+
+    def _reload_track_tags(self, path):
+        """Baca ulang tag/durasi file dari disk ke semua entri playlist dengan
+        path ini. cover_art sengaja TIDAK disentuh. Return dict ringkas / None."""
+        info = None
+        fresh = None
+        for track in self.playlist:
+            if track.get('path') != path:
+                continue
+            if fresh is None:
+                fresh = self._build_track_meta_fast(path)
+            track['name']   = fresh['name']
+            track['artist'] = fresh['artist']
+            track['album']  = fresh['album']
+            track['file_size']     = fresh['file_size']
+            track['replaygain_db'] = fresh['replaygain_db']
+            if fresh.get('duration'):          # jangan timpa durasi valid dengan 0
+                track['duration']     = fresh['duration']
+                track['duration_str'] = fresh['duration_str']
+            info = {
+                'path': path,
+                'name': track['name'], 'artist': track['artist'], 'album': track['album'],
+                'duration': track.get('duration', 0),
+                'duration_str': track.get('duration_str', ''),
+                'file_size': track.get('file_size', 0),
+                'replaygain_db': track.get('replaygain_db', 0.0),
+            }
+        return info
 
     # ─── DIALOG & FILE BROWSING ───────────────────────────────────────────────
 
