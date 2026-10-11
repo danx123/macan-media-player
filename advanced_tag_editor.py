@@ -1,5 +1,5 @@
 """
-Advanced Tag Editor — Enterprise Edition v4.5.0
+Advanced Tag Editor — Enterprise Edition v4.6.0
 © Macan Angkasa. All Rights Reserved.
 
 New in v4.1.1:
@@ -2745,11 +2745,11 @@ class AdvancedTagEditor(QMainWindow):
         html = """
         <div style="font-family: Arial, sans-serif; line-height: 1.6;">
             <h2 style="color: #2980b9;">Advanced Tag Editor</h2>
-            <b>Enterprise Edition v4.5.0</b>
+            <b>Enterprise Edition v4.6.0</b>
             <hr>
             <p>Professional-grade audio metadata management for archivists, engineers,
             and audiophiles.</p>
-            <p><b>v4.5.0 Enterprise Features:</b></p>
+            <p><b>v4.6.0 Enterprise Features:</b></p>
             <ul>
                 <li>Batch rename with template engine</li>
                 <li>Undo / Redo per-file history stack</li>
