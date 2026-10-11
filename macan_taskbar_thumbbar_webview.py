@@ -62,6 +62,31 @@ sebelum bikin `ITaskbarList3` — kalau ternyata sudah ter-inisialisasi duluan
 oleh WinForms, panggilan ini aman (COM cuma nambah refcount, gak nge-reset
 apa-apa), dan di-`CoUninitialize()` balik saat `shutdown()`.
 
+THUMBNAIL SINKRON (BARU — diadaptasi dari `macan_taskbar_thumbbar.py` versi Qt)
+--------------------------------------------------------------------------
+Keluhan sebelumnya: preview thumbnail taskbar GAK SINKRON saat di-hover /
+setelah klik Prev/Next. Penyebabnya: DWM cuma nampilin snapshot window
+(WebView2 dirender lewat DirectComposition, jadi snapshot-nya gampang basi /
+hitam, apalagi pas window minimize) — thumbnail gak tahu lagu sudah ganti.
+
+Solusi sama kayak versi Qt: artwork + judul + artis digambar SENDIRI
+(Iconic Thumbnail + Iconic Live Preview via DWM) dan DWM disuruh ambil ulang
+(`DwmInvalidateIconicBitmaps`) tiap kali info lagu berubah.
+
+Beda teknis dari versi Qt (karena gak ada Qt di process ini):
+  - Render pakai `System.Drawing` (GDI+) lewat pythonnet, bukan QPainter.
+    Kalau System.Drawing gagal ke-load, fitur thumbnail custom mati sendiri
+    dan tombol Prev/Play/Next tetap jalan.
+  - `IMessageFilter` WinForms CUMA lihat pesan yang di-POST ke message queue,
+    sedangkan pesan DWM (WM_DWMSENDICONICTHUMBNAIL / ..LIVEPREVIEWBITMAP) dan
+    WM_SIZE itu SENT -> gak pernah lewat filter. Makanya buat pesan-pesan itu
+    dipasang `SetWindowSubclass` (comctl32, cara subclass yang resmi & ngerantai
+    bener lewat DefSubclassProc) dari UI thread. Klik tombol thumbbar TETAP
+    lewat IMessageFilter seperti sebelumnya (gak diutak-atik).
+  - Kalau pesan DWM ternyata gak pernah nyampe (subclass gagal), modul ini
+    fallback ke mode PUSH: bitmap langsung didorong ke DWM tiap info lagu
+    berubah.
+
 Pemakaian (lihat integrasi lengkap di main.py):
     from macan_taskbar_thumbbar_webview import TaskbarThumbBar
 
@@ -76,6 +101,18 @@ Pemakaian (lihat integrasi lengkap di main.py):
     # tiap kali JS lapor balik status play/pause berubah:
     tb.set_playing(True)   # -> tombol tengah jadi ikon pause
 
+    # [BARU] tiap kali lagu / artwork berubah (WAJIB dipanggil dari JS lewat
+    # js_api, mis. di dalam fungsi yang dipanggil nextTrack()/prevTrack()/
+    # auto-next). artwork boleh: bytes, data-URI base64, path file, URL http(s),
+    # atau None:
+    tb.update_track(title, artist, artwork)
+    tb.set_accent("#0d6efd")       # opsional, ikut tema/aura
+
+    # opsional (kalau mau, buat jaga-jaga): sinkron state minimize dari event
+    # pywebview kalau subclass DWM gak aktif:
+    #   window.events.minimized += lambda: tb.notify_minimized(True)
+    #   window.events.restored  += lambda: tb.notify_minimized(False)
+
     # saat app mau ditutup:
     tb.shutdown()
 
@@ -83,7 +120,10 @@ Non-Windows -> otomatis no-op (aman dipanggil tanpa try/except di caller).
 """
 
 import sys
+import os
+import re
 import time
+import base64
 import threading
 
 IS_WINDOWS = sys.platform == "win32"
@@ -92,6 +132,21 @@ IS_WINDOWS = sys.platform == "win32"
 # tertentu, cukup ubah ini jadi False — seluruh fitur taskbar thumbbar mati
 # bersih tanpa perlu ubah kode integrasi di main.py.
 TASKBAR_THUMBBAR_ENABLED = True
+
+# Thumbnail CUSTOM (iconic thumbnail DWM): artwork + judul + artis digambar
+# sendiri supaya preview taskbar sinkron sama lagu yang lagi diputar, bukan
+# snapshot WebView2 yang suka basi. Kalau bermasalah, matikan di sini — tombol
+# Prev/Play/Next tetap jalan normal.
+THUMBNAIL_CUSTOM_ENABLED = True
+
+# False (default): thumbnail custom dipakai saat window di-minimize (sama
+# persis kayak versi Qt). True: dipakai TERUS, termasuk saat window tampil
+# normal — pilih ini kalau live thumbnail WebView2 saat hover masih kelihatan
+# basi/hitam. Efek samping: Alt+Tab / Aero Peek juga nampilin kartu custom.
+THUMBNAIL_ALWAYS_CUSTOM = False
+
+# True -> print log DWM (request thumbnail, invalidate, HRESULT) buat debug.
+THUMBNAIL_DEBUG = False
 
 
 class _Signal:
@@ -127,6 +182,30 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
     clr.AddReference("System.Windows.Forms")
     from System.Windows.Forms import Application, IMessageFilter, MethodInvoker
 
+    # System.Drawing (GDI+) buat render kartu thumbnail. Sudah ke-load oleh
+    # pywebview winforms backend, tapi tetap dibungkus try/except: kalau gagal,
+    # cuma thumbnail custom yang mati, tombol thumbbar gak ikut kena.
+    try:
+        clr.AddReference("System.Drawing")
+        from System import Convert
+        from System.IO import MemoryStream
+        from System.Drawing import (
+            Bitmap, Graphics, Color, Rectangle, RectangleF, PointF, Font,
+            FontStyle, GraphicsUnit, SolidBrush, StringFormat, StringAlignment,
+            StringTrimming, StringFormatFlags, Image,
+        )
+        from System.Drawing.Drawing2D import (
+            LinearGradientBrush, GraphicsPath, SmoothingMode,
+            InterpolationMode, PixelOffsetMode,
+        )
+        from System.Drawing.Imaging import PixelFormat, ImageLockMode
+        from System.Drawing.Text import TextRenderingHint
+        _DRAWING_OK = True
+    except Exception as _draw_err:
+        _DRAWING_OK = False
+        print(f"[TaskbarThumbBar] System.Drawing gagal dimuat, thumbnail custom "
+              f"dimatikan: {_draw_err}")
+
     ole32 = ctypes.windll.ole32
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
@@ -147,6 +226,24 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
 
     THBF_ENABLED = 0x0
     THBF_DISABLED = 0x1
+
+    # ── DWM iconic thumbnail (thumbnail saat window minimize / preview custom) ──
+    WM_SIZE = 0x0005
+    WM_NCDESTROY = 0x0082
+    SIZE_MINIMIZED = 1
+    WM_DWMSENDICONICTHUMBNAIL = 0x0323
+    WM_DWMSENDICONICLIVEPREVIEWBITMAP = 0x0326
+    DWMWA_FORCE_ICONIC_REPRESENTATION = 7
+    DWMWA_HAS_ICONIC_BITMAP = 10
+    _SUBCLASS_ID = 0x4D4143  # "MAC"
+    _WATCHED_MSGS = frozenset((
+        WM_SIZE, WM_NCDESTROY,
+        WM_DWMSENDICONICTHUMBNAIL, WM_DWMSENDICONICLIVEPREVIEWBITMAP,
+    ))
+    # Callback ctypes yang sudah dipasang sebagai subclass TIDAK BOLEH di-GC
+    # selama window hidup (crash kalau Windows manggil pointer yang sudah
+    # bebas) — makanya disimpan di list modul-level, gak pernah dikosongkan.
+    _KEEPALIVE = []
 
     # ID 200/201/202 (versi lama) ada di range kecil yang lazim dipakai
     # buat control/command ID internal Win32/WinForms umum, jadi dinaikin
@@ -220,6 +317,75 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
             ("bV5ProfileSize", wintypes.DWORD),
             ("bV5Reserved", wintypes.DWORD),
         ]
+
+    # ── API Win32 bertipe (WinDLL PRIVAT, bukan ctypes.windll) ──────────────
+    # Instance privat biar argtypes/restype yang di-set di sini gak nabrak
+    # modul lain di proses yang sama (pola yang sama kayak versi Qt). Tanpa
+    # argtypes, HWND/HBITMAP 64-bit bisa kepotong jadi c_int.
+    _u32 = ctypes.WinDLL("user32", use_last_error=True)
+    _g32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+    comctl32 = ctypes.WinDLL("comctl32", use_last_error=True)
+
+    _u32.GetDC.argtypes = [wintypes.HWND]
+    _u32.GetDC.restype = wintypes.HDC
+    _u32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    _u32.ReleaseDC.restype = ctypes.c_int
+    _u32.CreateIconIndirect.argtypes = [ctypes.POINTER(ICONINFO)]
+    _u32.CreateIconIndirect.restype = wintypes.HICON
+    _u32.DestroyIcon.argtypes = [wintypes.HICON]
+    _u32.DestroyIcon.restype = wintypes.BOOL
+    _u32.IsIconic.argtypes = [wintypes.HWND]
+    _u32.IsIconic.restype = wintypes.BOOL
+    _u32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    _u32.GetClientRect.restype = wintypes.BOOL
+
+    _g32.CreateDIBSection.argtypes = [
+        wintypes.HDC, ctypes.c_void_p, wintypes.UINT,
+        ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD,
+    ]
+    _g32.CreateDIBSection.restype = wintypes.HBITMAP
+    _g32.CreateBitmap.argtypes = [
+        ctypes.c_int, ctypes.c_int, wintypes.UINT, wintypes.UINT, ctypes.c_void_p,
+    ]
+    _g32.CreateBitmap.restype = wintypes.HBITMAP
+    _g32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    _g32.DeleteObject.restype = wintypes.BOOL
+
+    dwmapi.DwmSetWindowAttribute.argtypes = [
+        wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+    dwmapi.DwmSetIconicThumbnail.argtypes = [
+        wintypes.HWND, wintypes.HBITMAP, wintypes.DWORD,
+    ]
+    dwmapi.DwmSetIconicThumbnail.restype = ctypes.c_long
+    dwmapi.DwmSetIconicLivePreviewBitmap.argtypes = [
+        wintypes.HWND, wintypes.HBITMAP, ctypes.POINTER(wintypes.POINT), wintypes.DWORD,
+    ]
+    dwmapi.DwmSetIconicLivePreviewBitmap.restype = ctypes.c_long
+    dwmapi.DwmInvalidateIconicBitmaps.argtypes = [wintypes.HWND]
+    dwmapi.DwmInvalidateIconicBitmaps.restype = ctypes.c_long
+
+    # Subclass resmi comctl32 (SetWindowSubclass) — beda dari SetWindowLongPtrW
+    # yang dulu gak reliable: callback-nya dirantai lewat DefSubclassProc dan
+    # WAJIB dipasang/dilepas dari thread yang bikin window (UI thread).
+    _SUBCLASSPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+        wintypes.LPARAM, ctypes.c_size_t, ctypes.c_size_t,
+    )
+    comctl32.SetWindowSubclass.argtypes = [
+        wintypes.HWND, _SUBCLASSPROC, ctypes.c_size_t, ctypes.c_size_t,
+    ]
+    comctl32.SetWindowSubclass.restype = wintypes.BOOL
+    comctl32.RemoveWindowSubclass.argtypes = [
+        wintypes.HWND, _SUBCLASSPROC, ctypes.c_size_t,
+    ]
+    comctl32.RemoveWindowSubclass.restype = wintypes.BOOL
+    comctl32.DefSubclassProc.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    comctl32.DefSubclassProc.restype = ctypes.c_ssize_t
 
     # ── IMessageFilter WinForms: pengganti window-subclassing ctypes ─────────
     class _ThumbBarMessageFilter(IMessageFilter):
@@ -356,11 +522,12 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
 
         return bytes(buf)
 
-    def _rgba_bgra_to_hicon(bgra_bytes: bytes, size: int):
-        """Convert buffer BGRA top-down (dari _draw_icon_rgba) -> Win32 HICON
-        32-bit alpha lewat GDI DIB section. Analog sama _qimage_to_hicon di
-        versi Qt, tapi sumbernya raw bytes, bukan QImage."""
-        w = h = size
+    def _bgra_to_hbitmap(bgra_bytes, w, h):
+        """Buffer BGRA premultiplied top-down -> HBITMAP 32-bit ARGB (DIB
+        section). Caller WAJIB gdi32.DeleteObject() hasilnya. Analog
+        `_qimage_to_hbitmap` di versi Qt."""
+        if w <= 0 or h <= 0 or len(bgra_bytes) < w * h * 4:
+            return None
         bmi = BITMAPV5HEADER()
         ctypes.memset(ctypes.byref(bmi), 0, ctypes.sizeof(bmi))
         bmi.bV5Size = ctypes.sizeof(BITMAPV5HEADER)
@@ -374,18 +541,25 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
         bmi.bV5BlueMask = 0x000000FF
         bmi.bV5AlphaMask = 0xFF000000
 
-        hdc = user32.GetDC(None)
+        hdc = _u32.GetDC(None)
         ppv_bits = ctypes.c_void_p()
-        hbm_color = gdi32.CreateDIBSection(
+        hbm = _g32.CreateDIBSection(
             hdc, ctypes.byref(bmi), 0, ctypes.byref(ppv_bits), None, 0
         )
-        user32.ReleaseDC(None, hdc)
-        if not hbm_color or not ppv_bits.value:
+        _u32.ReleaseDC(None, hdc)
+        if not hbm or not ppv_bits.value:
             return None
+        ctypes.memmove(ppv_bits.value, bgra_bytes, w * h * 4)
+        return hbm
 
-        ctypes.memmove(ppv_bits, bgra_bytes, w * h * 4)
-
-        hbm_mask = gdi32.CreateBitmap(w, h, 1, 1, None)
+    def _rgba_bgra_to_hicon(bgra_bytes: bytes, size: int):
+        """Convert buffer BGRA top-down (dari _draw_icon_rgba) -> Win32 HICON
+        32-bit alpha lewat GDI DIB section. Analog sama _qimage_to_hicon di
+        versi Qt, tapi sumbernya raw bytes, bukan QImage."""
+        hbm_color = _bgra_to_hbitmap(bgra_bytes, size, size)
+        if not hbm_color:
+            return None
+        hbm_mask = _g32.CreateBitmap(size, size, 1, 1, None)
 
         icon_info = ICONINFO()
         icon_info.fIcon = True
@@ -394,10 +568,11 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
         icon_info.hbmMask = hbm_mask
         icon_info.hbmColor = hbm_color
 
-        hicon = user32.CreateIconIndirect(ctypes.byref(icon_info))
+        hicon = _u32.CreateIconIndirect(ctypes.byref(icon_info))
 
-        gdi32.DeleteObject(hbm_color)
-        gdi32.DeleteObject(hbm_mask)
+        _g32.DeleteObject(hbm_color)
+        if hbm_mask:
+            _g32.DeleteObject(hbm_mask)
 
         return hicon if hicon else None
 
@@ -409,6 +584,118 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
             time.sleep(delay)
         return 0
 
+    def _dbg(msg):
+        if THUMBNAIL_DEBUG:
+            print(f"[TaskbarThumbBar][dbg] {msg}")
+
+    def _parse_color(value, default=(13, 110, 253)):
+        """'#RRGGBB' / '#RGB' / '#RRGGBBAA' / 'rgb(r,g,b)' / (r,g,b) -> (r,g,b)."""
+        try:
+            if value is None:
+                return default
+            if isinstance(value, (tuple, list)) and len(value) >= 3:
+                return tuple(max(0, min(255, int(v))) for v in value[:3])
+            s = str(value).strip().lower()
+            if s.startswith("#"):
+                s = s[1:]
+                if len(s) == 3:
+                    s = "".join(c * 2 for c in s)
+                if len(s) in (6, 8):
+                    return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+            elif s.startswith("rgb"):
+                nums = re.findall(r"[\d.]+", s)[:3]
+                if len(nums) == 3:
+                    return tuple(max(0, min(255, int(float(n)))) for n in nums)
+        except Exception:
+            pass
+        return default
+
+    def _resolve_artwork_source(artwork):
+        """artwork -> ("bytes", data) | ("url", str) | None.
+        Terima: bytes/bytearray, data-URI, path file / file:// URI, URL http(s)."""
+        if artwork is None:
+            return None
+        try:
+            if isinstance(artwork, (bytes, bytearray, memoryview)):
+                b = bytes(artwork)
+                return ("bytes", b) if b else None
+            if isinstance(artwork, str):
+                s = artwork.strip()
+                if not s:
+                    return None
+                if s.startswith("data:"):
+                    head, _, payload = s.partition(",")
+                    if ";base64" in head.lower():
+                        payload = payload.strip()
+                        payload += "=" * (-len(payload) % 4)
+                        return ("bytes", base64.b64decode(payload))
+                    from urllib.parse import unquote_to_bytes
+                    return ("bytes", unquote_to_bytes(payload))
+                if s.lower().startswith(("http://", "https://")):
+                    return ("url", s)
+                path = s
+                if s.lower().startswith("file:"):
+                    from urllib.parse import urlparse
+                    from urllib.request import url2pathname
+                    path = url2pathname(urlparse(s).path)
+                if os.path.isfile(path):
+                    with open(path, "rb") as f:
+                        return ("bytes", f.read())
+        except Exception as e:
+            print(f"[TaskbarThumbBar] Gagal baca artwork: {e}")
+        return None
+
+    def _bytes_to_art_bitmap(data, max_side):
+        """Bytes gambar -> System.Drawing.Bitmap (32bppPArgb, di-downscale ke
+        max_side) atau None. Dipakai buat nyimpen cover tanpa nyimpen file
+        3000x3000 apa adanya. Stream sumber dilepas SEBELUM return (GDI+
+        butuh stream hidup selama Image-nya hidup, makanya di-copy ke Bitmap
+        baru)."""
+        if not _DRAWING_OK or not data:
+            return None
+        ms = None
+        src = None
+        try:
+            ms = MemoryStream(Convert.FromBase64String(base64.b64encode(data).decode("ascii")))
+            src = Image.FromStream(ms)
+            sw, sh = int(src.Width), int(src.Height)
+            if sw <= 0 or sh <= 0:
+                return None
+            scale = min(1.0, float(max_side) / max(sw, sh))
+            nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
+            dst = Bitmap(nw, nh, PixelFormat.Format32bppPArgb)
+            g = Graphics.FromImage(dst)
+            try:
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality
+                g.DrawImage(src, Rectangle(0, 0, nw, nh))
+            finally:
+                g.Dispose()
+            return dst
+        except Exception as e:
+            print(f"[TaskbarThumbBar] Gagal decode artwork: {e}")
+            return None
+        finally:
+            try:
+                if src is not None:
+                    src.Dispose()
+                if ms is not None:
+                    ms.Dispose()
+            except Exception:
+                pass
+
+    def _round_rect_path(x, y, w, h, r):
+        p = GraphicsPath()
+        r = max(0.5, min(float(r), w / 2.0, h / 2.0))
+        d = r * 2.0
+        x, y, w, h = float(x), float(y), float(w), float(h)
+        p.AddArc(x, y, d, d, 180.0, 90.0)
+        p.AddArc(x + w - d, y, d, d, 270.0, 90.0)
+        p.AddArc(x + w - d, y + h - d, d, d, 0.0, 90.0)
+        p.AddArc(x, y + h - d, d, d, 90.0, 90.0)
+        p.CloseFigure()
+        return p
+
     class TaskbarThumbBar:
         """
         Tombol Previous / Play-Pause / Next di preview thumbnail taskbar
@@ -419,6 +706,13 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
         pemanggil; kalau ada apapun yang gagal (COM, window subclassing,
         dst), fitur ini fail-safe mati sendiri.
         """
+
+        # Batas sisi artwork yang disimpan di memori (cukup buat thumbnail
+        # & peek; menghindari nyimpen cover 3000x3000 apa adanya).
+        _ART_CACHE_MAX = 512
+        # Jeda koalesensi invalidate (detik): embedded art + online art /
+        # prev-next beruntun cukup memicu 1x refresh.
+        _INVALIDATE_DELAY = 0.06
 
         def __init__(self, window=None, window_title=None, icon_size=24, icon_rgb=(255, 255, 255)):
             """
@@ -447,6 +741,29 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
             self._com_initialized = False
             self._message_filter = None  # simpan referensi biar gak di-GC
             self._click_in_flight = False  # guard: cegah evaluate_js overlap
+            self._prev_enabled = True
+            self._next_enabled = True
+
+            # State thumbnail custom
+            self._title = ""
+            self._artist = ""
+            self._art_bmp = None            # System.Drawing.Bitmap (sudah di-downscale) / None
+            self._art_key = None            # kunci artwork terakhir (skip decode ulang)
+            self._art_token = 0             # naik tiap update_track (buang fetch URL basi)
+            self._accent = (13, 110, 253)
+            self._state_ver = 0             # naik tiap state visual berubah (kunci cache frame)
+            self._frame_cache = {}          # kind -> (ver, w, h, bgra_bytes)
+            self._render_lock = threading.RLock()
+            self._timer_lock = threading.Lock()
+            self._invalidate_timer = None
+            self._iconic_ready = False      # DWMWA_HAS_ICONIC_BITMAP sudah aktif
+            self._forced_iconic = False
+            self._dwm_msg_seen = False      # pernah nerima pesan DWM? (subclass hidup)
+            self._push_fail_streak = 0
+            self._last_max = None           # (w, h) maksimum thumbnail dari DWM
+            self._last_client = None        # ukuran client terakhir saat gak minimize
+            self._subclass_cb = None
+            self._closing = False
 
         # ── Public API ────────────────────────────────────────────────────
         def init_buttons(self):
@@ -493,6 +810,84 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
                 print(f"[TaskbarThumbBar] Gagal init tombol taskbar, fitur dimatikan: {e}")
                 self._enabled = False
                 self._release_taskbar_list()
+                return
+
+            # Thumbnail custom dipisah try/except-nya: kalau ini gagal, tombol
+            # thumbbar di atas tetap harus jalan.
+            try:
+                self._enable_iconic_thumbnail()
+            except Exception as e:
+                print(f"[TaskbarThumbBar] Gagal aktifkan custom thumbnail: {e}")
+                self._iconic_ready = False
+
+        def update_track(self, title: str = "", artist: str = "", artwork=None):
+            """[BARU] Beritahu thumbbar bahwa lagu/artwork berubah. Panggil dari
+            JS (lewat js_api) tiap lagu ganti — termasuk auto-next dan hasil
+            klik Prev/Next dari tombol thumbbar — serta saat artwork online
+            ketemu. artwork: bytes | data-URI | path file | URL http(s) | None.
+            Aman dipanggil dari thread manapun & sebelum window tampil."""
+            new_bmp = None
+            key = None
+            keep_art = False
+            fetch_url = None
+            if self._enabled and _DRAWING_OK and artwork is not None:
+                src = _resolve_artwork_source(artwork)
+                if src is not None:
+                    kind, val = src
+                    key = ("b", len(val), hash(val)) if kind == "bytes" else ("u", val)
+                    if key == self._art_key and self._art_bmp is not None:
+                        keep_art = True   # cover sama (album sama) -> skip decode
+                    elif kind == "bytes":
+                        new_bmp = _bytes_to_art_bitmap(val, self._ART_CACHE_MAX)
+                        if new_bmp is None:
+                            key = None
+                    else:
+                        fetch_url = val
+            with self._render_lock:
+                self._title = title or ""
+                self._artist = artist or ""
+                if not keep_art:
+                    self._swap_art_locked(new_bmp, key)
+                self._state_ver += 1
+                self._art_token += 1
+                token = self._art_token
+            _dbg(f"update_track: {artist} - {title} | art={'ya' if (keep_art or new_bmp is not None) else ('url' if fetch_url else 'tidak')}")
+            if fetch_url:
+                self._fetch_art_async(fetch_url, token)
+            self.refresh_thumbnail()
+
+        def set_accent(self, color):
+            """[BARU] Warna aksen (tema / Dynamic Aura) buat latar & teks artis."""
+            rgb = _parse_color(color)
+            with self._render_lock:
+                if rgb == self._accent:
+                    return
+                self._accent = rgb
+                self._state_ver += 1
+            self.refresh_thumbnail()
+
+        def refresh_thumbnail(self, delay=None):
+            """[BARU] Minta DWM ambil ulang thumbnail/peek (dikoalesensi: panggilan
+            beruntun dalam `delay` detik cuma memicu 1x refresh)."""
+            if self._closing or not self._enabled or not self._iconic_ready:
+                return
+            d = self._INVALIDATE_DELAY if delay is None else float(delay)
+            with self._timer_lock:
+                if self._invalidate_timer is not None:
+                    self._invalidate_timer.cancel()
+                t = threading.Timer(d, self._do_invalidate)
+                t.daemon = True
+                self._invalidate_timer = t
+                t.start()
+
+        def notify_minimized(self, minimized: bool):
+            """[BARU] Opsional: kasih tahu manual kalau window minimize/restore
+            (mis. dari `window.events.minimized/restored` pywebview) — cadangan
+            kalau subclass WM_SIZE gak aktif."""
+            try:
+                self._on_window_size_changed(bool(minimized))
+            except Exception as e:
+                print(f"[TaskbarThumbBar] notify_minimized gagal: {e}")
 
         def set_playing(self, is_playing: bool):
             if not self._enabled or not self._buttons_added:
@@ -501,24 +896,33 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
             if self._is_playing == is_playing:
                 return
             self._is_playing = is_playing
-            try:
-                self._update_buttons()
-            except Exception as e:
-                print(f"[TaskbarThumbBar] Gagal update tombol play/pause: {e}")
-                self._enabled = False
+            # Dipanggil dari thread js_api -> update COM ITaskbarList3 harus
+            # balik ke UI/STA thread tempat object-nya dibikin.
+            self._ui_async(self._safe_update_buttons)
 
         def set_enabled_buttons(self, has_prev: bool = True, has_next: bool = True):
             if not self._enabled or not self._buttons_added:
                 return
-            try:
-                self._update_buttons(prev_enabled=has_prev, next_enabled=has_next)
-            except Exception as e:
-                print(f"[TaskbarThumbBar] Gagal update enable/disable tombol: {e}")
-                self._enabled = False
+            self._prev_enabled = bool(has_prev)
+            self._next_enabled = bool(has_next)
+            self._ui_async(self._safe_update_buttons)
 
         def shutdown(self):
             if not IS_WINDOWS:
                 return
+            self._closing = True
+            self._iconic_ready = False
+            try:
+                with self._timer_lock:
+                    if self._invalidate_timer is not None:
+                        self._invalidate_timer.cancel()
+                        self._invalidate_timer = None
+            except Exception:
+                pass
+            try:
+                self._remove_subclass()
+            except Exception:
+                pass
             try:
                 self._restore_message_filter()
             except Exception:
@@ -531,6 +935,20 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
                 if self._com_initialized:
                     ole32.CoUninitialize()
                     self._com_initialized = False
+            except Exception:
+                pass
+            # Bebaskan HICON tombol & bitmap artwork
+            try:
+                for hicon in self._icons.values():
+                    if hicon:
+                        _u32.DestroyIcon(hicon)
+                self._icons.clear()
+            except Exception:
+                pass
+            try:
+                with self._render_lock:
+                    self._swap_art_locked(None, None)
+                    self._frame_cache.clear()
             except Exception:
                 pass
 
@@ -586,7 +1004,13 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
                 self._taskbar_list = None
             self._buttons_added = False
 
-        def _make_buttons_array(self, prev_enabled=True, next_enabled=True):
+        def _make_buttons_array(self, prev_enabled=None, next_enabled=None):
+            # None -> pakai state terakhir (sebelumnya set_playing() ikut
+            # ngereset prev/next jadi enabled lagi).
+            if prev_enabled is None:
+                prev_enabled = self._prev_enabled
+            if next_enabled is None:
+                next_enabled = self._next_enabled
             buttons = (THUMBBUTTON * 3)()
             specs = [
                 (BTN_ID_PREV, self._icons.get("prev"), "Previous", prev_enabled),
@@ -619,7 +1043,7 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
             hr = add_fn(self._taskbar_list, self._hwnd, 3, buttons)
             self._buttons_added = (hr == S_OK)
 
-        def _update_buttons(self, prev_enabled=True, next_enabled=True):
+        def _update_buttons(self, prev_enabled=None, next_enabled=None):
             if not self._taskbar_list or not self._buttons_added or not self._hwnd:
                 return
             buttons = self._make_buttons_array(prev_enabled, next_enabled)
@@ -638,6 +1062,478 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
             except Exception as e:
                 print(f"[TaskbarThumbBar] Gagal re-init setelah explorer restart: {e}")
                 self._enabled = False
+                return
+            try:
+                if self._iconic_ready:
+                    self._set_iconic_attribute()
+            except Exception as e:
+                print(f"[TaskbarThumbBar] Gagal re-aktifkan custom thumbnail: {e}")
+
+        # ── Internal: helper thread UI ────────────────────────────────────
+        def _native(self):
+            return getattr(self._window, "native", None) if self._window is not None else None
+
+        def _ui_async(self, fn):
+            """Jalankan fn di UI thread tanpa nunggu (BeginInvoke). Aman buat
+            COM ITaskbarList3 karena object-nya STA & dibikin di UI thread.
+            JANGAN dipakai buat apapun yang manggil evaluate_js."""
+            native = self._native()
+            if native is not None:
+                try:
+                    if getattr(native, "InvokeRequired", False):
+                        native.BeginInvoke(MethodInvoker(fn))
+                        return
+                except Exception as e:
+                    print(f"[TaskbarThumbBar] BeginInvoke gagal, jalan langsung: {e}")
+            fn()
+
+        def _run_on_ui_sync(self, fn):
+            """Jalankan fn di UI thread dan TUNGGU selesai (Invoke); exception
+            dari fn diteruskan ke pemanggil."""
+            native = self._native()
+            if native is not None and getattr(native, "InvokeRequired", False):
+                err = []
+
+                def _w():
+                    try:
+                        fn()
+                    except Exception as e:
+                        err.append(e)
+
+                native.Invoke(MethodInvoker(_w))
+                if err:
+                    raise err[0]
+            else:
+                fn()
+
+        def _safe_update_buttons(self):
+            try:
+                self._update_buttons()
+            except Exception as e:
+                print(f"[TaskbarThumbBar] Gagal update tombol: {e}")
+
+        # ── Internal: custom iconic thumbnail ─────────────────────────────
+        def _enable_iconic_thumbnail(self):
+            if not (THUMBNAIL_CUSTOM_ENABLED and _DRAWING_OK):
+                return
+            self._set_iconic_attribute()
+            if not self._iconic_ready:
+                return
+            try:
+                self._install_subclass()
+            except Exception as e:
+                # Gak fatal: tanpa subclass modul ini fallback ke mode PUSH
+                # (bitmap didorong ke DWM tiap lagu berubah).
+                print(f"[TaskbarThumbBar] Gagal pasang subclass DWM, fallback ke mode push: {e}")
+
+        def _set_iconic_attribute(self):
+            """Aktifkan DWMWA_HAS_ICONIC_BITMAP: saat minimize DWM minta bitmap
+            ke kita; saat window tampil normal, live thumbnail biasa tetap
+            dipakai (kecuali THUMBNAIL_ALWAYS_CUSTOM)."""
+            hwnd = self._hwnd
+            if not hwnd:
+                return
+            val = ctypes.c_int(1)
+            hr = dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_HAS_ICONIC_BITMAP, ctypes.byref(val), ctypes.sizeof(val))
+            self._iconic_ready = (hr == S_OK)
+            _dbg(f"iconic enable: hwnd={hwnd} hr=0x{hr & 0xFFFFFFFF:08X} ready={self._iconic_ready}")
+            if self._iconic_ready:
+                self._sync_iconic_state()
+                # Segera sinkronkan dgn lagu yang sudah ter-set sebelum window tampil
+                self.refresh_thumbnail(delay=0.05)
+
+        def _install_subclass(self):
+            if self._subclass_cb is not None:
+                return
+            hwnd = self._hwnd
+            owner = self
+            holder = [None]
+
+            def _proc(h, msg, wparam, lparam, uid, ref):
+                # Jalur panas: dipanggil buat SETIAP pesan window -> cek paling
+                # murah dulu, sisanya langsung diteruskan.
+                if msg in _WATCHED_MSGS:
+                    try:
+                        if msg == WM_NCDESTROY:
+                            comctl32.RemoveWindowSubclass(h, holder[0], _SUBCLASS_ID)
+                        elif not owner._closing:
+                            r = owner._on_subclass_message(h, msg, wparam, lparam)
+                            if r is not None:
+                                return r
+                    except Exception as e:
+                        print(f"[TaskbarThumbBar] Error di subclass proc: {e}")
+                return comctl32.DefSubclassProc(h, msg, wparam, lparam)
+
+            cb = _SUBCLASSPROC(_proc)
+            holder[0] = cb
+
+            def _do():
+                if not comctl32.SetWindowSubclass(hwnd, cb, _SUBCLASS_ID, 0):
+                    raise OSError("SetWindowSubclass gagal")
+
+            # Wajib dari thread pembuat window (UI thread).
+            self._run_on_ui_sync(_do)
+            self._subclass_cb = cb
+            _KEEPALIVE.append(cb)
+            _dbg(f"subclass DWM terpasang di hwnd={hwnd}")
+
+        def _remove_subclass(self):
+            cb = self._subclass_cb
+            if cb is None:
+                return
+            hwnd = self._hwnd
+
+            def _do():
+                try:
+                    comctl32.RemoveWindowSubclass(hwnd, cb, _SUBCLASS_ID)
+                except Exception:
+                    pass
+
+            # Async: aman dari deadlock saat shutdown. `cb` tetap di _KEEPALIVE
+            # (gak pernah di-GC), dan flag _closing bikin proc cuma pass-through.
+            self._ui_async(_do)
+
+        def _on_subclass_message(self, hwnd, msg, wparam, lparam):
+            """Dipanggil dari subclass proc (UI thread). Return None = terusin
+            ke DefSubclassProc; return angka = pesan sudah ditangani."""
+            if hwnd != self._hwnd:
+                return None
+            if msg == WM_SIZE:
+                minimized = (wparam == SIZE_MINIMIZED)
+                if not minimized:
+                    lp = lparam & 0xFFFFFFFF
+                    cw, ch = lp & 0xFFFF, (lp >> 16) & 0xFFFF
+                    if cw > 0 and ch > 0:
+                        self._last_client = (cw, ch)
+                self._on_window_size_changed(minimized)
+                return None
+            if msg == WM_DWMSENDICONICTHUMBNAIL:
+                # lParam: HIWORD = max width, LOWORD = max height
+                lp = lparam & 0xFFFFFFFF
+                self._on_iconic_thumbnail_requested((lp >> 16) & 0xFFFF, lp & 0xFFFF)
+                return 0
+            if msg == WM_DWMSENDICONICLIVEPREVIEWBITMAP:
+                self._on_iconic_preview_requested()
+                return 0
+            return None
+
+        def _sync_iconic_state(self):
+            """Samakan flag force-iconic dgn kondisi window sekarang (jaga-jaga
+            kalau WM_SIZE gak pernah nyampe)."""
+            try:
+                self._on_window_size_changed(bool(_u32.IsIconic(self._hwnd)))
+            except Exception:
+                pass
+
+        def _on_window_size_changed(self, minimized: bool):
+            """Saat minimize, paksa DWM pakai representasi iconic (bitmap dari
+            kita); saat restore, kembalikan ke live thumbnail biasa (kecuali
+            THUMBNAIL_ALWAYS_CUSTOM)."""
+            if not (self._enabled and self._iconic_ready):
+                return
+            want = True if THUMBNAIL_ALWAYS_CUSTOM else bool(minimized)
+            if want == self._forced_iconic:
+                return
+            self._forced_iconic = want
+            hwnd = self._hwnd
+            val = ctypes.c_int(1 if want else 0)
+            hr = dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_FORCE_ICONIC_REPRESENTATION,
+                ctypes.byref(val), ctypes.sizeof(val))
+            _dbg(f"force-iconic={want} (minimized={minimized}) hr=0x{hr & 0xFFFFFFFF:08X}")
+            if want:
+                dwmapi.DwmInvalidateIconicBitmaps(hwnd)
+
+        def _do_invalidate(self):
+            """Jalan di thread Timer (hasil koalesensi refresh_thumbnail)."""
+            if self._closing or not (self._enabled and self._iconic_ready):
+                return
+            try:
+                hwnd = self._hwnd
+                self._sync_iconic_state()
+                hr = dwmapi.DwmInvalidateIconicBitmaps(hwnd)
+                _dbg(f"invalidate hr=0x{hr & 0xFFFFFFFF:08X} msg_seen={self._dwm_msg_seen}")
+                if not self._dwm_msg_seen:
+                    # Belum pernah ada pesan DWM yang nyampe -> kemungkinan
+                    # subclass gak aktif. Dorong bitmap langsung ke DWM.
+                    self._push_bitmaps()
+            except Exception as e:
+                print(f"[TaskbarThumbBar] Gagal invalidate thumbnail: {e}")
+
+        def _push_bitmaps(self):
+            """Mode PUSH (fallback): kirim thumbnail + peek ke DWM tanpa nunggu
+            diminta. Ukuran maksimum thumbnail belum diketahui -> coba dari
+            besar ke kecil sampai DWM nerima."""
+            if self._push_fail_streak >= 3:
+                return
+            boxes = [self._last_max] if self._last_max else [
+                (480, 480), (360, 360), (300, 300), (240, 240), (200, 200), (160, 160)]
+            ok = False
+            for mw, mh in boxes:
+                hr = self._set_iconic_thumbnail(mw, mh)
+                _dbg(f"push thumbnail box={mw}x{mh} hr=0x{hr & 0xFFFFFFFF:08X}")
+                if hr == S_OK:
+                    ok = True
+                    break
+            hr2 = self._set_iconic_preview()
+            _dbg(f"push preview hr=0x{hr2 & 0xFFFFFFFF:08X}")
+            self._push_fail_streak = 0 if ok else self._push_fail_streak + 1
+
+        def _on_iconic_thumbnail_requested(self, max_w: int, max_h: int):
+            """DWM minta bitmap thumbnail (hover taskbar)."""
+            self._dwm_msg_seen = True
+            _dbg(f"DWM minta thumbnail {max_w}x{max_h} | {self._artist} - {self._title}")
+            if max_w <= 0 or max_h <= 0:
+                return
+            self._last_max = (max_w, max_h)
+            hr = self._set_iconic_thumbnail(max_w, max_h)
+            _dbg(f"set thumbnail hr=0x{hr & 0xFFFFFFFF:08X}")
+
+        def _on_iconic_preview_requested(self):
+            """DWM minta bitmap peek (hover thumbnail -> preview besar)."""
+            self._dwm_msg_seen = True
+            hr = self._set_iconic_preview()
+            _dbg(f"set preview hr=0x{hr & 0xFFFFFFFF:08X}")
+
+        def _set_iconic_thumbnail(self, max_w, max_h):
+            ww, wh = self._window_size()
+            scale = min(max_w / ww, max_h / wh)
+            w, h = max(1, int(ww * scale)), max(1, int(wh * scale))
+            data = self._get_frame("thumb", w, h)
+            if not data:
+                return -1
+            hbm = _bgra_to_hbitmap(data, w, h)
+            if not hbm:
+                return -1
+            try:
+                return dwmapi.DwmSetIconicThumbnail(self._hwnd, hbm, 0)
+            finally:
+                _g32.DeleteObject(hbm)  # DWM sudah menyalin bitmap-nya
+
+        def _set_iconic_preview(self):
+            ww, wh = self._window_size()
+            data = self._get_frame("peek", ww, wh)
+            if not data:
+                return -1
+            hbm = _bgra_to_hbitmap(data, ww, wh)
+            if not hbm:
+                return -1
+            try:
+                return dwmapi.DwmSetIconicLivePreviewBitmap(self._hwnd, hbm, None, 0)
+            finally:
+                _g32.DeleteObject(hbm)
+
+        def _window_size(self):
+            """Ukuran client window. Saat minimize GetClientRect = 0, jadi
+            pakai ukuran terakhir yang tercatat waktu window masih normal."""
+            hwnd = self._hwnd
+            try:
+                if hwnd and not _u32.IsIconic(hwnd):
+                    rc = wintypes.RECT()
+                    if _u32.GetClientRect(hwnd, ctypes.byref(rc)):
+                        w, h = rc.right - rc.left, rc.bottom - rc.top
+                        if w > 0 and h > 0:
+                            self._last_client = (w, h)
+                            return w, h
+            except Exception:
+                pass
+            if self._last_client:
+                return self._last_client
+            try:
+                w, h = int(self._window.width), int(self._window.height)
+                if w > 0 and h > 0:
+                    return w, h
+            except Exception:
+                pass
+            return 480, 360
+
+        # ── Internal: state artwork ───────────────────────────────────────
+        def _swap_art_locked(self, bmp, key):
+            """Ganti bitmap artwork (WAJIB dipanggil dgn _render_lock dipegang)."""
+            old = self._art_bmp
+            self._art_bmp = bmp
+            self._art_key = key
+            if old is not None and old is not bmp:
+                try:
+                    old.Dispose()
+                except Exception:
+                    pass
+
+        def _fetch_art_async(self, url, token):
+            """Ambil cover dari URL di thread terpisah (gak ngeblok js_api)."""
+            def _run():
+                try:
+                    import urllib.request
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": "MacanMediaPlayer/1.0"})
+                    with urllib.request.urlopen(req, timeout=6) as r:
+                        data = r.read(8 * 1024 * 1024)
+                    bmp = _bytes_to_art_bitmap(data, self._ART_CACHE_MAX)
+                except Exception as e:
+                    print(f"[TaskbarThumbBar] Gagal fetch artwork URL: {e}")
+                    return
+                if bmp is None:
+                    return
+                with self._render_lock:
+                    if token != self._art_token or self._closing:
+                        try:
+                            bmp.Dispose()
+                        except Exception:
+                            pass
+                        return  # lagu sudah ganti lagi, cover ini basi
+                    self._swap_art_locked(bmp, ("u", url))
+                    self._state_ver += 1
+                self.refresh_thumbnail()
+
+            try:
+                threading.Thread(target=_run, daemon=True, name="TaskbarThumbBarArt").start()
+            except Exception as e:
+                print(f"[TaskbarThumbBar] Gagal start thread fetch artwork: {e}")
+
+        # ── Internal: render kartu thumbnail (System.Drawing) ─────────────
+        def _get_frame(self, kind, w, h):
+            """Frame BGRA premultiplied (di-cache per ukuran & versi state, jadi
+            hover berulang gak render ulang)."""
+            with self._render_lock:
+                c = self._frame_cache.get(kind)
+                if c and c[0] == self._state_ver and c[1] == w and c[2] == h:
+                    return c[3]
+                try:
+                    data = self._render_frame(w, h)
+                except Exception as e:
+                    print(f"[TaskbarThumbBar] Gagal render thumbnail: {e}")
+                    return None
+                if data:
+                    self._frame_cache[kind] = (self._state_ver, w, h, data)
+                return data
+
+        def _render_frame(self, w, h):
+            """Gambar kartu: latar gradasi aksen, artwork rounded, judul & artis.
+            Layout disamakan dgn `_render_frame` versi Qt. Return bytes BGRA
+            premultiplied top-down (w*h*4)."""
+            if not _DRAWING_OK or w <= 0 or h <= 0:
+                return None
+            bmp = Bitmap(w, h, PixelFormat.Format32bppPArgb)
+            g = Graphics.FromImage(bmp)
+            disposables = []
+            try:
+                g.SmoothingMode = SmoothingMode.AntiAlias
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality
+                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit
+                g.Clear(Color.Transparent)
+
+                # -- Latar: gelap bernuansa aksen --
+                ar, ag, ab = self._accent
+                t = 0.30
+                top = Color.FromArgb(255, int(18 * (1 - t) + ar * t),
+                                     int(18 * (1 - t) + ag * t),
+                                     int(18 * (1 - t) + ab * t))
+                grad = LinearGradientBrush(
+                    PointF(0.0, 0.0), PointF(0.0, float(h)), top,
+                    Color.FromArgb(255, 10, 10, 10))
+                disposables.append(grad)
+                radius = min(w, h) * 0.05
+                bg = _round_rect_path(0, 0, w, h, radius)
+                disposables.append(bg)
+                g.FillPath(grad, bg)
+
+                # -- Artwork (persegi, rounded, center-crop) --
+                pad = h * 0.07
+                side = max(1.0, min(w - 2 * pad, h * 0.60))
+                ax = (w - side) / 2.0
+                ay = pad
+                art_path = _round_rect_path(ax, ay, side, side, side * 0.06)
+                disposables.append(art_path)
+
+                art = self._art_bmp
+                if art is not None:
+                    aw, ah = float(art.Width), float(art.Height)
+                    if aw >= ah:   # center-crop (KeepAspectRatioByExpanding)
+                        sw_, sh_ = ah, ah
+                        sx_, sy_ = (aw - ah) / 2.0, 0.0
+                    else:
+                        sw_, sh_ = aw, aw
+                        sx_, sy_ = 0.0, (ah - aw) / 2.0
+                    g.SetClip(art_path)
+                    g.DrawImage(art, RectangleF(float(ax), float(ay), float(side), float(side)),
+                                RectangleF(sx_, sy_, sw_, sh_), GraphicsUnit.Pixel)
+                    g.ResetClip()
+                else:
+                    ph = SolidBrush(Color.FromArgb(22, 255, 255, 255))
+                    disposables.append(ph)
+                    g.FillPath(ph, art_path)
+                    f = Font("Segoe UI", float(max(10, int(side * 0.4))),
+                             FontStyle.Regular, GraphicsUnit.Pixel)
+                    disposables.append(f)
+                    sf = StringFormat()
+                    disposables.append(sf)
+                    sf.Alignment = StringAlignment.Center
+                    sf.LineAlignment = StringAlignment.Center
+                    nb = SolidBrush(Color.FromArgb(90, 255, 255, 255))
+                    disposables.append(nb)
+                    g.DrawString("\u266A", f, nb,
+                                 RectangleF(float(ax), float(ay), float(side), float(side)), sf)
+
+                # -- Teks: judul & artis, di-elide (trimming ellipsis) --
+                text_w = max(1.0, w - 2 * pad)
+                ty = ay + side + h * 0.04
+
+                fmt = StringFormat()
+                disposables.append(fmt)
+                fmt.Alignment = StringAlignment.Center
+                fmt.LineAlignment = StringAlignment.Center
+                fmt.Trimming = StringTrimming.EllipsisCharacter
+                fmt.FormatFlags = StringFormatFlags.NoWrap
+
+                title_font = Font("Segoe UI", float(max(8, int(h * 0.075))),
+                                  FontStyle.Bold, GraphicsUnit.Pixel)
+                disposables.append(title_font)
+                white = SolidBrush(Color.FromArgb(255, 255, 255, 255))
+                disposables.append(white)
+                title_h = float(title_font.Height)
+                g.DrawString(self._title or "Macan Media Player", title_font, white,
+                             RectangleF(float(pad), float(ty), float(text_w), title_h), fmt)
+
+                if self._artist:
+                    artist_font = Font("Segoe UI", float(max(7, int(h * 0.055))),
+                                       FontStyle.Regular, GraphicsUnit.Pixel)
+                    disposables.append(artist_font)
+                    lr, lg, lb = ar, ag, ab
+                    if (0.299 * lr + 0.587 * lg + 0.114 * lb) / 255.0 < 0.55:
+                        lr, lg, lb = min(255, int(lr * 1.5)), min(255, int(lg * 1.5)), min(255, int(lb * 1.5))
+                    ab_ = SolidBrush(Color.FromArgb(255, lr, lg, lb))
+                    disposables.append(ab_)
+                    artist_h = float(artist_font.Height)
+                    g.DrawString(self._artist, artist_font, ab_,
+                                 RectangleF(float(pad), float(ty + title_h), float(text_w), artist_h), fmt)
+            finally:
+                try:
+                    g.Dispose()
+                except Exception:
+                    pass
+                for d in disposables:
+                    try:
+                        d.Dispose()
+                    except Exception:
+                        pass
+
+            # Salin pixel dari Bitmap GDI+ ke bytes Python
+            try:
+                bd = bmp.LockBits(Rectangle(0, 0, w, h), ImageLockMode.ReadOnly,
+                                  PixelFormat.Format32bppPArgb)
+                try:
+                    stride = int(bd.Stride)
+                    ptr = int(bd.Scan0.ToInt64())
+                    row = w * 4
+                    if stride == row:
+                        return ctypes.string_at(ptr, row * h)
+                    return b"".join(ctypes.string_at(ptr + y * stride, row) for y in range(h))
+                finally:
+                    bmp.UnlockBits(bd)
+            finally:
+                bmp.Dispose()
 
         # ── Internal: IMessageFilter WinForms (pengganti QAbstractNativeEventFilter) ──
         def _defer(self, fn):
@@ -762,10 +1658,12 @@ if IS_WINDOWS and TASKBAR_THUMBBAR_ENABLED:
         def _handle_button_click(self, btn_id):
             if btn_id == BTN_ID_PREV:
                 self.previous_requested.emit()
+                self.refresh_thumbnail(delay=0.35)
             elif btn_id == BTN_ID_PLAYPAUSE:
                 self.play_pause_requested.emit()
             elif btn_id == BTN_ID_NEXT:
                 self.next_requested.emit()
+                self.refresh_thumbnail(delay=0.35)
 
 else:
     # ── No-op fallback: non-Windows, atau TASKBAR_THUMBBAR_ENABLED = False ──
@@ -776,6 +1674,18 @@ else:
             self.next_requested = _Signal()
 
         def init_buttons(self):
+            pass
+
+        def update_track(self, title: str = "", artist: str = "", artwork=None):
+            pass
+
+        def set_accent(self, color):
+            pass
+
+        def refresh_thumbnail(self, delay=None):
+            pass
+
+        def notify_minimized(self, minimized: bool):
             pass
 
         def set_playing(self, is_playing: bool):
