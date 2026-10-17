@@ -81,6 +81,10 @@ const videoThumbCache = new Map();  // path → dataUrl
 const _persistDebounce = new Map();
 function _persistArtToServer(path, dataUrl, isVideo) {
   if (!pw() || !dataUrl) return;
+  // Video thumbs are already persisted by Python's VideoThumbCache (disk).
+  // Sending the base64 back over the bridge only made Python rewrite the
+  // whole playlist table per thumbnail -- a major source of post-add lag.
+  if (isVideo) return;
   clearTimeout(_persistDebounce.get(path));
   _persistDebounce.set(path, setTimeout(() => {
     _persistDebounce.delete(path);
@@ -135,6 +139,26 @@ let _lazyThumbObserver = null;
 // get_cover_art IPC call for every row that flashed past, spiking Python-side
 // CPU for thumbnails nobody actually looked at.
 const _lazyPending = new Map();
+
+// While a folder/file batch is still being scanned by Python, thumbnail
+// work (get_video_thumbnail / get_cover_art IPC + cv2 decode) is HELD so it
+// doesn't compete with the scan and the playlist render. Held placeholders
+// are collected here and released by _endBulkScan() once the list is complete.
+let _bulkScanning = false;
+const _deferredLazyEls = new Set();
+function _beginBulkScan() { _bulkScanning = true; }
+function _endBulkScan() {
+  if (!_bulkScanning && _deferredLazyEls.size === 0) return;
+  _bulkScanning = false;
+  if (!_deferredLazyEls.size) return;
+  const obs = _getLazyObserver();
+  const els = Array.from(_deferredLazyEls);
+  _deferredLazyEls.clear();
+  // Re-observe: IntersectionObserver fires an initial callback with the
+  // current state, so only rows actually near the viewport get fetched.
+  for (const el of els) if (el.isConnected) obs.observe(el);
+}
+
 function _getLazyObserver() {
   if (_lazyThumbObserver) return _lazyThumbObserver;
   _lazyThumbObserver = new IntersectionObserver((entries) => {
@@ -145,6 +169,7 @@ function _getLazyObserver() {
         const timeoutId = setTimeout(() => {
           _lazyPending.delete(el);
           _lazyThumbObserver.unobserve(el);
+          if (_bulkScanning) { _deferredLazyEls.add(el); return; } // hold until list is complete
           _fetchLazyThumb(el);
         }, 180); // 150-200ms grace period before actually fetching
         _lazyPending.set(el, timeoutId);
@@ -4188,10 +4213,11 @@ async function openFiles() {
     const paths = await pywebview.api.browse_files();
     if (paths?.length) {
       setStatus(`SCANNING ${paths.length} FILE(S)...`);
+      _beginBulkScan();
       await pywebview.api.add_tracks_stream(paths);
       // Rendering happens progressively via onTrackBatchReady
     } else { setStatus('NO FILES SELECTED'); }
-  } catch(e) { console.error(e); setStatus('ERROR — SEE CONSOLE'); }
+  } catch(e) { _endBulkScan(); console.error(e); setStatus('ERROR — SEE CONSOLE'); }
 }
 
 async function openFolder() {
@@ -4202,10 +4228,11 @@ async function openFolder() {
     const paths = await pywebview.api.browse_folder();
     if (paths?.length) {
       setStatus(`SCANNING ${paths.length} FILE(S)...`);
+      _beginBulkScan();
       await pywebview.api.add_tracks_stream(paths);
       // Rendering happens progressively via onTrackBatchReady
     } else { setStatus('NO MEDIA FOUND'); }
-  } catch(e) { console.error(e); setStatus('ERROR — SEE CONSOLE'); }
+  } catch(e) { _endBulkScan(); console.error(e); setStatus('ERROR — SEE CONSOLE'); }
 }
 
 // ── Streaming batch receiver — called from Python via evaluate_js ──────────
@@ -4219,6 +4246,7 @@ window.onTrackBatchReady = function(tracks, done) {
       if (S.currentIndex < 0 && S.playlist.length > 0) loadTrack(0);
       setStatus(`LOADED ${S.playlist.length} TRACK(S)`);
       window.MacanBridge?.emit('queue:add', { tracks: S.playlist });
+      _endBulkScan();   // list complete -> now let thumbnails load
     }
     return;
   }
@@ -4227,7 +4255,7 @@ window.onTrackBatchReady = function(tracks, done) {
   const known = new Set(S.playlist.map(t => t.path));
   const newTracks = tracks.filter(t => !known.has(t.path));
   if (!newTracks.length) {
-    if (done) { updatePlaylistMeta(); }
+    if (done) { updatePlaylistMeta(); _endBulkScan(); }
     return;
   }
 
@@ -4254,6 +4282,7 @@ window.onTrackBatchReady = function(tracks, done) {
     if (S.currentIndex < 0 && S.playlist.length > 0) loadTrack(0);
     setStatus(`LOADED ${S.playlist.length} TRACK(S)`);
     window.MacanBridge?.emit('queue:add', { tracks: S.playlist });
+    _endBulkScan();     // list complete -> now let thumbnails load
   } else {
     setStatus(`LOADING... ${S.playlist.length} tracks`);
   }
