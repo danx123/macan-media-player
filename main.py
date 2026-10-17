@@ -1526,34 +1526,57 @@ class MacanMediaAPI:
 
         JS side must implement window.onTrackBatchReady(tracks, done) to receive
         the pushes. Returns True immediately; JS gets data asynchronously.
-        """
-        known = {t['path'] for t in self.playlist}
-        candidates = []
-        for fp in file_paths:
-            abs_path = str(Path(fp).resolve())
-            if abs_path not in known:
-                candidates.append(abs_path)
-                known.add(abs_path)
 
-        if not candidates:
-            # Nothing new — notify JS that we're done with the existing playlist
+        OPTIMIZED vs. the old version:
+        - Batches are now pushed AS THE ORDERED PREFIX OF RESULTS COMPLETES.
+          Before, the worker first waited for every single future
+          (done_map) and only then started pushing, so "streaming" showed
+          nothing until the whole folder was scanned.
+        - No Path.resolve() on the IPC/bridge thread. The old pre-pass
+          resolved every path (a filesystem syscall each) before returning
+          to JS; now only a cheap string normalise is done up front, and the
+          real resolve() happens once per file inside the scan pool.
+        - No video-thumbnail work in the scan at all (see
+          _build_track_meta_fast) -- thumbnails come after the list exists.
+        - First batch is small (fast first paint), later ones larger
+          (fewer evaluate_js round-trips + fewer re-renders).
+        - done=True is guaranteed via try/finally, so JS never stays stuck
+          in "bulk scanning" state if a worker throws.
+        """
+        import json as _json
+
+        def _notify_done_empty():
             try:
-                import json as _json
                 self._window.evaluate_js(
                     f'window.onTrackBatchReady({_json.dumps([])}, true)'
                 )
             except Exception:
                 pass
+
+        # Cheap pre-filter (pure string ops, no syscalls) to skip files that
+        # are obviously already in the playlist / duplicated in this batch.
+        _norm = lambda p: os.path.normcase(os.path.abspath(p))
+        known = {t['path'] for t in self.playlist}
+        known_norm = {os.path.normcase(p) for p in known}
+        candidates = []
+        for fp in file_paths:
+            n = _norm(fp)
+            if n in known_norm:
+                continue
+            known_norm.add(n)
+            candidates.append(fp)
+
+        if not candidates:
+            # Nothing new — notify JS that we're done with the existing playlist
+            _notify_done_empty()
             return True
 
-        total     = len(candidates)
-        BATCH_SZ  = 8    # flush to JS every N tracks; smaller = smoother on low-end
-        batch_buf = []
+        FIRST_BATCH = 12   # small first flush -> list appears almost instantly
+        BATCH_SZ    = 40   # later flushes bigger -> fewer bridge round-trips
 
         def _push_batch(tracks, done=False):
             """Serialize and push a batch to the WebView via evaluate_js."""
             try:
-                import json as _json
                 payload = _json.dumps(tracks, ensure_ascii=False)
                 self._window.evaluate_js(
                     f'window.onTrackBatchReady({payload}, {"true" if done else "false"})'
@@ -1562,34 +1585,40 @@ class MacanMediaAPI:
                 print(f"[MACAN] add_tracks_stream push error: {e}")
 
         def _worker_thread():
-            nonlocal batch_buf
-            # Reuses the shared self._scan_pool instead of spinning up a
-            # fresh ThreadPoolExecutor for this call.
-            futures = {self._scan_pool.submit(self._build_track_meta_fast, fp): fp
-                       for fp in candidates}
-            # Collect in submission order to keep natural sort order
-            done_map = {}
-            for fut in futures:
-                fp = futures[fut]
-                try:
-                    done_map[fp] = fut.result()
-                except Exception as e:
-                    print(f"[MACAN] stream scan error {fp}: {e}")
-
-            for fp in candidates:
-                track = done_map.get(fp)
-                if not track:
-                    continue
-                self.playlist.append(track)
-                batch_buf.append(track)
-                if len(batch_buf) >= BATCH_SZ:
-                    _push_batch(batch_buf, done=False)
-                    batch_buf = []
-
-            # Final flush
-            _push_batch(batch_buf, done=True)
             batch_buf = []
-            self._save_playlist()
+            sent = 0
+            try:
+                # Reuses the shared self._scan_pool instead of spinning up a
+                # fresh ThreadPoolExecutor for this call.
+                futures = [self._scan_pool.submit(self._build_track_meta_fast, fp)
+                           for fp in candidates]
+                # Consume in submission order (keeps natural sort order) but
+                # push as soon as each batch-worth of the ordered prefix is
+                # ready -- do NOT wait for the remaining files.
+                for fp, fut in zip(candidates, futures):
+                    try:
+                        track = fut.result()
+                    except Exception as e:
+                        print(f"[MACAN] stream scan error {fp}: {e}")
+                        continue
+                    if not track:
+                        continue
+                    # Authoritative dedup on the resolved path
+                    if track['path'] in known:
+                        continue
+                    known.add(track['path'])
+                    self.playlist.append(track)
+                    batch_buf.append(track)
+                    if len(batch_buf) >= (FIRST_BATCH if sent == 0 else BATCH_SZ):
+                        _push_batch(batch_buf, done=False)
+                        sent += len(batch_buf)
+                        batch_buf = []
+            except Exception as e:
+                print(f"[MACAN] add_tracks_stream worker error: {e}")
+            finally:
+                # Final flush -- always, so JS leaves its "scanning" state
+                _push_batch(batch_buf, done=True)
+                self._save_playlist()
 
         import threading as _th
         _th.Thread(target=_worker_thread, daemon=True).start()
@@ -1611,7 +1640,7 @@ class MacanMediaAPI:
         p = Path(filepath)
         ext = p.suffix.lower()
         is_video = ext in {'.mp4', '.mkv', '.avi', '.webm', '.mov', '.wmv'}
-        abs_path = str(p.resolve())
+        abs_path = str(p.resolve())   # resolve() = syscalls; do it once only
 
         meta = self._read_tags(abs_path, ext, is_video)
         duration = meta.get('duration') or 0
@@ -1652,31 +1681,22 @@ class MacanMediaAPI:
             except Exception:
                 pass
 
-        # Video thumbnail: check the persistent disk cache (SQLite lookup +
-        # small JPEG read, no cv2 decode) before deferring to the JS lazy
-        # fetch. This is the fix for "loading many videos re-generates every
-        # thumbnail" — a video that was already thumbnailed in ANY previous
-        # session or playlist now shows instantly on add/scan instead of
-        # waiting on a lazy round-trip + full cv2 decode again.
+        # Video thumbnail: DEFERRED ENTIRELY. The track list must appear
+        # first; thumbnails (disk-cache lookup OR fresh cv2 decode) are
+        # resolved afterwards by JS -> get_video_thumbnail() only for rows
+        # that are actually visible, and only once the bulk scan is done
+        # (see _bulkScanning in script.js). The disk cache is still used
+        # there, so already-thumbnailed videos remain a cheap hit -- it just
+        # no longer costs a SQLite open + JPEG read + base64 per file inside
+        # the scan, nor bloats every evaluate_js batch with image data.
         video_thumb = None
-        if is_video:
-            try:
-                video_thumb = self._video_thumb_disk_cache.get_cached(abs_path)
-                if video_thumb:
-                    # Warm the in-memory cache too so a same-session
-                    # get_video_thumbnail() call is also an instant hit.
-                    if not hasattr(self, '_video_thumb_cache'):
-                        self._video_thumb_cache = {}
-                    self._video_thumb_cache[abs_path] = video_thumb
-            except Exception:
-                video_thumb = None
 
         return {
             'name':             display_name,
             'artist':           artist,
             'album':            album,
             'path':             abs_path,
-            'url':              p.resolve().as_uri(),
+            'url':              Path(abs_path).as_uri(),   # no 2nd resolve()
             'ext':              ext.lstrip('.').upper(),
             'is_video':         is_video,
             'duration':         duration,
@@ -1704,16 +1724,22 @@ class MacanMediaAPI:
         return updated
 
     def update_track_video_thumb(self, path, video_thumb):
-        """Same as update_track_art but for video thumbnails."""
-        updated = False
+        """Video thumbnails are persisted by VideoThumbCache (SQLite + .jpg on
+        disk, validated by mtime/size), NOT inside the playlist table.
+
+        This used to store the base64 data-URI on the track and call
+        _save_playlist() -- i.e. EVERY newly generated thumbnail triggered a
+        DELETE + re-INSERT of the whole playlist with every row's base64
+        image inside its JSON. With hundreds of videos generating thumbnails
+        continuously that is the main reason the app kept lagging after
+        'add folder'. Now it only updates the in-memory track (cheap) and
+        never schedules a playlist save.
+        """
         for track in self.playlist:
             if track.get('path') == path:
                 track['video_thumb'] = video_thumb
-                updated = True
-                break
-        if updated:
-            self._save_playlist()
-        return updated
+                return True
+        return False
 
     def update_track_duration(self, path, duration, duration_str=None):
         """Backfill a track's duration once it's known for certain.
@@ -3045,16 +3071,48 @@ class MacanMediaAPI:
             pass
         return None
 
+    _MEDIA_EXTS = frozenset({'.mp3', '.mp4', '.wav', '.flac', '.ogg', '.aac',
+                             '.mkv', '.avi', '.webm', '.m4a', '.opus', '.mov', '.wmv'})
+
     def _scan_media_folder_paths(self, folder):
-        """Recursively scan folder and return list of media file path strings."""
-        extensions = {'.mp3', '.mp4', '.wav', '.flac', '.ogg', '.aac',
-                      '.mkv', '.avi', '.webm', '.m4a', '.opus', '.mov', '.wmv'}
+        """Recursively scan folder and return list of media file path strings.
+
+        OPTIMIZED: pure os.scandir walk. DirEntry already carries the
+        file/dir flag from the directory listing itself (no extra stat per
+        entry on Windows), and the extension check uses os.path.splitext on
+        the plain name string instead of building a pathlib.Path object for
+        every single file. Order is identical to the old os.walk version:
+        a directory's own files (sorted by name) first, then each
+        subdirectory in listing order. Hidden (dot) directories are skipped.
+        Only lists names -- no file is opened, so this stays cheap even for
+        big video folders.
+        """
+        exts = self._MEDIA_EXTS
+        splitext = os.path.splitext
+        join = os.path.join
         paths = []
-        for root, dirs, files in os.walk(folder):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            for f in sorted(files):
-                if Path(f).suffix.lower() in extensions:
-                    paths.append(os.path.join(root, f))
+
+        def _walk(d):
+            names, subdirs = [], []
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        try:
+                            if e.is_dir(follow_symlinks=False):
+                                if not e.name.startswith('.'):
+                                    subdirs.append(e.path)
+                            elif splitext(e.name)[1].lower() in exts:
+                                names.append(e.name)
+                        except OSError:
+                            continue
+            except OSError:
+                return
+            names.sort()
+            paths.extend(join(d, n) for n in names)
+            for sd in subdirs:
+                _walk(sd)
+
+        _walk(folder)
         return paths
 
     def _read_tags(self, path, ext, is_video):
@@ -3069,8 +3127,21 @@ class MacanMediaAPI:
             # FIX: read duration from container metadata for videos too.
             # mutagen.File() parses MP4/MOV/MKV/WEBM/AVI atoms/headers without
             # spawning ffprobe — cheap enough for bulk scans.
+            #
+            # OPTIMIZED: mutagen has NO parser for Matroska/AVI/WebM, so
+            # mutagen.File() on .mkv/.avi/.webm just opened the file, ran
+            # every format scorer against its header and returned None --
+            # pure wasted I/O (painful on HDD/big libraries). Skip those
+            # (duration is resolved lazily on first play, same as before)
+            # and, for the formats mutagen DOES support, call the right
+            # parser directly instead of the "try every format" probe.
             try:
-                media_file = mutagen.File(path)
+                if ext in ('.mp4', '.m4v', '.mov'):
+                    media_file = MP4(path)
+                elif ext == '.wmv':
+                    media_file = mutagen.File(path)
+                else:
+                    media_file = None
                 if media_file and media_file.info and getattr(media_file.info, 'length', 0):
                     result['duration'] = int(media_file.info.length)
             except Exception as e:
@@ -3500,7 +3571,9 @@ class MacanMediaAPI:
                 conn.execute("DELETE FROM playlist")
                 conn.executemany(
                     "INSERT INTO playlist(pos,data) VALUES(?,?)",
-                    [(pos, json.dumps(track, ensure_ascii=False))
+                    [(pos, json.dumps(
+                        {k: v for k, v in track.items() if k != 'video_thumb'},
+                        ensure_ascii=False))
                      for pos, track in enumerate(snapshot)]
                 )
                 conn.commit()
