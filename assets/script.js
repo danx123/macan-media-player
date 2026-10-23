@@ -1958,6 +1958,8 @@ window.addEventListener('load', () => {
   setupSeekbar();
   setupVcSeekbar();
   setupVideoControls();
+  setupVideoPlaylistPanel();
+  setupCinematicLighting();
   setupVideoContextMenu();
   _setupPlaylistDelegation(); // one delegated listener set on #playlist-list instead of per-row listeners
 
@@ -2532,6 +2534,7 @@ function _restorePerfModeFromPython() {
       perfModeEnabled = s.perf_mode;
       try { localStorage.setItem('macan_perf_mode', perfModeEnabled ? '1' : '0'); } catch {}
       _applyPerfModeStyle(perfModeEnabled);
+      if (window.CinematicLight) CinematicLight.refresh();
     }
     _updatePerfModeUI(perfModeEnabled);
   }).catch(() => { _updatePerfModeUI(perfModeEnabled); });
@@ -2547,6 +2550,7 @@ function setPerfMode(enabled) {
   if (typeof pywebview !== 'undefined') {
     pywebview.api.save_settings({ perf_mode: enabled }).catch(() => {});
   }
+  if (window.CinematicLight) CinematicLight.refresh();
 }
 
 function _setupModeMenu() {
@@ -3197,10 +3201,32 @@ function setupVideoControls() {
   // Guard against clicks on #video-controls buttons so they don't double-fire.
   let _clickTimer = null;
 
+  // Elements that own their own click behaviour. NOTE: we must NOT use
+  // videoControls.contains(e.target) — #video-controls is a full-screen
+  // container, so while the controls are visible (always true right after
+  // a mouse move) every click on the video would match it and be ignored.
+  const _VC_INTERACTIVE =
+    'button, input, select, a, .vc-seekbar-wrap, .vc-vol-wrap, .vc-countdown, #vc-playlist-panel';
+
+  // Remember where the press started: a seekbar drag released over the video
+  // fires a `click` on a common ancestor — that must not toggle playback.
+  let _pressedOnControl = false;
+  videoLayer.addEventListener('mousedown', e => {
+    _pressedOnControl = !!e.target.closest(_VC_INTERACTIVE);
+  }, true);
+
   videoLayer.addEventListener('click', e => {
-    // Ignore clicks on the controls bar (prev/play/next/seek/etc.)
-    if (videoControls && videoControls.contains(e.target)) return;
+    if (e.target.closest(_VC_INTERACTIVE) || _pressedOnControl) {
+      _pressedOnControl = false;
+      return;
+    }
     if (document.getElementById('macan-ctx-menu')) return;
+
+    // Playlist drawer open → first click outside only closes it
+    if (window.VideoPlaylist && VideoPlaylist.isOpen()) {
+      VideoPlaylist.close();
+      return;
+    }
 
     clearTimeout(_clickTimer);
     const wasPaused = video.paused;
@@ -3219,6 +3245,229 @@ function setupVideoControls() {
 
   // Double-click cancels the single-click timer (prevent accidental play/pause on dblclick)
   videoLayer.addEventListener('dblclick', () => clearTimeout(_clickTimer));
+}
+
+// ─── VIDEO PLAYLIST DRAWER ────────────────────────────────────
+// Button #vc-playlist (just left of fullscreen) toggles a drawer listing the
+// VIDEO tracks of the queue. Rows are built only when the drawer opens and
+// use delegated click handling, so it costs nothing while closed.
+function setupVideoPlaylistPanel() {
+  const btn     = $('vc-playlist');
+  const panel   = $('vc-playlist-panel');
+  const listEl  = $('vcp-list');
+  const countEl = $('vcp-count');
+  if (!btn || !panel || !listEl) return;
+
+  let _open = false;
+
+  function _render() {
+    const frag = document.createDocumentFragment();
+    let n = 0;
+    S.playlist.forEach((t, i) => {
+      if (!t.is_video) return;
+      n++;
+      const isCur = i === S.currentIndex;
+      const row = document.createElement('div');
+      row.className = 'vcp-item' + (isCur ? ' active' : '');
+      row.dataset.index = i;
+      row.dataset.n = n;
+      const dur = t.duration_str && t.duration_str !== '--:--' ? t.duration_str : '';
+      row.innerHTML =
+        `<span class="vcp-num">${isCur ? '▶' : n}</span>` +
+        `<span class="vcp-name">${esc(t.name || '')}</span>` +
+        `<span class="vcp-dur">${esc(dur)}</span>`;
+      frag.appendChild(row);
+    });
+    if (!n) {
+      const empty = document.createElement('div');
+      empty.className = 'vcp-empty';
+      empty.textContent = 'NO VIDEOS IN QUEUE';
+      frag.appendChild(empty);
+    }
+    listEl.replaceChildren(frag);
+    countEl.textContent = n;
+  }
+
+  function open() {
+    if (_open) return;
+    _open = true;
+    _render();
+    panel.hidden = false;
+    void panel.offsetWidth;                 // let the transition run
+    panel.classList.add('open');
+    btn.classList.add('active');
+    btn.setAttribute('aria-expanded', 'true');
+    listEl.querySelector('.vcp-item.active')?.scrollIntoView({ block: 'center' });
+  }
+
+  function close() {
+    if (!_open) return;
+    _open = false;
+    panel.classList.remove('open');
+    btn.classList.remove('active');
+    btn.setAttribute('aria-expanded', 'false');
+    setTimeout(() => { if (!_open) panel.hidden = true; }, 220);
+  }
+
+  btn.addEventListener('click', e => { e.stopPropagation(); _open ? close() : open(); });
+  $('vcp-close').addEventListener('click', e => { e.stopPropagation(); close(); });
+
+  listEl.addEventListener('click', e => {
+    const row = e.target.closest('.vcp-item');
+    if (!row) return;
+    const idx = +row.dataset.index;
+    if (idx === S.currentIndex) { togglePlayPause(); return; }
+    loadTrack(idx);
+  });
+
+  // Close automatically whenever the video layer goes away
+  // (close button, mini player, switching to an audio track, ...)
+  new MutationObserver(() => {
+    if (!videoLayer.classList.contains('active')) close();
+  }).observe(videoLayer, { attributes: true, attributeFilter: ['class'] });
+
+  window.VideoPlaylist = {
+    isOpen: () => _open,
+    open, close,
+    // called from updatePlaylistHighlight(): O(1) class swap, no re-render
+    syncActive(idx) {
+      if (!_open) return;
+      const prev = listEl.querySelector('.vcp-item.active');
+      if (prev) {
+        prev.classList.remove('active');
+        const pn = prev.querySelector('.vcp-num');
+        if (pn) pn.textContent = prev.dataset.n || '';
+      }
+      const next = listEl.querySelector(`.vcp-item[data-index="${idx}"]`);
+      if (next) {
+        next.classList.add('active');
+        const nn = next.querySelector('.vcp-num');
+        if (nn) nn.textContent = '▶';
+        next.scrollIntoView({ block: 'nearest' });
+      }
+    }
+  };
+}
+
+// ─── CINEMATIC LIGHTING ───────────────────────────────────────
+// Ambient glow behind the video, sampled from the playing video itself.
+// Performance design:
+//   * NO second <video> (no extra decode) - the main element is sampled.
+//   * Frame is downscaled to 48x27 then 96x54; the compositor's bilinear
+//     upscale does the "blur", so there is no CSS blur()/backdrop-filter.
+//   * Sampled <= ~8 fps via requestVideoFrameCallback (only fires on real
+//     new frames, never while paused), timer fallback otherwise.
+//   * Temporal smoothing via globalAlpha -> no flicker, zero extra cost.
+//   * Runs only while: layer visible + video playing + tab visible +
+//     NOT in Performance mode. Everything is torn down otherwise.
+function setupCinematicLighting() {
+  const canvas = $('vc-ambient');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d', { alpha: false });
+  if (!ctx) return;
+
+  // 1st stage: aggressive downscale of the video frame
+  const small = document.createElement('canvas');
+  small.width = 48; small.height = 27;
+  const sctx = small.getContext('2d', { alpha: false });
+  sctx.imageSmoothingEnabled = true;
+  sctx.imageSmoothingQuality = 'high';   // mip-filtered -> no shimmer on big downscale
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+
+  const SAMPLE_MS = 120;                 // ~8 fps
+  const BLEND     = 0.35;                // temporal smoothing (1 = no smoothing)
+  const hasRVFC   = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+  let handle = null, running = false, lastDraw = 0, fresh = true;
+
+  const canRun = () =>
+    !perfModeEnabled &&
+    !document.hidden &&
+    videoLayer.classList.contains('active') &&
+    !video.paused && !video.ended;
+
+  function drawFrame(first) {
+    if (video.readyState < 2 || !video.videoWidth) return;
+    try {
+      sctx.drawImage(video, 0, 0, small.width, small.height);
+      ctx.globalAlpha = first ? 1 : BLEND;
+      ctx.drawImage(small, 0, 0, canvas.width, canvas.height);
+      ctx.globalAlpha = 1;
+      canvas.classList.add('on');
+    } catch (_) { /* not decodable yet - just skip this frame */ }
+  }
+
+  function tick(now) {
+    handle = null;
+    if (!running) return;
+    const t = now || performance.now();
+    if (t - lastDraw >= SAMPLE_MS) {
+      lastDraw = t;
+      drawFrame(fresh);
+      fresh = false;
+    }
+    schedule();
+  }
+
+  function schedule() {
+    if (!running || handle !== null) return;
+    handle = hasRVFC
+      ? video.requestVideoFrameCallback(tick)
+      : setTimeout(() => tick(performance.now()), SAMPLE_MS);
+  }
+
+  function cancel() {
+    if (handle === null) return;
+    if (hasRVFC) video.cancelVideoFrameCallback(handle);
+    else clearTimeout(handle);
+    handle = null;
+  }
+
+  function start() {
+    if (running || !canRun()) return;
+    running = true;
+    schedule();
+  }
+
+  function stop() {
+    running = false;
+    cancel();
+  }
+
+  function refresh() {
+    if (perfModeEnabled || !videoLayer.classList.contains('active')) {
+      stop();
+      canvas.classList.remove('on');   // fade out; nothing runs anymore
+      fresh = true;
+      return;
+    }
+    if (canRun()) start(); else stop();
+  }
+
+  // Playback state
+  video.addEventListener('playing', start);
+  video.addEventListener('pause',   stop);
+  video.addEventListener('ended',   stop);
+  // New media -> first frame replaces the glow immediately (no slow cross-blend)
+  video.addEventListener('loadstart', () => { fresh = true; });
+  video.addEventListener('emptied',   () => { stop(); fresh = true; canvas.classList.remove('on'); });
+  // While paused, scrubbing should still update the glow once
+  video.addEventListener('seeked', () => {
+    if (!perfModeEnabled && videoLayer.classList.contains('active') && video.paused) {
+      drawFrame(true);
+    }
+  });
+  video.addEventListener('loadeddata', () => {
+    if (!perfModeEnabled && videoLayer.classList.contains('active')) drawFrame(true);
+  });
+
+  document.addEventListener('visibilitychange', refresh);
+  new MutationObserver(refresh)
+    .observe(videoLayer, { attributes: true, attributeFilter: ['class'] });
+
+  window.CinematicLight = { refresh };
+  refresh();
 }
 
 function hideVcControls() {
@@ -5068,6 +5317,7 @@ async function showInlineTagEditor(track) {
 }
 
 function updatePlaylistHighlight(idx) {
+  if (window.VideoPlaylist) VideoPlaylist.syncActive(idx);
   // Remove active from previous — track via data attribute lookup (O(1))
   const prev = playlistList.querySelector('.pl-item.active');
   if (prev) prev.classList.remove('active');
@@ -5101,6 +5351,8 @@ document.addEventListener('keydown', e => {
       _exitLyricsFullscreen();
     } else if (S.lyricsOpen) {
       closeLyrics();
+    } else if (window.VideoPlaylist && VideoPlaylist.isOpen()) {
+      VideoPlaylist.close();
     } else if (videoLayer.classList.contains('active')) {
       closeVideo();
     }
