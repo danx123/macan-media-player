@@ -1239,6 +1239,8 @@ input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider)::-webk
   height: 100%;
   object-fit: contain;
   display: block;
+  position: relative;   /* paint above #vc-ambient */
+  z-index: 1;
 }
 
 /* ── Video Controls Overlay ── */
@@ -6790,3 +6792,146 @@ video::cue {
 }
 .vc-cd-cancel:hover  { background: rgba(255,255,255,0.16); color: #fff; border-color: rgba(255,255,255,0.35); }
 .vc-cd-cancel:active { transform: scale(0.97); }
+
+/* ═══════════════════════════════════════════════════════════════
+   CINEMATIC LIGHTING — ambient glow from the playing video
+   A 96×54 canvas upscaled by the compositor (bilinear = free blur).
+   No CSS filter / backdrop-filter, so there is no per-frame blur cost.
+═══════════════════════════════════════════════════════════════ */
+#vc-ambient {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.9s ease;
+  image-rendering: auto;
+}
+#vc-ambient.on { opacity: 0.8; }
+
+/* ═══════════════════════════════════════════════════════════════
+   IN-PLAYER PLAYLIST (video layer)
+   Solid background on purpose — no backdrop-filter (keeps it cheap
+   and consistent with Performance mode).
+═══════════════════════════════════════════════════════════════ */
+#vc-playlist.active {
+  background: rgba(232,255,0,0.12);
+  color: #E8FF00;
+}
+
+#vc-playlist-panel {
+  position: absolute;
+  top: 72px;
+  right: 24px;
+  bottom: 150px;
+  width: min(380px, calc(100% - 48px));
+  z-index: 502;                 /* above #video-controls (501) */
+  display: flex;
+  flex-direction: column;
+  background: rgba(14,14,14,0.94);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+  opacity: 0;
+  transform: translateX(16px);
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+#vc-playlist-panel[hidden] { display: none; }
+#vc-playlist-panel.open {
+  opacity: 1;
+  transform: none;
+  pointer-events: all;
+}
+
+.vcp-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  flex-shrink: 0;
+}
+.vcp-title {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 3px;
+  color: var(--accent);
+}
+.vcp-count {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--text-mid);
+  margin-right: auto;
+}
+.vcp-close {
+  background: none;
+  border: none;
+  color: var(--text-mid);
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+.vcp-close:hover { background: rgba(255,255,255,0.1); color: #fff; }
+
+.vcp-list {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px;
+}
+.vcp-list::-webkit-scrollbar { width: 6px; }
+.vcp-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+
+.vcp-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: rgba(255,255,255,0.8);
+  /* skip layout/paint of off-screen rows → big lists stay cheap */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 40px;
+}
+.vcp-item:hover { background: rgba(255,255,255,0.07); }
+.vcp-item.active {
+  background: rgba(232,255,0,0.10);
+  color: var(--accent);
+}
+.vcp-num {
+  width: 22px;
+  flex-shrink: 0;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--text-lo);
+}
+.vcp-item.active .vcp-num { color: var(--accent); }
+.vcp-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vcp-dur {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--text-mid);
+  flex-shrink: 0;
+}
+.vcp-empty {
+  padding: 28px 12px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 2px;
+  color: var(--text-lo);
+}
