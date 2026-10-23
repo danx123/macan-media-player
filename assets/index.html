@@ -331,6 +331,9 @@
 
 <!-- ═══════════ VIDEO FULLSCREEN LAYER ══════════════════════ -->
 <div id="video-layer">
+  <!-- Cinematic lighting: tiny canvas (low-res frame of the video) stretched
+       to fill the layer; sits BEHIND the <video> so it only glows in the letterbox area -->
+  <canvas id="vc-ambient" width="96" height="54" aria-hidden="true"></canvas>
   <video id="video-player" preload="auto"></video>
 
   <!-- Center play/pause overlay button (YouTube-style) -->
@@ -409,6 +412,14 @@
           </svg>
           <span class="vc-sub-label">CC</span>
         </button>
+        <button class="vc-btn" id="vc-playlist" title="Playlist" aria-haspopup="true" aria-expanded="false">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="9" y1="6" x2="21" y2="6"/><line x1="9" y1="12" x2="21" y2="12"/><line x1="9" y1="18" x2="21" y2="18"/>
+            <circle cx="4" cy="6" r="1" fill="currentColor" stroke="none"/>
+            <circle cx="4" cy="12" r="1" fill="currentColor" stroke="none"/>
+            <circle cx="4" cy="18" r="1" fill="currentColor" stroke="none"/>
+          </svg>
+        </button>
         <button class="vc-btn" id="vc-fullscreen" title="Toggle Fullscreen">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
@@ -422,6 +433,16 @@
         </button>
       </div>
     </div>
+  </div>
+
+  <!-- In-player playlist (videos only). Built lazily on open. -->
+  <div id="vc-playlist-panel" role="dialog" aria-label="Video playlist" hidden>
+    <div class="vcp-header">
+      <span class="vcp-title">PLAYLIST</span>
+      <span class="vcp-count" id="vcp-count">0</span>
+      <button class="vcp-close" id="vcp-close" title="Close" aria-label="Close playlist">✕</button>
+    </div>
+    <div class="vcp-list" id="vcp-list"></div>
   </div>
 
   <!-- Countdown overlay: direct child of video-layer so it stays visible
