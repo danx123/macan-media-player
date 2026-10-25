@@ -4595,10 +4595,97 @@ const DND = {
   indicator:  null,
 };
 
+// ── PLAYLIST MULTI-SELECT (dipakai context menu "Convert") ───────────
+// Ctrl/Cmd+klik = toggle, Shift+klik = range, klik biasa = reset + play.
+// Disimpan berdasarkan track.path supaya selection tetap aman saat
+// playlist di-render ulang / di-reorder.
+var _plSel = new Set();
+var _plAnchorPath = null;
+
+(function _injectSelectionStyle() {
+  if (document.getElementById('macan-sel-style')) return;
+  const st = document.createElement('style');
+  st.id = 'macan-sel-style';
+  st.textContent = `
+    .pl-item.pl-selected { background: rgba(200,255,0,0.12) !important; box-shadow: inset 3px 0 0 #c8ff00; }
+    .macan-ctx-menu .ctx-label { padding: 6px 12px 4px; font-size: 9px; letter-spacing: 1px; opacity: .55; pointer-events: none; font-family: 'Space Mono', monospace; }
+  `;
+  document.head.appendChild(st);
+})();
+
+function _plGetSelected() {
+  if (!_plSel.size) return [];
+  return S.playlist.filter(t => t && _plSel.has(t.path));
+}
+
+function _plPaintSelection() {
+  playlistList.querySelectorAll('.pl-item').forEach(r => {
+    const t = S.playlist[parseInt(r.dataset.index, 10)];
+    r.classList.toggle('pl-selected', !!t && _plSel.has(t.path));
+  });
+}
+
+function _plClearSelection() {
+  if (!_plSel.size) return;
+  _plSel.clear();
+  _plAnchorPath = null;
+  _plPaintSelection();
+}
+
+function _plToggle(track) {
+  if (_plSel.has(track.path)) _plSel.delete(track.path);
+  else _plSel.add(track.path);
+  _plAnchorPath = track.path;
+  _plPaintSelection();
+}
+
+function _plSelectRange(toTrack) {
+  const rows = [...playlistList.querySelectorAll('.pl-item')];
+  const paths = rows.map(r => (S.playlist[parseInt(r.dataset.index, 10)] || {}).path);
+  let a = paths.indexOf(_plAnchorPath);
+  const b = paths.indexOf(toTrack.path);
+  if (b < 0) return;
+  if (a < 0) a = b;
+  const [lo, hi] = a <= b ? [a, b] : [b, a];
+  _plSel.clear();
+  for (let i = lo; i <= hi; i++) if (paths[i]) _plSel.add(paths[i]);
+  _plPaintSelection();
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || !_plSel.size) return;
+  const tag = (e.target && e.target.tagName) || '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+  _plClearSelection();
+});
+
+// ── KIRIM KE CONVERTER ───────────────────────────────────────
+// mode: 'audio' | 'video' (sesuai converter_start di main.py).
+// Handoff ke converter.js lewat 3 jalur sekaligus:
+//   1) window.__macanConverterInbox  (dibaca converter.js saat panel dibuka)
+//   2) CustomEvent 'macan:converter-load' (kalau panel sudah terbuka)
+//   3) openConverter() untuk membuka panelnya
+function sendToConverter(tracks, mode) {
+  const files = tracks
+    .filter(t => t && t.path && (mode === 'video' ? t.is_video : !t.is_video))
+    .map(t => t.path);
+  if (!files.length) { setStatus('CONVERT — NO FILES'); return; }
+
+  const detail = { files, mode };
+  window.__macanConverterInbox = detail;
+
+  if (typeof openConverter === 'function') openConverter();
+  setTimeout(() => {
+    window.dispatchEvent(new CustomEvent('macan:converter-load', { detail }));
+  }, 0);
+
+  setStatus(`CONVERT — ${files.length} ${mode.toUpperCase()} FILE${files.length > 1 ? 'S' : ''} SENT TO CONVERTER`);
+}
+
 function _buildPlaylistItem(track, realIdx) {
   const isActive = realIdx === S.currentIndex;
   const div = document.createElement('div');
-  div.className = 'pl-item' + (isActive ? ' active' : '');
+  div.className = 'pl-item' + (isActive ? ' active' : '') + ((_plSel && _plSel.has(track.path)) ? ' pl-selected' : '');
   div.dataset.index = realIdx;
   div.draggable = !filterQ;
 
@@ -4708,7 +4795,20 @@ function _setupPlaylistDelegation() {
       return;
     }
     const idx = _idxFromRow(row);
-    if (idx >= 0) loadTrack(idx);
+    if (idx < 0) return;
+    const clicked = S.playlist[idx];
+
+    // Multi-select: Ctrl/Cmd = toggle, Shift = range (tidak memutar lagu)
+    if (clicked && (e.ctrlKey || e.metaKey)) { _plToggle(clicked); return; }
+    if (clicked && e.shiftKey)               { _plSelectRange(clicked); return; }
+
+    _plClearSelection();
+    loadTrack(idx);
+  });
+
+  // Cegah teks ikut ter-highlight saat Shift+klik
+  playlistList.addEventListener('mousedown', e => {
+    if (e.shiftKey && _rowFromEvent(e)) e.preventDefault();
   });
 
   playlistList.addEventListener('dblclick', e => {
@@ -4724,7 +4824,11 @@ function _setupPlaylistDelegation() {
     e.preventDefault(); e.stopPropagation();
     const idx = _idxFromRow(row);
     const track = S.playlist[idx];
-    if (track) showContextMenu(e.clientX, e.clientY, track);
+    if (!track) return;
+    // Klik kanan di item yang belum terpilih → selection di-reset ke item itu saja
+    if (!_plSel.has(track.path)) _plClearSelection();
+    const selected = _plSel.has(track.path) ? _plGetSelected() : [track];
+    showContextMenu(e.clientX, e.clientY, track, selected);
   });
 
   playlistList.addEventListener('dragstart', e => {
@@ -4865,16 +4969,44 @@ function _doPlaylistReorder(fromIdx, toIdx) {
 
 
 // ─── CONTEXT MENU ─────────────────────────────────────────────
-function showContextMenu(x, y, track) {
+function showContextMenu(x, y, track, selected) {
   // Remove existing context menus
   closeContextMenu();
 
   const isAudio = !track.is_video;
 
+  // Target convert: selection (kalau >1) atau track yang di-klik kanan
+  const isMulti  = Array.isArray(selected) && selected.length > 1;
+  const targets  = isMulti ? selected : [track];
+  const audioT   = targets.filter(t => t && t.path && !t.is_video);
+  const videoT   = targets.filter(t => t && t.path &&  t.is_video);
+
+  const convertIcon = `
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+      </svg>`;
+  const _convLabel = (n, kind) => !isMulti ? 'Convert'
+    : (audioT.length && videoT.length) ? `Convert ${n} ${kind} Files`
+    : `Convert ${n} Files`;
+  const convertHtml =
+    (audioT.length ? `<div class="ctx-item ctx-convert" data-action="convert-audio">${convertIcon}${_convLabel(audioT.length, 'Audio')}</div>` : '') +
+    (videoT.length ? `<div class="ctx-item ctx-convert" data-action="convert-video">${convertIcon}${_convLabel(videoT.length, 'Video')}</div>` : '');
+
   const menu = document.createElement('div');
   menu.id = 'macan-ctx-menu';
   menu.className = 'macan-ctx-menu';
-  menu.innerHTML = `
+  const multiHtml = `
+    <div class="ctx-label">${selected ? selected.length : 0} FILES SELECTED</div>
+    ${convertHtml}
+    <div class="ctx-separator"></div>
+    <div class="ctx-item ctx-clearsel" data-action="clearsel">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+      Clear Selection
+    </div>`;
+  const singleHtml = `
     <div class="ctx-item ctx-properties" data-action="properties">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
@@ -4912,21 +5044,44 @@ function showContextMenu(x, y, track) {
       Edit Tags / Metadata
     </div>` : ''}
     <div class="ctx-separator"></div>
+    ${convertHtml}
+    <div class="ctx-separator"></div>
     <div class="ctx-item ctx-remove" data-action="remove">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
       </svg>
       Remove from Queue
     </div>`;
+  menu.innerHTML = isMulti ? multiHtml : singleHtml;
 
   document.body.appendChild(menu);
 
-  // Position — keep within viewport
-  const menuW = 200, menuH = isAudio ? 160 : 110;
-  const left = Math.min(x, window.innerWidth - menuW - 8);
-  const top  = Math.min(y, window.innerHeight - menuH - 8);
+  // Position — keep within viewport (ukuran asli menu, karena tinggi tergantung item)
+  const mr = menu.getBoundingClientRect();
+  const left = Math.max(8, Math.min(x, window.innerWidth  - mr.width  - 8));
+  const top  = Math.max(8, Math.min(y, window.innerHeight - mr.height - 8));
   menu.style.left = left + 'px';
   menu.style.top  = top  + 'px';
+
+  const _convA = menu.querySelector('[data-action="convert-audio"]');
+  const _convV = menu.querySelector('[data-action="convert-video"]');
+  if (_convA) _convA.addEventListener('click', () => { sendToConverter(audioT, 'audio'); closeContextMenu(); });
+  if (_convV) _convV.addEventListener('click', () => { sendToConverter(videoT, 'video'); closeContextMenu(); });
+
+  if (isMulti) {
+    menu.querySelector('[data-action="clearsel"]').addEventListener('click', () => {
+      _plClearSelection();
+      closeContextMenu();
+    });
+    menu.addEventListener('contextmenu', e => e.preventDefault());
+    setTimeout(() => { document.addEventListener('click', closeContextMenu, { once: true }); }, 0);
+    setTimeout(() => {
+      document.addEventListener('contextmenu', e => {
+        if (!menu.contains(e.target)) closeContextMenu();
+      }, { once: true });
+    }, 150);
+    return;
+  }
 
   menu.querySelector('[data-action="properties"]').addEventListener('click', () => {
     showFileProperties(track);
