@@ -806,6 +806,31 @@ async function _addFiles() {
   _renderFileList();
 }
 
+// ─── LOAD FILES DARI LUAR (context menu playlist → Convert) ────────────────────
+// script.js mengirim { files: [path], mode: 'audio' | 'video' }.
+// Kalau mode sama dengan tab aktif, file ditambahkan; kalau beda, pindah tab dulu.
+function converterLoadFiles(files, mode) {
+  if (!Array.isArray(files) || !files.length) return;
+  if (mode && mode !== ConverterState.mode) _switchMode(mode); // _switchMode juga me-reset list
+
+  files.forEach(path => {
+    const name = path.split(/[\\/]/).pop();
+    if (!ConverterState.files.find(f => f.path === path)) {
+      ConverterState.files.push({ path, name, status: 'READY', progress: 0, cssClass: '' });
+    }
+  });
+  _renderFileList();
+  openConverter();
+}
+window.converterLoadFiles = converterLoadFiles;
+
+window.addEventListener('macan:converter-load', e => {
+  const d = (e && e.detail) || window.__macanConverterInbox;
+  if (!d) return;
+  window.__macanConverterInbox = null;
+  converterLoadFiles(d.files, d.mode);
+});
+
 // ─── GATHER OPTIONS ───────────────────────────────────────────────────────────
 
 function _gatherOptions() {
