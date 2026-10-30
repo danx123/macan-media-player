@@ -850,6 +850,12 @@ class MacanMediaAPI:
         # One shared pool, created once here, is reused for every scan.
         self._scan_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='ScanPool')
         self._load_settings()
+        # OOM FIX: DB lama menyimpan cover_art base64 ukuran penuh per track.
+        # Sudah di-strip saat load; tulis ulang sekali + VACUUM supaya file DB mengecil.
+        self._cover_thumb_none = set()
+        if getattr(self, '_legacy_art_stripped', False):
+            self._vacuum_after_save = True
+            self._save_playlist()
         app_data = self._get_app_data()
         self._art_cache   = AlbumArtCache(app_data)
         self._lyric_cache = LyricCache(app_data)
@@ -1469,7 +1475,9 @@ class MacanMediaAPI:
     # ─── PLAYLIST MANAGEMENT ─────────────────────────────────────────────────
 
     def get_playlist(self):
-        return self.playlist
+        """OOM FIX: kirim playlist TANPA cover_art (base64 ukuran penuh).
+        Thumbnail kecil diambil lazy per-baris lewat get_cover_thumb()."""
+        return [{**t, 'cover_art': None} for t in self.playlist]
 
     def add_tracks(self, file_paths):
         """Accept list of file path strings, build track metadata in parallel,
@@ -1493,7 +1501,7 @@ class MacanMediaAPI:
                 known.add(abs_path)   # prevent dupes within this batch too
 
         if not candidates:
-            return self.playlist
+            return self.get_playlist()
 
         # Parallel metadata scan — skip heavy cover_art/video_thumb at this stage.
         # Reuses the shared self._scan_pool (built once in __init__) instead of
@@ -1517,7 +1525,7 @@ class MacanMediaAPI:
                 self.playlist.append(track)
 
         self._save_playlist()
-        return self.playlist
+        return self.get_playlist()
 
     def add_tracks_stream(self, file_paths):
         """Streaming variant of add_tracks: scans in parallel and pushes batches
@@ -1664,13 +1672,9 @@ class MacanMediaAPI:
 
         # Cover art: only use what's already in the in-memory cache (from
         # previous sessions); do NOT call get_cover_art() which does disk I/O
+        # OOM FIX: cover art tidak dikirim di payload track; thumbnail kecil
+        # di-lazy-load JS lewat get_cover_thumb().
         cover_art = None
-        if not is_video:
-            try:
-                if artist:
-                    cover_art = self._art_cache.get_cached(artist, display_name)
-            except Exception:
-                pass
 
         replaygain_db = 0.0
         if not is_video:
@@ -1713,15 +1717,9 @@ class MacanMediaAPI:
         """Called from JS when cover art is fetched asynchronously (online fallback
         or first-time fetch). Persists art back into playlist.json so restarts
         and clear+reload cycles don't lose it."""
-        updated = False
-        for track in self.playlist:
-            if track.get('path') == path:
-                track['cover_art'] = cover_art
-                updated = True
-                break
-        if updated:
-            self._save_playlist()
-        return updated
+        # OOM FIX: sengaja no-op. Menyimpan cover art penuh ke tabel playlist
+        # membuat DB + payload get_playlist() membengkak (ratusan MB).
+        return True
 
     def update_track_video_thumb(self, path, video_thumb):
         """Video thumbnails are persisted by VideoThumbCache (SQLite + .jpg on
@@ -1819,6 +1817,99 @@ class MacanMediaAPI:
             print(f"[Metadata] Error reading art for {path}: {e}")
 
         return None
+
+    # ─── LIST THUMBNAILS (kecil, di-cache ke disk) ──────────────────────────
+    _COVER_THUMB_PX = 96
+
+    def _extract_cover_bytes(self, path):
+        """Ambil bytes cover art mentah dari tag file (tanpa base64)."""
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in ('.m4a', '.mp4'):
+                f = MP4(path)
+                if 'covr' in f and f['covr']:
+                    return bytes(f['covr'][0])
+            elif ext == '.mp3':
+                f = ID3(path)
+                for tag in f.values():
+                    if hasattr(tag, 'data') and tag.data and 'APIC' in tag.HashKey:
+                        return bytes(tag.data)
+            elif ext == '.flac':
+                f = FLAC(path)
+                if f.pictures:
+                    return bytes(f.pictures[0].data)
+            else:
+                f = mutagen.File(path)
+                if f and hasattr(f, 'pictures') and f.pictures:
+                    return bytes(f.pictures[0].data)
+        except Exception as e:
+            print(f"[Thumb] extract error {path}: {e}")
+        return None
+
+    def _downscale_cover(self, data):
+        """Kecilkan ke ~96px JPEG (beberapa KB). None kalau gagal."""
+        px = self._COVER_THUMB_PX
+        if PIL_AVAILABLE:
+            try:
+                img = Image.open(BytesIO(data))
+                img.draft('RGB', (px * 2, px * 2))   # JPEG: decode langsung kecil, hemat RAM
+                img = img.convert('RGB')
+                img.thumbnail((px, px))
+                out = BytesIO()
+                img.save(out, 'JPEG', quality=72, optimize=True)
+                return out.getvalue()
+            except Exception as e:
+                print(f"[Thumb] downscale error: {e}")
+                return None
+        # Tanpa PIL: hanya pakai apa adanya kalau memang sudah kecil.
+        return data if len(data) <= 40000 else None
+
+    def get_cover_thumb(self, path, force=False):
+        """Thumbnail kecil (data-URI ~3-8 KB) untuk baris playlist.
+        Dicache di disk (CoverThumbs/) -> restore ratusan track tidak
+        mendecode / mengirim cover penuh lagi."""
+        path = str(path)
+        if force:
+            self._cover_thumb_none.discard(path)
+        elif path in self._cover_thumb_none:
+            return None
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        try:
+            sig = f"{path}|{int(st.st_mtime)}|{st.st_size}"
+            h = hashlib.md5(sig.encode('utf-8', 'ignore')).hexdigest()
+            d = os.path.join(self._get_app_data(), 'CoverThumbs')
+            os.makedirs(d, exist_ok=True)
+            jpg = os.path.join(d, h + '.jpg')
+            if os.path.exists(jpg):
+                with open(jpg, 'rb') as f:
+                    return 'data:image/jpeg;base64,' + base64.b64encode(f.read()).decode()
+
+            data = self._extract_cover_bytes(path)
+            if not data:
+                # fallback: cache art online dari sesi sebelumnya (file di disk)
+                track = next((t for t in self.playlist if t.get('path') == path), None)
+                if track and track.get('artist'):
+                    cached = self._art_cache.get_cached(track['artist'], track.get('name') or '')
+                    if cached and ',' in cached:
+                        data = base64.b64decode(cached.split(',', 1)[1])
+            if not data:
+                self._cover_thumb_none.add(path)
+                return None
+
+            small = self._downscale_cover(data)
+            del data
+            if not small:
+                self._cover_thumb_none.add(path)
+                return None
+            with open(jpg, 'wb') as f:
+                f.write(small)
+            return 'data:image/jpeg;base64,' + base64.b64encode(small).decode()
+        except Exception as e:
+            print(f"[Thumb] get_cover_thumb error {path}: {e}")
+            return None
 
     def get_video_preview(self, path, time_sec):
         """API called from JS when hovering video seekbar.
@@ -2971,25 +3062,8 @@ class MacanMediaAPI:
         except Exception:
             file_size = 0
 
-        # Pre-fetch cover art for audio files
-        # Priority: 1) embedded tags  2) SQLite online art cache (from previous sessions)
+        # OOM FIX: cover art penuh tidak lagi disertakan di data track.
         cover_art = None
-        if not is_video:
-            try:
-                cover_art = self.get_cover_art(abs_path)
-            except Exception:
-                cover_art = None
-            # If no embedded art, check the local SQLite art cache populated by
-            # previous online fetches — this survives clear+reload cycles
-            if not cover_art:
-                try:
-                    meta_for_cache = meta  # already read above
-                    artist = meta_for_cache.get('artist') or ''
-                    title  = meta_for_cache.get('title')  or p.stem
-                    if artist:
-                        cover_art = self._art_cache.get_cached(artist, title)
-                except Exception:
-                    cover_art = None
 
         # Pre-generate thumbnail for video files (cached in memory)
         video_thumb = None
@@ -3491,6 +3565,12 @@ class MacanMediaAPI:
                     "SELECT data FROM playlist ORDER BY pos"
                 ).fetchall()
             self.playlist = [json.loads(r[0]) for r in rows]
+            # OOM FIX: jangan simpan cover_art penuh di memori / DB.
+            self._legacy_art_stripped = False
+            for _t in self.playlist:
+                if _t.get('cover_art'):
+                    _t['cover_art'] = None
+                    self._legacy_art_stripped = True
         except Exception as e:
             print(f"[MACAN] Load playlist from DB error: {e}")
             self.playlist = []
@@ -3572,13 +3652,21 @@ class MacanMediaAPI:
                 conn.executemany(
                     "INSERT INTO playlist(pos,data) VALUES(?,?)",
                     [(pos, json.dumps(
-                        {k: v for k, v in track.items() if k != 'video_thumb'},
+                        {k: v for k, v in track.items() if k not in ('video_thumb', 'cover_art')},
                         ensure_ascii=False))
                      for pos, track in enumerate(snapshot)]
                 )
                 conn.commit()
         except Exception as e:
             print(f"[MACAN] Save playlist error: {e}")
+        if getattr(self, '_vacuum_after_save', False):
+            self._vacuum_after_save = False
+            try:
+                _c = self._db_connect()
+                _c.execute("VACUUM")
+                _c.close()
+            except Exception as e:
+                print(f"[MACAN] VACUUM error (non-fatal): {e}")
 
 
 def _register_aumid_for_smtc():
