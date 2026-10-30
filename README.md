@@ -1,6 +1,6 @@
 # 🐯 Macan Media Player
 
-![Version](https://img.shields.io/badge/version-11.6.6-E8FF00?style=flat-square)
+![Version](https://img.shields.io/badge/version-11.6.7-E8FF00?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
 ![Rust](https://img.shields.io/badge/native%20engine-Rust-orange?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
