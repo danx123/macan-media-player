@@ -78,22 +78,9 @@ const thumbCache      = new Map();  // path → dataUrl
 const videoThumbCache = new Map();  // path → dataUrl
 
 // Debounced per-path persist — avoids hammering Python on rapid fetches
-const _persistDebounce = new Map();
-function _persistArtToServer(path, dataUrl, isVideo) {
-  if (!pw() || !dataUrl) return;
-  // Video thumbs are already persisted by Python's VideoThumbCache (disk).
-  // Sending the base64 back over the bridge only made Python rewrite the
-  // whole playlist table per thumbnail -- a major source of post-add lag.
-  if (isVideo) return;
-  clearTimeout(_persistDebounce.get(path));
-  _persistDebounce.set(path, setTimeout(() => {
-    _persistDebounce.delete(path);
-    const fn = isVideo
-      ? pywebview.api.update_track_video_thumb(path, dataUrl)
-      : pywebview.api.update_track_art(path, dataUrl);
-    fn.catch(() => {});
-  }, 1000));
-}
+// OOM FIX: art tidak lagi dikirim balik ke Python / disimpan di tabel playlist.
+// (Thumbnail list di-cache di disk oleh Python lewat get_cover_thumb().)
+function _persistArtToServer() { /* no-op */ }
 
 // Same idea, for lazily-resolved video durations (see onMeta()) — backfills
 // the DB when a video whose duration mutagen couldn't read during the fast
@@ -224,20 +211,13 @@ async function _fetchLazyThumb(placeholder) {
       }
     } else {
       // Audio: check memory cache → embedded tags → online fallback
+      // OOM FIX: hanya thumbnail kecil (~96px). Cover penuh TIDAK disimpan
+      // di track.cover_art -- itu hanya dimuat untuk track yang sedang diputar.
       dataUrl = thumbCache.get(path) || null;
       if (!dataUrl) {
-        dataUrl = await pywebview.api.get_cover_art(path);
+        dataUrl = await pywebview.api.get_cover_thumb(path);
       }
-      if (dataUrl) {
-        thumbCache.set(path, dataUrl);
-        const track = idx >= 0 ? S.playlist[idx] : null;
-        if (track) {
-          const wasNew = !track.cover_art;
-          track.cover_art = dataUrl;
-          if (idx === S.currentIndex) applyArt(dataUrl);
-          if (wasNew) _persistArtToServer(path, dataUrl, false);
-        }
-      }
+      if (dataUrl) thumbCache.set(path, dataUrl);
     }
 
     if (!dataUrl) return;
@@ -1154,29 +1134,32 @@ btnPlaylistManager.addEventListener('click', () => {
 // ─── ONLINE ART CALLBACK (called from Python via evaluate_js) ─────────────
 window.onOnlineArtReady = function(path, dataUrl) {
   if (!dataUrl) return;
-  thumbCache.set(path, dataUrl);
-
-  const idx = S.playlist.findIndex(t => t.path === path);
-  if (idx >= 0) {
-    const wasNew = !S.playlist[idx].cover_art;
-    S.playlist[idx].cover_art = dataUrl;
-    // FIX: placeholder is a <div>, not <img>
-    const item = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
-    if (item) {
-      const placeholder = item.querySelector('.pl-thumb-placeholder');
-      if (placeholder) {
-        const img = document.createElement('img');
-        img.className = 'pl-thumb';
-        img.src = dataUrl; img.alt = ''; img.draggable = false; img.loading = 'lazy';
-        placeholder.replaceWith(img);
-      }
-    }
-    if (wasNew) _persistArtToServer(path, dataUrl, false);
-  }
+  // Art penuh hanya untuk track yang sedang diputar; baris list pakai thumbnail kecil.
   if (S.currentIndex >= 0 && S.playlist[S.currentIndex]?.path === path) {
     applyArt(dataUrl);
   }
+  _refreshRowThumb(path);
 };
+
+// Ambil thumbnail kecil dari Python lalu tukar placeholder baris (kalau terlihat).
+async function _refreshRowThumb(path) {
+  if (!pw()) return;
+  try {
+    const t = await pywebview.api.get_cover_thumb(path, true);
+    if (!t) return;
+    thumbCache.set(path, t);
+    const idx = S.playlist.findIndex(x => x.path === path);
+    if (idx < 0) return;
+    const item = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
+    const ph = item && item.querySelector('.pl-thumb-placeholder');
+    if (ph) {
+      const img = document.createElement('img');
+      img.className = 'pl-thumb';
+      img.src = t; img.alt = ''; img.draggable = false; img.loading = 'lazy';
+      ph.replaceWith(img);
+    }
+  } catch (_) {}
+}
 
 // ─── VIDEO THUMBNAIL CALLBACK (called from Python via evaluate_js) ────────
 // get_video_thumbnail() no longer blocks the JS<->Python bridge: on a cache
@@ -3975,6 +3958,7 @@ function updateTrackInfo(track) {
   updateMediaSession(track, track.cover_art || null);
 }
 
+let _fullArtHolder = null; // satu-satunya track yang boleh memegang cover penuh
 function applyArt(src) {
   albumArt.src = src;
   albumArt.onload = () => {
@@ -4002,8 +3986,10 @@ function applyArt(src) {
   if (S.currentIndex >= 0 && S.playlist[S.currentIndex]) {
     const track = S.playlist[S.currentIndex];
     const wasNew = !track.cover_art;
+    // OOM FIX: lepas art penuh milik track sebelumnya -- hanya track aktif yang menyimpannya.
+    if (_fullArtHolder && _fullArtHolder !== track) _fullArtHolder.cover_art = null;
+    _fullArtHolder = track;
     track.cover_art = src;
-    thumbCache.set(track.path, src);
 
     // Update Wrapped art cache
     if (window.MacanWrapped) MacanWrapped.updateTrackArt(track, src);
@@ -4011,16 +3997,8 @@ function applyArt(src) {
     // Update SMTC with newly received cover art
     updateMediaSession(track, src);
     // FIX: placeholder is a <div class="pl-thumb-placeholder">, not an img
-    const activeItem = playlistList.querySelector(`.pl-item[data-index="${S.currentIndex}"]`);
-    if (activeItem) {
-      const placeholder = activeItem.querySelector('.pl-thumb-placeholder');
-      if (placeholder) {
-        const img = document.createElement('img');
-        img.className = 'pl-thumb';
-        img.src = src; img.alt = ''; img.draggable = false; img.loading = 'lazy';
-        placeholder.replaceWith(img);
-      }
-    }
+    // OOM FIX: baris list pakai thumbnail kecil, bukan `src` penuh.
+    if (!track.is_video && !thumbCache.has(track.path)) _refreshRowThumb(track.path);
     // Persist newly-fetched art to Python so clear+reload and restarts keep it
     if (wasNew) {
       _persistArtToServer(track.path, src, false);
@@ -4712,13 +4690,10 @@ function _buildPlaylistItem(track, realIdx) {
         </div>`;
     }
   } else {
-    if (!track.cover_art && thumbCache.has(track.path))
-      track.cover_art = thumbCache.get(track.path);
-    if (track.cover_art && !thumbCache.has(track.path))
-      thumbCache.set(track.path, track.cover_art);
-
-    if (track.cover_art) {
-      thumbHtml = `<img class="pl-thumb" src="${track.cover_art}" alt="" loading="lazy" draggable="false">`;
+    // OOM FIX: baris list hanya memakai thumbnail kecil dari thumbCache.
+    const _rowThumb = thumbCache.get(track.path);
+    if (_rowThumb) {
+      thumbHtml = `<img class="pl-thumb" src="${_rowThumb}" alt="" loading="lazy" draggable="false">`;
     } else {
       // Lazy placeholder — observer will fetch when visible
       thumbHtml = `
@@ -4915,8 +4890,8 @@ function renderPlaylist() {
   // Build all items into a DocumentFragment — single DOM insertion,
   // eliminates per-item reflow that caused jank with 100+ tracks.
   const frag = document.createDocumentFragment();
-  list.forEach((track) => {
-    const realIdx = S.playlist.indexOf(track);
+  list.forEach((track, i) => {
+    const realIdx = filterQ ? S.playlist.indexOf(track) : i;
     frag.appendChild(_buildPlaylistItem(track, realIdx));
   });
 
