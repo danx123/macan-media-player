@@ -15,8 +15,8 @@
 
   // ── App metadata ────────────────────────────────────────────
   // Increment APP_VERSION with each release.
-  const APP_VERSION   = '11.6.7';
-  const APP_BUILD     = 'build.2026.10';
+  const APP_VERSION   = '11.7.0';
+  const APP_BUILD     = 'build.2026.11';
   const REPO_URL      = 'https://github.com/danx123/macan-media-player';
   const VERSION_JSON  = 'https://raw.githubusercontent.com/danx123/macan-media-player/main/version.json';
 
