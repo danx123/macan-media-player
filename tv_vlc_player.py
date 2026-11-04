@@ -14,6 +14,15 @@
 # window to draw into, which is what lets it play streams/codecs that
 # the browser's <video> element rejects.
 #
+# CHANNEL LOGOS: every channel row shows its `tvg-logo` artwork. Logos are
+# downloaded lazily (only for rows that are on screen), cached on disk next
+# to the channel DB (…/MacanMediaPlayer/logos) and shown in the list and in
+# the top bar for the channel that is playing.
+#
+# COUNTRY CATEGORIES: "Github (Global)" now loads iptv-org's
+# index.country.m3u, and the channel panel gets a country dropdown so the
+# huge global list can be narrowed down to one country.
+#
 # Usage:
 #   python tv_vlc_player.py [--source URL] [--db PATH]
 # ═══════════════════════════════════════════════════════════════
@@ -29,6 +38,9 @@ import argparse
 import datetime
 import subprocess
 import random
+import queue
+import threading
+from collections import OrderedDict
 from urllib.parse import urlparse
 
 # ── libvlc.dll next to this script (Windows) ──────────────────────────────
@@ -46,8 +58,10 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QLineEdit, QLabel, QSlider, QComboBox,
     QFileDialog, QMenu, QMessageBox, QFrame, QTabWidget, QSizePolicy
 )
-from PySide6.QtCore import Qt, QTimer, QSettings, Signal, Slot, QObject, QSize
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont
+from PySide6.QtCore import Qt, QTimer, QSettings, Signal, Slot, QObject, QSize, QPoint
+from PySide6.QtGui import (
+    QColor, QCursor, QDesktopServices, QFont, QIcon, QPixmap, QPainter, QImageReader
+)
 from PySide6.QtCore import QUrl
 
 
@@ -56,7 +70,7 @@ from PySide6.QtCore import QUrl
 # ═══════════════════════════════════════════════════════════════
 TV_SOURCES = {
     "Github (ID)":       "https://iptv-org.github.io/iptv/countries/id.m3u",
-    "Github (Global)":   "https://iptv-org.github.io/iptv/index.m3u",
+    "Github (Global)":   "https://iptv-org.github.io/iptv/index.country.m3u",   # grouped by country
     "Vizio TV":          "https://www.apsattv.com/vizio.m3u",
     "Local Now":         "https://www.apsattv.com/localnow.m3u",
     "LG Channels":       "https://www.apsattv.com/lg.m3u",
@@ -69,6 +83,12 @@ TV_SOURCES = {
     "TCL TV Plus":       "https://www.apsattv.com/tclplus.m3u",
 }
 DEFAULT_SOURCE = list(TV_SOURCES.values())[0]
+
+# The global list used to be the flat index.m3u (no country info). If an older
+# version saved it as the last-used source, or a launcher still passes it via
+# --source, transparently switch to the country-grouped playlist.
+GLOBAL_SOURCE_URL = TV_SOURCES["Github (Global)"]
+_LEGACY_SOURCES = {"https://iptv-org.github.io/iptv/index.m3u": GLOBAL_SOURCE_URL}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -97,9 +117,21 @@ class TvChannelCache:
                     source_key  TEXT NOT NULL,
                     name        TEXT NOT NULL,
                     url         TEXT NOT NULL,
+                    logo        TEXT NOT NULL DEFAULT '',
+                    grp         TEXT NOT NULL DEFAULT '',
                     fetched_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
                 )
             """)
+            # Migrate databases created by older versions (no logo / group
+            # columns): their cached rows carry no artwork or country info,
+            # so drop them and let every source re-download once.
+            cols = {r[1] for r in conn.execute(f"PRAGMA table_info({self._TABLE})")}
+            if "logo" not in cols or "grp" not in cols:
+                conn.execute(f"DELETE FROM {self._TABLE}")
+                if "logo" not in cols:
+                    conn.execute(f"ALTER TABLE {self._TABLE} ADD COLUMN logo TEXT NOT NULL DEFAULT ''")
+                if "grp" not in cols:
+                    conn.execute(f"ALTER TABLE {self._TABLE} ADD COLUMN grp TEXT NOT NULL DEFAULT ''")
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self._TABLE}_key ON {self._TABLE}(source_key)")
 
     def is_empty(self, source_url: str) -> bool:
@@ -112,16 +144,20 @@ class TvChannelCache:
         key = self._key(source_url)
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT name, url FROM {self._TABLE} WHERE source_key=? ORDER BY name", (key,)
+                f"SELECT name, url, logo, grp FROM {self._TABLE} "
+                f"WHERE source_key=? ORDER BY name COLLATE NOCASE", (key,)
             ).fetchall()
-        return [{"name": r["name"], "url": r["url"]} for r in rows]
+        return [{"name": r["name"], "url": r["url"], "logo": r["logo"], "group": r["grp"]}
+                for r in rows]
 
     def save(self, source_url: str, channels: list):
         key = self._key(source_url)
-        rows = [(key, c["name"], c["url"]) for c in channels if c.get("name") and c.get("url")]
+        rows = [(key, c["name"], c["url"], c.get("logo", ""), c.get("group", ""))
+                for c in channels if c.get("name") and c.get("url")]
         with self._connect() as conn:
             conn.execute(f"DELETE FROM {self._TABLE} WHERE source_key=?", (key,))
-            conn.executemany(f"INSERT INTO {self._TABLE}(source_key,name,url) VALUES(?,?,?)", rows)
+            conn.executemany(
+                f"INSERT INTO {self._TABLE}(source_key,name,url,logo,grp) VALUES(?,?,?,?,?)", rows)
 
     def invalidate(self, source_url: str):
         key = self._key(source_url)
@@ -129,19 +165,54 @@ class TvChannelCache:
             conn.execute(f"DELETE FROM {self._TABLE} WHERE source_key=?", (key,))
 
 
+_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+# Flag emoji are pairs of regional-indicator symbols; Windows renders them as
+# plain letters ("ID"), so strip them from group names.
+_FLAG_RE = re.compile('[\U0001F1E6-\U0001F1FF]')
+
+
+def _split_extinf(line: str):
+    """Split '#EXTINF:-1 key="v" key2="v2",Channel Name' into (attributes, name).
+    Only a comma OUTSIDE double quotes separates the attributes from the name,
+    so URLs / titles that contain commas don't truncate the channel name."""
+    in_q = False
+    for i, ch in enumerate(line):
+        if ch == '"':
+            in_q = not in_q
+        elif ch == ',' and not in_q:
+            return line[:i], line[i + 1:].strip()
+    return line, ''
+
+
+def _clean_group(raw: str) -> str:
+    raw = (raw or '').split(';')[0]
+    return _FLAG_RE.sub('', raw).strip()
+
+
 def parse_m3u_content(content: str):
-    """Same parsing rule as radio-tv.js parseM3U() / Macan Vision parse_m3u_content()."""
+    """Same parsing rule as radio-tv.js parseM3U() / Macan Vision parse_m3u_content(),
+    now also reading `tvg-logo` (channel artwork) and `group-title`
+    (country for iptv-org's index.country.m3u, category for most other lists)."""
     channels = []
     lines = content.strip().split('\n')
     for i, line in enumerate(lines):
         line = line.strip()
         if line.startswith('#EXTINF:'):
             try:
-                name = line.split(',')[-1].strip()
+                head, name = _split_extinf(line)
                 if i + 1 < len(lines) and lines[i + 1].strip().startswith(('http', 'rtsp', 'rtmp')):
                     url = lines[i + 1].strip()
                     if name and url:
-                        channels.append({'name': name, 'url': url})
+                        attrs = dict(_ATTR_RE.findall(head))
+                        logo = attrs.get('tvg-logo', '').strip()
+                        if not logo.lower().startswith(('http://', 'https://')):
+                            logo = ''
+                        channels.append({
+                            'name': name,
+                            'url': url,
+                            'logo': logo,
+                            'group': _clean_group(attrs.get('group-title', '')),
+                        })
             except IndexError:
                 continue
     return channels
@@ -177,18 +248,173 @@ class _FetchThread(QObject):
 
 
 # ═══════════════════════════════════════════════════════════════
+# CHANNEL LOGOS — lazy download + disk cache + in-memory LRU
+# ═══════════════════════════════════════════════════════════════
+LOGO_SIZE = QSize(44, 28)          # logical size of a logo chip in the list
+_LOGO_DPR = 2                      # rendered at 2x so it stays sharp on HiDPI
+_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+
+class LogoManager(QObject):
+    """Fetches channel logos on demand.
+
+    The global playlist has 10k+ channels, so logos are NEVER downloaded
+    up-front: the channel list asks for a logo only when its row is (almost)
+    on screen. Downloads run on a few daemon threads (newest request first,
+    so what you are looking at wins over what you scrolled past), are saved
+    to `cache_dir`, and are decoded on the GUI thread.
+    """
+    logoReady = Signal(str)            # emitted (GUI thread) when a logo is on disk
+    _fetched  = Signal(str, bool)      # worker thread -> GUI thread
+
+    def __init__(self, cache_dir: str, workers: int = 6, mem_limit: int = 1500):
+        super().__init__()
+        self._dir = cache_dir
+        os.makedirs(self._dir, exist_ok=True)
+        self._mem = OrderedDict()      # url -> QPixmap (tile, ready to show)
+        self._mem_limit = mem_limit
+        self._pending = set()
+        self._failed = set()
+        self._placeholders = {}
+        self._queue = queue.LifoQueue()
+        self._fetched.connect(self._on_fetched)
+        for _ in range(workers):
+            threading.Thread(target=self._worker, daemon=True).start()
+
+    # ── public API ───────────────────────────────────────────────────
+    def pixmap(self, url: str):
+        """Return the logo tile for `url`, or None if it isn't available yet
+        (a download is then queued and `logoReady` fires when it lands)."""
+        pm = self._mem.get(url)
+        if pm is not None:
+            self._mem.move_to_end(url)
+            return pm
+        if url in self._failed or url in self._pending:
+            return None
+        path = self._path(url)
+        if os.path.exists(path):
+            pm = self._decode(path)
+            if pm is None:
+                self._failed.add(url)
+                return None
+            self._mem[url] = pm
+            if len(self._mem) > self._mem_limit:
+                self._mem.popitem(last=False)
+            return pm
+        self._pending.add(url)
+        self._queue.put(url)
+        return None
+
+    def placeholder_icon(self, name: str) -> QIcon:
+        """Neutral tile with the channel's first letter, shown until (or
+        instead of) a real logo."""
+        letter = next((c for c in (name or '').strip() if c.isalnum()), '?').upper()
+        icon = self._placeholders.get(letter)
+        if icon is None:
+            icon = QIcon(self._tile(None, letter))
+            self._placeholders[letter] = icon
+        return icon
+
+    # ── internals ────────────────────────────────────────────────────
+    def _path(self, url: str) -> str:
+        return os.path.join(self._dir, hashlib.sha1(url.encode()).hexdigest() + '.img')
+
+    def _worker(self):
+        while True:
+            url = self._queue.get()
+            ok = False
+            try:
+                path = self._path(url)
+                if os.path.exists(path):
+                    ok = True
+                else:
+                    r = requests.get(url, timeout=8, headers=_HTTP_HEADERS)
+                    r.raise_for_status()
+                    data = r.content
+                    if data and len(data) <= 3_000_000:
+                        tmp = f"{path}.{threading.get_ident()}.part"
+                        with open(tmp, 'wb') as f:
+                            f.write(data)
+                        os.replace(tmp, path)
+                        ok = True
+            except Exception:
+                ok = False
+            self._fetched.emit(url, ok)
+
+    @Slot(str, bool)
+    def _on_fetched(self, url: str, ok: bool):
+        self._pending.discard(url)
+        if ok:
+            self.logoReady.emit(url)
+        else:
+            self._failed.add(url)
+
+    def _decode(self, path: str):
+        try:
+            reader = QImageReader(path)
+            reader.setDecideFormatFromContent(True)
+            size = reader.size()
+            if size.isValid() and (size.width() > 512 or size.height() > 512):
+                size.scale(512, 512, Qt.KeepAspectRatio)
+                reader.setScaledSize(size)
+            img = reader.read()
+            if img.isNull():
+                return None
+            return self._tile(QPixmap.fromImage(img), '')
+        except Exception:
+            return None
+
+    def _tile(self, pm, letter: str) -> QPixmap:
+        """Draw a logo (or a letter placeholder) onto a rounded chip. Logos get
+        a light background because most station logos are made for white."""
+        w, h = LOGO_SIZE.width() * _LOGO_DPR, LOGO_SIZE.height() * _LOGO_DPR
+        canvas = QPixmap(w, h)
+        canvas.fill(Qt.transparent)
+        p = QPainter(canvas)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.setPen(Qt.NoPen)
+        radius = 4 * _LOGO_DPR
+        if pm is not None:
+            p.setBrush(QColor(245, 245, 245))
+            p.drawRoundedRect(0, 0, w, h, radius, radius)
+            pad = 3 * _LOGO_DPR
+            scaled = pm.scaled(w - 2 * pad, h - 2 * pad, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            p.drawPixmap((w - scaled.width()) // 2, (h - scaled.height()) // 2, scaled)
+        else:
+            p.setBrush(QColor(255, 255, 255, 22))
+            p.drawRoundedRect(0, 0, w, h, radius, radius)
+            f = QFont()
+            f.setBold(True)
+            f.setPixelSize(14 * _LOGO_DPR)
+            p.setFont(f)
+            p.setPen(QColor(150, 150, 150))
+            p.drawText(canvas.rect(), Qt.AlignCenter, letter)
+        p.end()
+        canvas.setDevicePixelRatio(_LOGO_DPR)
+        return canvas
+
+
+# ═══════════════════════════════════════════════════════════════
 # CHANNEL SWITCHER OVERLAY (right-side slide-in panel, autohide)
 # Mirrors radio-tv.js's #tv-ch-switcher behaviour.
 # ═══════════════════════════════════════════════════════════════
+_HAS_LOGO = int(Qt.UserRole) + 1    # item flag: real logo already applied
+_OTHER_GROUP = "Other"
+
+
 class ChannelSwitcher(QFrame):
     channelChosen = Signal(dict)
     favToggled    = Signal(str)
 
-    def __init__(self, parent, favorites_getter):
+    def __init__(self, parent, favorites_getter, logos: LogoManager):
         super().__init__(parent)
         self._favorites_getter = favorites_getter
-        self._all_channels = []
+        self._logos = logos
+        self._all_channels = []        # de-duplicated by stream URL
         self._query = ''
+        self._group = None             # None = every country / category
+        self._group_kind = 'category'  # 'country' for the global list
         self.setObjectName("chSwitcher")
         self.setFixedWidth(300)
         self.setStyleSheet("""
@@ -201,11 +427,22 @@ class ChannelSwitcher(QFrame):
                 border: 1px solid rgba(255,255,255,0.1);
                 border-radius: 4px; color: #eee; padding: 6px 8px;
             }
+            QComboBox {
+                background-color: rgba(255,255,255,0.06);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 4px; color: #eee; padding: 5px 8px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #141414; color: #ddd;
+                border: 1px solid rgba(255,255,255,0.15);
+                selection-background-color: rgba(232,255,0,0.16);
+                selection-color: #E8FF00;
+            }
             QListWidget {
                 background: transparent; border: none; color: #ddd;
                 font-size: 12px;
             }
-            QListWidget::item { padding: 7px 6px; border-radius: 3px; }
+            QListWidget::item { padding: 5px 6px; border-radius: 3px; }
             QListWidget::item:selected { background-color: rgba(232,255,0,0.16); color: #E8FF00; }
             QTabBar::tab { padding: 5px 10px; color: #aaa; }
             QTabBar::tab:selected { color: #E8FF00; }
@@ -230,6 +467,15 @@ class ChannelSwitcher(QFrame):
         self.search.textChanged.connect(self._on_search)
         v.addWidget(self.search)
 
+        # Country (global list) / category (other lists) filter. NoFocus so the
+        # ← → keys keep switching channels instead of changing this selection.
+        self.group_combo = QComboBox()
+        self.group_combo.setFocusPolicy(Qt.NoFocus)
+        self.group_combo.setMaxVisibleItems(18)
+        self.group_combo.currentIndexChanged.connect(self._on_group_changed)
+        self.group_combo.hide()
+        v.addWidget(self.group_combo)
+
         self.tabs = QTabWidget()
         self.list_all = QListWidget()
         self.list_fav = QListWidget()
@@ -237,47 +483,150 @@ class ChannelSwitcher(QFrame):
         self.tabs.addTab(self.list_fav, "★ Favorites")
         v.addWidget(self.tabs, 1)
 
+        # Logos are fetched only for rows near the viewport; this timer
+        # debounces scroll / tab / render / logo-arrived events.
+        self._logo_timer = QTimer(self)
+        self._logo_timer.setSingleShot(True)
+        self._logo_timer.setInterval(100)
+        self._logo_timer.timeout.connect(self._refresh_visible_logos)
+        self._logos.logoReady.connect(self._schedule_logo_refresh)
+
         for lw in (self.list_all, self.list_fav):
+            lw.setIconSize(LOGO_SIZE)
+            lw.setUniformItemSizes(True)
             lw.itemDoubleClicked.connect(self._on_item_activated)
             lw.setContextMenuPolicy(Qt.CustomContextMenu)
             lw.customContextMenuRequested.connect(lambda pos, w=lw: self._ctx_menu(w, pos))
+            lw.verticalScrollBar().valueChanged.connect(self._schedule_logo_refresh)
+        self.tabs.currentChanged.connect(self._schedule_logo_refresh)
 
         hint = QLabel("Double-click to play · Right-click to favorite\n← → switch channel · Esc close")
         hint.setStyleSheet("color:#555; font-size:9px;")
         hint.setWordWrap(True)
         v.addWidget(hint)
 
-    def set_channels(self, channels):
-        self._all_channels = channels
+    # ── data ──────────────────────────────────────────────────────────
+    def set_channels(self, channels, group_kind='category'):
+        """`group_kind` is 'country' for the global playlist, otherwise
+        'category'; it only changes the wording of the dropdown."""
+        seen, unique = set(), []
+        for c in channels:             # a channel can be listed under several countries
+            if c['url'] not in seen:
+                seen.add(c['url'])
+                unique.append(c)
+        self._all_channels = unique
+        self._group_kind = group_kind
+        self._rebuild_groups()
+        self._render()
+
+    @staticmethod
+    def _group_of(ch):
+        g = (ch.get('group') or '').strip()
+        return _OTHER_GROUP if (not g or g.lower() == 'undefined') else g
+
+    def _rebuild_groups(self):
+        counts = {}
+        for c in self._all_channels:
+            g = self._group_of(c)
+            counts[g] = counts.get(g, 0) + 1
+        names = sorted((g for g in counts if g != _OTHER_GROUP), key=str.lower)
+        if _OTHER_GROUP in counts:
+            names.append(_OTHER_GROUP)
+
+        prev = self._group
+        all_label = "All countries" if self._group_kind == 'country' else "All categories"
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItem(f"{all_label} ({len(self._all_channels)})", None)
+        for g in names:
+            self.group_combo.addItem(f"{g} ({counts[g]})", g)
+        idx = self.group_combo.findData(prev) if prev else 0
+        if idx < 0:
+            idx = 0
+        self.group_combo.setCurrentIndex(idx)
+        self._group = self.group_combo.itemData(idx)
+        self.group_combo.blockSignals(False)
+        # A single group (or none at all) means there is nothing to filter by.
+        self.group_combo.setVisible(len(names) > 1)
+        if len(names) <= 1:
+            self._group = None
+
+    def _on_group_changed(self, _idx):
+        self._group = self.group_combo.currentData()
         self._render()
 
     def _on_search(self, text):
         self._query = text.lower()
         self._render()
 
+    def _make_item(self, text, ch, fav):
+        item = QListWidgetItem(text)
+        item.setData(Qt.UserRole, ch)
+        item.setIcon(self._logos.placeholder_icon(ch['name']))
+        if fav:
+            item.setForeground(QColor("#FFD700"))
+        return item
+
     def _render(self):
         favs = self._favorites_getter()
         q = self._query
-        filtered = [c for c in self._all_channels if q in c['name'].lower()] if q else self._all_channels
-        self.count_lbl.setText(f"{len(filtered)}/{len(self._all_channels)}")
+        pool = self._all_channels
+        if self._group is not None:
+            pool = [c for c in pool if self._group_of(c) == self._group]
+        filtered = [c for c in pool if q in c['name'].lower()] if q else pool
+        self.count_lbl.setText(f"{len(filtered)}/{len(pool)}")
 
+        self.list_all.setUpdatesEnabled(False)
         self.list_all.clear()
         for idx, ch in enumerate(filtered, 1):
             star = "★ " if ch['name'] in favs else ""
-            item = QListWidgetItem(f"{idx:>3}. {star}{ch['name']}")
-            item.setData(Qt.UserRole, ch)
-            if ch['name'] in favs:
-                item.setForeground(QColor("#FFD700"))
-            self.list_all.addItem(item)
+            self.list_all.addItem(self._make_item(f"{idx:>3}. {star}{ch['name']}", ch, ch['name'] in favs))
+        self.list_all.setUpdatesEnabled(True)
 
         self.list_fav.clear()
         fav_channels = [c for c in filtered if c['name'] in favs]
         for idx, ch in enumerate(fav_channels, 1):
-            item = QListWidgetItem(f"{idx:>3}. ★ {ch['name']}")
-            item.setData(Qt.UserRole, ch)
-            item.setForeground(QColor("#FFD700"))
-            self.list_fav.addItem(item)
+            self.list_fav.addItem(self._make_item(f"{idx:>3}. ★ {ch['name']}", ch, True))
 
+        self._schedule_logo_refresh()
+
+    # ── logos ─────────────────────────────────────────────────────────
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._schedule_logo_refresh()
+
+    def _schedule_logo_refresh(self, *_):
+        self._logo_timer.start()
+
+    def _refresh_visible_logos(self):
+        """Apply logos to the rows on screen (plus a small margin each way)."""
+        if not self.isVisible():
+            return
+        lw = self.list_fav if self.tabs.currentIndex() == 1 else self.list_all
+        n = lw.count()
+        if n == 0:
+            return
+        first = lw.indexAt(QPoint(8, 2)).row()
+        last = lw.indexAt(QPoint(8, max(2, lw.viewport().height() - 2))).row()
+        if first < 0:
+            first = 0
+        if last < first:
+            last = min(n - 1, first + 25)
+        first = max(0, first - 8)
+        last = min(n - 1, last + 12)
+        for r in range(first, last + 1):
+            item = lw.item(r)
+            if item.data(_HAS_LOGO):
+                continue
+            url = (item.data(Qt.UserRole) or {}).get('logo')
+            if not url:
+                continue
+            pm = self._logos.pixmap(url)
+            if pm is not None:
+                item.setIcon(QIcon(pm))
+                item.setData(_HAS_LOGO, True)
+
+    # ── interaction ───────────────────────────────────────────────────
     def _on_item_activated(self, item):
         ch = item.data(Qt.UserRole)
         if ch:
@@ -320,10 +669,12 @@ class TvVlcWindow(QWidget):
 
         self.settings = QSettings("MacanAngkasa", "MacanTvPlayer")
         self.cache = TvChannelCache(db_path)
+        self.logos = LogoManager(os.path.join(os.path.dirname(db_path), "logos"))
 
         self.channels = []
         self.current_channel = None
         self.current_source = initial_source or self.settings.value("last_source", DEFAULT_SOURCE)
+        self.current_source = _LEGACY_SOURCES.get(self.current_source, self.current_source)
         self._favorites = set(self.settings.value("favorites", []) or [])
         self._switcher_visible = False
         self._hide_timer = QTimer(self)
@@ -349,7 +700,7 @@ class TvVlcWindow(QWidget):
         root.setSpacing(0)
         root.addWidget(self.video_frame, 1)
 
-        self.switcher = ChannelSwitcher(self, lambda: self._favorites)
+        self.switcher = ChannelSwitcher(self, lambda: self._favorites, self.logos)
         self.switcher.channelChosen.connect(self._play_channel)
         self.switcher.favToggled.connect(self._toggle_favorite)
         self.switcher.hide()
@@ -360,6 +711,13 @@ class TvVlcWindow(QWidget):
         self.top_bar.setStyleSheet("background: rgba(0,0,0,150);")
         tb = QHBoxLayout(self.top_bar)
         tb.setContentsMargins(16, 8, 16, 8)
+
+        # logo of the channel that is playing (hidden until one with artwork plays)
+        self.logo_lbl = QLabel()
+        self.logo_lbl.setFixedSize(LOGO_SIZE)
+        self.logo_lbl.setStyleSheet("background: transparent;")
+        self.logo_lbl.hide()
+        self.logos.logoReady.connect(self._refresh_now_logo)
 
         self.title_lbl = QLabel("— SELECT A CHANNEL —")
         self.title_lbl.setStyleSheet("color:#fff; font-size:13px; font-weight:600; letter-spacing:1px;")
@@ -390,8 +748,9 @@ class TvVlcWindow(QWidget):
         self.btn_close.setStyleSheet("QPushButton{color:#ff2d55;} QPushButton:hover{background:#ff2d55; color:#fff;}")
         self.btn_close.clicked.connect(self.close)
 
-        for w in (self.title_lbl,):
-            tb.addWidget(w)
+        tb.addWidget(self.logo_lbl)
+        tb.addSpacing(8)
+        tb.addWidget(self.title_lbl)
         tb.addStretch()
         tb.addWidget(self.source_combo)
         tb.addWidget(self.btn_m3u)
@@ -624,7 +983,7 @@ class TvVlcWindow(QWidget):
         channels = parse_m3u_content(resp.text)
         if not channels:
             raise ValueError("No valid channels found in this source.")
-        channels.sort(key=lambda c: c['name'])
+        channels.sort(key=lambda c: c['name'].lower())
         return channels
 
     @Slot(object)
@@ -635,7 +994,8 @@ class TvVlcWindow(QWidget):
         self.channels = channels
         if persist:
             self.cache.save(url, channels)
-        self.switcher.set_channels(channels)
+        kind = 'country' if url == GLOBAL_SOURCE_URL else 'category'
+        self.switcher.set_channels(channels, kind)
         self.title_lbl.setText(f"{len(channels)} CHANNELS LOADED — move mouse to browse")
 
     def _on_fetch_error(self, msg):
@@ -652,9 +1012,9 @@ class TvVlcWindow(QWidget):
             if not channels:
                 QMessageBox.warning(self, "M3U", "No valid channels found in this file.")
                 return
-            channels.sort(key=lambda c: c['name'])
+            channels.sort(key=lambda c: c['name'].lower())
             self.channels = channels
-            self.switcher.set_channels(channels)
+            self.switcher.set_channels(channels, 'category')
             self.title_lbl.setText(f"{len(channels)} CHANNELS LOADED (local file)")
         except Exception as e:
             QMessageBox.critical(self, "M3U", f"Failed to read file:\n{e}")
@@ -663,6 +1023,17 @@ class TvVlcWindow(QWidget):
     def _play_channel(self, channel: dict):
         self.current_channel = channel
         self._play_stream(channel.get('url'), channel.get('name'))
+        self._refresh_now_logo()
+
+    def _refresh_now_logo(self, *_):
+        """Show the playing channel's artwork in the top bar (if it has any)."""
+        url = (self.current_channel or {}).get('logo')
+        pm = self.logos.pixmap(url) if url else None
+        if pm is not None:
+            self.logo_lbl.setPixmap(pm)
+            self.logo_lbl.show()
+        else:
+            self.logo_lbl.hide()
 
     def _play_from_url_input(self):
         url = self.url_input.text().strip()
@@ -680,6 +1051,7 @@ class TvVlcWindow(QWidget):
         name = f"{hostname} (Custom)"
         self.current_channel = {'name': name, 'url': url}
         self._play_stream(url, name)
+        self._refresh_now_logo()
         self.url_input.clear()
 
     def _play_stream(self, url, name):
