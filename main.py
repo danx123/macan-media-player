@@ -885,19 +885,19 @@ class MacanMediaAPI:
         #    di preview taskbar Windows) — no-op otomatis di non-Windows.
         self._taskbar_thumbbar = TaskbarThumbBar(window=window, window_title='Macan Media Player')
         self._taskbar_thumbbar.previous_requested.connect(
-            lambda: self._window.evaluate_js('prevTrack()'))
+            lambda: self._window.evaluate_js('extPrevTrack()'))
         self._taskbar_thumbbar.play_pause_requested.connect(
-            lambda: self._window.evaluate_js('togglePlayPause()'))
+            lambda: self._window.evaluate_js('extTogglePlayPause()'))
         self._taskbar_thumbbar.next_requested.connect(
-            lambda: self._window.evaluate_js('nextTrack()'))
+            lambda: self._window.evaluate_js('extNextTrack()'))
 
         # ── Global media hotkeys (system-wide, works even when the window
         #    isn't focused): CTRL+ALT+SPACE=Play/Pause, CTRL+ALT+RIGHT=Next,
         #    CTRL+ALT+LEFT=Previous. No-op automatically on non-Windows.
         self._global_hotkeys = GlobalMediaHotkeys(
-            on_play_pause=lambda: self._window.evaluate_js('togglePlayPause()'),
-            on_next=lambda: self._window.evaluate_js('nextTrack()'),
-            on_previous=lambda: self._window.evaluate_js('prevTrack()'),
+            on_play_pause=lambda: self._window.evaluate_js('extTogglePlayPause()'),
+            on_next=lambda: self._window.evaluate_js('extNextTrack()'),
+            on_previous=lambda: self._window.evaluate_js('extPrevTrack()'),
         )
         self._global_hotkeys.start_and_wait()
 
