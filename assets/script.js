@@ -552,8 +552,15 @@ function _detectMime(dataUrl) {
   return m ? m[1] : 'image/jpeg';
 }
 
+// While an online radio station owns the OS media session (see radio-tv.js),
+// the main player must not overwrite SMTC metadata / state or the taskbar card.
+function _radioOwnsMedia() {
+  return !!(window.RTV && typeof RTV.ownsMedia === 'function' && RTV.ownsMedia());
+}
+
 async function updateMediaSession(track, artSrc) {
   if (!('mediaSession' in navigator)) return;
+  if (_radioOwnsMedia()) return;
 
   const title  = track.name   || '—';
   const artist = track.artist || 'Macan Media Player';
@@ -598,6 +605,7 @@ async function updateMediaSession(track, artSrc) {
 
 function syncMediaSessionState() {
   if (!('mediaSession' in navigator)) return;
+  if (_radioOwnsMedia()) return;
 
   navigator.mediaSession.playbackState = S.isPlaying ? 'playing' : 'paused';
 
@@ -674,6 +682,7 @@ function startSmtcHeartbeat() {
   if (_smtcHeartbeatId) return;
   _smtcHeartbeatId = setInterval(() => {
     if (!('mediaSession' in navigator)) return;
+    if (_radioOwnsMedia()) return;
     const track = S.playlist[S.currentIndex];
     if (!track) return;
     // Re-push full metadata if title has drifted after track switch while minimized
@@ -684,6 +693,40 @@ function startSmtcHeartbeat() {
     syncMediaSessionState();
   }, 5000);
 }
+
+
+// ─── RADIO <-> MAIN PLAYER HAND-OFF ───────────────────────────
+// radio-tv.js calls window.pauseMainPlayer() when a station starts.
+window.pauseMainPlayer = function () {
+  try { const p = activePlayer(); if (p && !p.paused) p.pause(); } catch (_) {}
+};
+
+// Called by radio-tv.js when the radio lets go of the OS media session:
+// re-install the main player's SMTC handlers and re-push the current track
+// to SMTC + taskbar thumbnail (or reset them if nothing is loaded).
+function restoreMainMediaSession() {
+  initMediaSessionHandlers();
+  try { navigator.mediaSession.setActionHandler('stop', null); } catch (_) {}
+  const t = S.playlist[S.currentIndex];
+  if ('mediaSession' in navigator) {
+    if (t) updateMediaSession(t, t.cover_art || null);
+    else { try { navigator.mediaSession.metadata = null; navigator.mediaSession.playbackState = 'none'; } catch (_) {} }
+  }
+  if (pw()) {
+    pywebview.api.notify_play_state(!!S.isPlaying).catch(() => {});
+    pywebview.api.update_taskbar_track(
+      t ? (t.name || '') : 'Macan Media Player',
+      t ? (t.artist || '') : '',
+      t ? (t.cover_art || null) : null
+    ).catch(() => {});
+  }
+}
+
+// External transport (taskbar thumbbar buttons, global hotkeys — see main.py).
+// Routes to the radio while it owns the media session, else to the main player.
+function extTogglePlayPause() { if (_radioOwnsMedia()) RTV.toggleRadio();  else togglePlayPause(); }
+function extPrevTrack()       { if (_radioOwnsMedia()) RTV.prevStation();  else prevTrack(); }
+function extNextTrack()       { if (_radioOwnsMedia()) RTV.nextStation();  else nextTrack(); }
 
 
 // ═══════════════════════════════════════════════════════════════
@@ -4023,6 +4066,9 @@ function applyArt(src) {
 // ─── PLAY STATE ───────────────────────────────────────────────
 function onPlayState(playing) {
   S.isPlaying = playing;
+  // Main player starting takes the media session back from the radio.
+  // (stopRadioStream -> restoreMainMediaSession re-pushes SMTC + taskbar.)
+  if (playing && _radioOwnsMedia()) RTV.onMainPlayerStarted();
   iconPlay.style.display  = playing ? 'none'  : 'block';
   iconPause.style.display = playing ? 'block' : 'none';
   vcIconPlay.style.display  = playing ? 'none'  : 'block';
@@ -4044,7 +4090,7 @@ function onPlayState(playing) {
 
   // Sync taskbar thumbbar play/pause icon (Windows) — no-op kalau bukan
   // di app pywebview / kalau taskbar_thumbbar gagal init di sisi Python.
-  if (pw()) {
+  if (pw() && !_radioOwnsMedia()) {
     pywebview.api.notify_play_state(playing).catch(() => {});
   }
 
