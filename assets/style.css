@@ -1044,7 +1044,7 @@ body {
 
 /* ─── TOOLTIP (volume value) ──────────────────────────────────── */
 /* Only apply generic track style to sliders not explicitly styled */
-input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider)::-webkit-slider-runnable-track {
+input[type=range]:not(#volume-slider):not(.vc-vol-slider):not(.eq-slider):not(.radio-vol-slider)::-webkit-slider-runnable-track {
   height: 3px;
   background: var(--elevated);
   border-radius: 0;
@@ -4836,6 +4836,7 @@ video::cue {
 .radio-ring-2 { inset: 10px; animation: radio-ring-spin 8s linear infinite reverse; }
 @keyframes radio-ring-spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
 .radio-art-icon {
+  overflow: hidden;
   position: relative;
   z-index: 1;
   width: 72px;
@@ -4933,38 +4934,91 @@ video::cue {
   border-color: #E8FF00;
 }
 
-/* Volume */
+/* Volume
+   FIX: the global `input[type=range]::-webkit-slider-runnable-track` rule used to
+   paint a flat track over the slider's own background, so the yellow fill was
+   invisible, the thumb sat at the top edge and the hit-area was only 3px tall.
+   Now the fill is drawn on the track itself via --vol (set from radio-tv.js). */
 .radio-vol-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   width: 100%;
-  max-width: 260px;
+  max-width: 280px;
 }
+.radio-vol-icon {
+  background: none;
+  border: none;
+  padding: 4px;
+  color: rgba(255,255,255,0.55);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  transition: color 0.15s;
+  flex-shrink: 0;
+}
+.radio-vol-icon:hover { color: #E8FF00; }
 .radio-vol-slider {
+  --vol: 80%;
   flex: 1;
-  height: 3px;
+  min-width: 0;
+  height: 20px;               /* generous hit-area */
+  margin: 0;
   -webkit-appearance: none;
   appearance: none;
-  background: rgba(255,255,255,0.1);
-  border-radius: 2px;
+  background: transparent;
   outline: none;
   cursor: pointer;
 }
+.radio-vol-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(to right,
+    #E8FF00 0, #E8FF00 var(--vol),
+    rgba(255,255,255,0.12) var(--vol), rgba(255,255,255,0.12) 100%);
+}
 .radio-vol-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 10px;
-  height: 10px;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;           /* (4px track - 14px thumb) / 2 */
   border-radius: 50%;
   background: #E8FF00;
+  border: none;
   cursor: pointer;
+  box-shadow: 0 0 8px rgba(232,255,0,0.35);
+  transition: transform 0.12s, box-shadow 0.12s;
+}
+.radio-vol-slider:hover::-webkit-slider-thumb,
+.radio-vol-slider:active::-webkit-slider-thumb {
+  transform: scale(1.2);
+  box-shadow: 0 0 12px rgba(232,255,0,0.7);
+}
+.radio-vol-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255,255,255,0.12);
+}
+.radio-vol-slider::-moz-range-progress {
+  height: 4px;
+  border-radius: 2px;
+  background: #E8FF00;
+}
+.radio-vol-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 50%;
+  background: #E8FF00;
 }
 .radio-vol-val {
   font-family: 'Space Mono', monospace;
   font-size: 0.6rem;
-  color: rgba(255,255,255,0.3);
-  width: 24px;
+  color: rgba(255,255,255,0.4);
+  width: 28px;
   text-align: right;
+  flex-shrink: 0;
 }
 
 .radio-divider {
@@ -6934,4 +6988,98 @@ video::cue {
   font-size: 0.65rem;
   letter-spacing: 2px;
   color: var(--text-lo);
+}
+
+
+/* ════════════════════════════════════════════════════════════════
+   RADIO — station artwork + country selector
+   ════════════════════════════════════════════════════════════════ */
+.radio-art-icon img.radio-art-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+  background: #111;
+}
+.radio-art-icon.has-art { border-color: rgba(232,255,0,0.35); }
+
+.radio-country-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 22px 0;
+  flex-shrink: 0;
+}
+.radio-country-row label {
+  font-family: 'Space Mono', monospace;
+  font-size: 0.58rem;
+  letter-spacing: 2px;
+  color: rgba(255,255,255,0.3);
+  flex-shrink: 0;
+}
+.radio-country-select {
+  flex: 1;
+  min-width: 0;
+  background: rgba(255,255,255,0.04) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23E8FF00' stroke-width='1.5'/%3E%3C/svg%3E") no-repeat right 10px center;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 4px;
+  color: rgba(255,255,255,0.85);
+  font-family: 'Space Mono', monospace;
+  font-size: 0.65rem;
+  letter-spacing: 1px;
+  padding: 7px 28px 7px 10px;
+  outline: none;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: border-color 0.15s;
+}
+.radio-country-select:hover,
+.radio-country-select:focus { border-color: rgba(232,255,0,0.4); }
+.radio-country-select option { background: #111; color: #fff; }
+
+/* Station row (flex): idx | art | info | badge | fav | play */
+.rtv-item-art {
+  width: 36px;
+  height: 36px;
+  border-radius: 4px;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: #161616;
+  border: 1px solid rgba(255,255,255,0.08);
+}
+.rtv-item.active .rtv-item-art { border-color: var(--accent); }
+.rtv-item-fav {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.2);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 4px;
+  flex-shrink: 0;
+  transition: color 0.15s, transform 0.15s;
+}
+.rtv-item-fav:hover { color: rgba(232,255,0,0.7); transform: scale(1.15); }
+.rtv-item-fav.is-fav { color: #E8FF00; }
+
+/* generated station tile (no favicon / favicon failed to load) */
+.rtv-art-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, hsl(var(--h) 58% 26%), hsl(calc(var(--h) + 40) 68% 10%));
+  color: #fff;
+  font-family: 'Space Mono', monospace;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.5);
+  user-select: none;
+}
+/* stations lists can hold ~2000 rows: skip layout/paint for off-screen ones */
+.radio-list .rtv-item {
+  content-visibility: auto;
+  contain-intrinsic-size: 0 54px;
 }
