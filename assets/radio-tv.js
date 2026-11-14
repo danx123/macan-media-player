@@ -24,6 +24,10 @@ const RTV = (() => {
   let radioAudio      = null; // HTMLAudioElement for streaming
   let radioShowFavs   = false; // filter: show only favorites
   let radioCountry    = 'ID'; // active country code (ISO 3166-1 alpha-2)
+  let radioPlaying    = false;  // true only while the stream is actually playing (radioActive stays set while paused)
+  let radioPlayToken  = 0;      // guards async callbacks against rapid station switching
+  let radioMuted      = false;
+  let radioArtBlobUrl = null;   // blob: URL handed to SMTC (revoked on change)
 
   let tvChannels      = [];
   let tvCustom        = [];
@@ -196,11 +200,37 @@ const RTV = (() => {
     { code: 'UZ', name: 'Uzbekistan' },
     { code: 'VE', name: 'Venezuela' },
     { code: 'VN', name: 'Vietnam' },
+    { code: 'AL', name: 'Albania' },      { code: 'AM', name: 'Armenia' },
+    { code: 'AZ', name: 'Azerbaijan' },   { code: 'BH', name: 'Bahrain' },
+    { code: 'BO', name: 'Bolivia' },      { code: 'BN', name: 'Brunei' },
+    { code: 'KH', name: 'Cambodia' },     { code: 'CM', name: 'Cameroon' },
+    { code: 'CR', name: 'Costa Rica' },   { code: 'CI', name: "Cote d'Ivoire" },
+    { code: 'CU', name: 'Cuba' },         { code: 'CY', name: 'Cyprus' },
+    { code: 'DO', name: 'Dominican Republic' }, { code: 'EC', name: 'Ecuador' },
+    { code: 'SV', name: 'El Salvador' },  { code: 'EE', name: 'Estonia' },
+    { code: 'ET', name: 'Ethiopia' },     { code: 'GE', name: 'Georgia' },
+    { code: 'GT', name: 'Guatemala' },    { code: 'HK', name: 'Hong Kong' },
+    { code: 'IS', name: 'Iceland' },      { code: 'JM', name: 'Jamaica' },
+    { code: 'KG', name: 'Kyrgyzstan' },   { code: 'LA', name: 'Laos' },
+    { code: 'LV', name: 'Latvia' },       { code: 'LT', name: 'Lithuania' },
+    { code: 'LU', name: 'Luxembourg' },   { code: 'MO', name: 'Macau' },
+    { code: 'MV', name: 'Maldives' },     { code: 'MT', name: 'Malta' },
+    { code: 'MN', name: 'Mongolia' },     { code: 'ME', name: 'Montenegro' },
+    { code: 'MM', name: 'Myanmar' },      { code: 'NP', name: 'Nepal' },
+    { code: 'NI', name: 'Nicaragua' },    { code: 'MK', name: 'North Macedonia' },
+    { code: 'OM', name: 'Oman' },         { code: 'PS', name: 'Palestine' },
+    { code: 'PA', name: 'Panama' },       { code: 'PY', name: 'Paraguay' },
+    { code: 'PR', name: 'Puerto Rico' },  { code: 'SN', name: 'Senegal' },
+    { code: 'SK', name: 'Slovakia' },     { code: 'SI', name: 'Slovenia' },
+    { code: 'LK', name: 'Sri Lanka' },    { code: 'SD', name: 'Sudan' },
+    { code: 'TZ', name: 'Tanzania' },     { code: 'TT', name: 'Trinidad and Tobago' },
+    { code: 'UG', name: 'Uganda' },       { code: 'UY', name: 'Uruguay' },
+    { code: 'YE', name: 'Yemen' },        { code: 'ZW', name: 'Zimbabwe' },
   ];
 
   // ─── Per-country cache key ──────────────────────────────────────
   function _radioCacheKey(code) {
-    return `macan_radio_cache_${code.toUpperCase()}`;
+    return `macan_radio_cache_v2_${code.toUpperCase()}`;
   }
 
   function _loadRadioCountryCache(code) {
@@ -215,7 +245,7 @@ const RTV = (() => {
   function _buildCountrySelect() {
     if (!radioCountrySelect) return;
     radioCountrySelect.innerHTML = '';
-    RADIO_COUNTRIES.forEach(c => {
+    [...RADIO_COUNTRIES].sort((a, b) => a.name.localeCompare(b.name)).forEach(c => {
       const opt = document.createElement('option');
       opt.value = c.code;
       opt.textContent = `${c.name}`;
@@ -293,20 +323,289 @@ const RTV = (() => {
     return a;
   }
 
-  function stopRadioStream() {
-    if (radioAudio) {
-      radioAudio.pause();
-      radioAudio.src = '';
+  // ═══════════════════════════════════════════════════════════════
+  // STATION ARTWORK  (favicon from radio-browser, generated tile as fallback)
+  // ═══════════════════════════════════════════════════════════════
+
+  function _hash(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+    return Math.abs(h);
+  }
+  function _stationHue(name) { return _hash(String(name || '')) % 360; }
+
+  function _hslToHex(h, s, l) {
+    s /= 100; l /= 100;
+    const k = n => (n + h / 30) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+    return '#' + [f(0), f(8), f(4)].map(x => Math.round(x * 255).toString(16).padStart(2, '0')).join('');
+  }
+  function _stationAccent(name) { return _hslToHex(_stationHue(name), 70, 52); }
+
+  function _initials(name) {
+    const words = [...String(name || '').matchAll(/[\p{L}\p{N}]+/gu)].map(m => m[0]);
+    if (!words.length) return '♪';
+    const first = Array.from(words[0])[0];
+    const second = words.length > 1 ? Array.from(words[1])[0] : (Array.from(words[0])[1] || '');
+    return (first + second).toUpperCase();
+  }
+
+  // CSS-only fallback tile for list rows (no canvas cost for thousands of rows)
+  function _fallbackArtEl(name) {
+    const d = document.createElement('div');
+    d.className = 'rtv-item-art rtv-art-fallback';
+    d.style.setProperty('--h', _stationHue(name));
+    d.textContent = _initials(name);
+    return d;
+  }
+
+  const _genArtCache = new Map();
+  function generateStationArt(name, size = 256) {
+    const key = name + '|' + size;
+    if (_genArtCache.has(key)) return _genArtCache.get(key);
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    const h = _stationHue(name);
+    const bg = g.createLinearGradient(0, 0, size, size);
+    bg.addColorStop(0, `hsl(${h},62%,26%)`);
+    bg.addColorStop(1, `hsl(${(h + 40) % 360},70%,9%)`);
+    g.fillStyle = bg; g.fillRect(0, 0, size, size);
+    // broadcast waves
+    g.strokeStyle = 'rgba(255,255,255,0.10)'; g.lineWidth = size * 0.018;
+    for (let i = 1; i <= 4; i++) {
+      g.beginPath(); g.arc(size * 0.5, size * 1.05, size * 0.22 * i, Math.PI * 1.15, Math.PI * 1.85); g.stroke();
     }
+    g.fillStyle = '#fff'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.font = `700 ${size * 0.36}px 'Bebas Neue','Space Mono',sans-serif`;
+    g.shadowColor = 'rgba(0,0,0,0.45)'; g.shadowBlur = size * 0.04;
+    g.fillText(_initials(name), size / 2, size * 0.46);
+    g.shadowBlur = 0;
+    g.fillStyle = 'rgba(255,255,255,0.55)';
+    g.font = `700 ${size * 0.065}px 'Space Mono',monospace`;
+    g.fillText('RADIO', size / 2, size * 0.80);
+    const url = c.toDataURL('image/jpeg', 0.9);
+    _genArtCache.set(key, url);
+    return url;
+  }
+
+  function _loadImage(url, cors) {
+    return new Promise(resolve => {
+      const img = new Image();
+      if (cors) img.crossOrigin = 'anonymous';
+      img.referrerPolicy = 'no-referrer';
+      const t = setTimeout(() => resolve(null), 6000);
+      img.onload  = () => { clearTimeout(t); resolve(img); };
+      img.onerror = () => { clearTimeout(t); resolve(null); };
+      img.src = url;
+    });
+  }
+
+  // Returns { display, dataUrl, remoteUrl, fallback }
+  //   display   → what the modal <img> shows
+  //   dataUrl   → self-contained image (works for SMTC blob + taskbar thumbnail)
+  //   remoteUrl → plain URL when the favicon can be shown but not read back (no CORS)
+  async function resolveStationArt(station) {
+    const fallback = generateStationArt(station.name);
+    const out = { display: fallback, dataUrl: fallback, remoteUrl: null, fallback };
+    if (!station.favicon) return out;
+
+    const img = await _loadImage(station.favicon, true);       // CORS-clean → can rasterise
+    if (img) {
+      try {
+        const S = 256, c = document.createElement('canvas');
+        c.width = c.height = S;
+        const g = c.getContext('2d');
+        const h = _stationHue(station.name);
+        const bg = g.createLinearGradient(0, 0, S, S);
+        bg.addColorStop(0, `hsl(${h},55%,24%)`); bg.addColorStop(1, `hsl(${(h + 40) % 360},65%,10%)`);
+        g.fillStyle = bg; g.fillRect(0, 0, S, S);
+        const big = Math.min(img.naturalWidth, img.naturalHeight) >= 96;
+        const box = S * (big ? 0.78 : 0.56);
+        const plate = box + S * 0.08, px = (S - plate) / 2;
+        g.fillStyle = 'rgba(255,255,255,0.94)';
+        g.beginPath(); g.roundRect(px, px, plate, plate, S * 0.1); g.fill();
+        const r = Math.min(box / img.naturalWidth, box / img.naturalHeight);
+        const w = img.naturalWidth * r, hh = img.naturalHeight * r;
+        g.imageSmoothingQuality = 'high';
+        g.drawImage(img, (S - w) / 2, (S - hh) / 2, w, hh);
+        const url = c.toDataURL('image/jpeg', 0.92);        // throws if tainted
+        out.display = out.dataUrl = url;
+        return out;
+      } catch (_) { /* fall through */ }
+    }
+    const plain = await _loadImage(station.favicon, false);     // visible, but not readable
+    if (plain) { out.display = station.favicon; out.remoteUrl = station.favicon; }
+    return out;
+  }
+
+  function _setPlayerArt(src) {
+    const img  = document.getElementById('radio-art-img');
+    const wrap = document.getElementById('radio-art-icon');
+    const svg  = wrap ? wrap.querySelector('svg') : null;
+    if (!img || !wrap) return;
+    if (src) {
+      img.src = src; img.style.display = '';
+      wrap.classList.add('has-art');
+      if (svg) svg.style.display = 'none';
+    } else {
+      img.removeAttribute('src'); img.style.display = 'none';
+      wrap.classList.remove('has-art');
+      if (svg) svg.style.display = '';
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // SYSTEM INTEGRATION — SMTC (navigator.mediaSession) + taskbar thumbbar
+  // While a radio station is selected (playing OR paused from outside),
+  // RTV "owns" the OS media session. script.js asks via RTV.ownsMedia().
+  // ═══════════════════════════════════════════════════════════════
+
+  function _pwApi() {
+    return (typeof pywebview !== 'undefined' && pywebview.api) ? pywebview.api : null;
+  }
+  function _countryName() {
+    const c = RADIO_COUNTRIES.find(x => x.code === radioCountry);
+    return c ? c.name : radioCountry;
+  }
+  function _stationMeta(st) {
+    return [st.city, st.codec, st.bitrate ? st.bitrate + 'kbps' : ''].filter(Boolean).join(' · ');
+  }
+
+  function _installRadioSessionHandlers() {
+    if (!('mediaSession' in navigator)) return;
+    const ms = navigator.mediaSession;
+    const set = (a, fn) => { try { ms.setActionHandler(a, fn); } catch (_) {} };
+    set('play',          () => { if (radioActive && !radioPlaying) resumeRadio(); });
+    set('pause',         () => { if (radioActive && radioPlaying)  pauseRadio(); });
+    set('stop',          () => stopRadioStream());
+    set('previoustrack', () => radioStep(-1));
+    set('nexttrack',     () => radioStep(+1));
+    // live stream: no seeking
+    set('seekto', null); set('seekbackward', null); set('seekforward', null);
+    try { ms.setPositionState(); } catch (_) {}   // clear any stale scrubber
+  }
+
+  async function _pushRadioMetadata(station, art, token) {
+    if (!('mediaSession' in navigator)) return;
+    let artwork = [];
+    const src = art.remoteUrl || art.dataUrl;
+    if (src && src.startsWith('data:')) {
+      try {
+        const blob = await (await fetch(src)).blob();
+        if (token !== radioPlayToken) return;            // superseded while converting
+        if (radioArtBlobUrl) URL.revokeObjectURL(radioArtBlobUrl);
+        radioArtBlobUrl = URL.createObjectURL(blob);
+        artwork = [{ src: radioArtBlobUrl, sizes: '256x256', type: blob.type || 'image/jpeg' }];
+      } catch (_) {}
+    } else if (src) {
+      artwork = [{ src, sizes: '256x256' }];
+    }
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title:  station.name,
+        artist: _stationMeta(station) || 'Radio Online',
+        album:  'RADIO ONLINE · ' + _countryName(),
+        artwork,
+      });
+      navigator.mediaSession.playbackState = radioPlaying ? 'playing' : 'paused';
+    } catch (e) { console.warn('[RADIO] MediaMetadata error:', e.message); }
+  }
+
+  function _pushTaskbarTrack(station, art) {
+    const api = _pwApi();
+    if (!api) return;
+    const src = (art.dataUrl && art.dataUrl.startsWith('data:')) ? art.dataUrl : (art.remoteUrl || art.fallback);
+    try {
+      api.update_taskbar_track(station.name, _stationMeta(station) || 'RADIO ONLINE', src).catch(() => {});
+      api.update_taskbar_accent(_stationAccent(station.name)).catch(() => {});
+    } catch (_) {}
+  }
+
+  function _pushPlayState(playing) {
+    if ('mediaSession' in navigator) {
+      try { navigator.mediaSession.playbackState = radioActive ? (playing ? 'playing' : 'paused') : 'none'; } catch (_) {}
+    }
+    const api = _pwApi();
+    if (api) { try { api.notify_play_state(!!playing).catch(() => {}); } catch (_) {} }
+  }
+
+  function _setRadioUiPlaying(playing) {
+    if (radioLiveBadge) radioLiveBadge.style.display = playing ? 'inline' : 'none';
+    if (radioVisBars)   radioVisBars.style.display   = playing ? 'flex'   : 'none';
+    if (radioIconPlay)  radioIconPlay.style.display  = playing ? 'none' : '';
+    if (radioIconStop)  radioIconStop.style.display  = playing ? ''     : 'none';
+  }
+
+  function _ensureRadioAudio() {
+    if (radioAudio) return radioAudio;
+    radioAudio = createAudioEl();
+    radioAudio.addEventListener('waiting', () => {
+      if (radioActive && radioPlaying) setStatus(radioStatus, 'BUFFERING...');
+    });
+    radioAudio.addEventListener('playing', () => {
+      if (radioActive) setStatus(radioStatus, '● LIVE — ' + radioActive.name);
+    });
+    radioAudio.addEventListener('error', () => {
+      if (!radioActive || !radioAudio.getAttribute('src')) return;   // ignore our own src reset
+      radioPlaying = false;
+      _setRadioUiPlaying(false);
+      setStatus(radioStatus, 'STREAM ERROR — TRY ANOTHER STATION');
+      _pushPlayState(false);
+    });
+    return radioAudio;
+  }
+
+  function _releaseStream() {
+    if (!radioAudio) return;
+    radioAudio.pause();
+    radioAudio.removeAttribute('src');
+    try { radioAudio.load(); } catch (_) {}
+  }
+
+  function pauseRadio() {
+    if (!radioActive) return;
+    radioPlayToken++;                 // cancel pending play() callbacks
+    _releaseStream();                 // live stream: drop the connection instead of buffering silently
+    radioPlaying = false;
+    _setRadioUiPlaying(false);
+    setStatus(radioStatus, 'PAUSED — ' + radioActive.name);
+    _pushPlayState(false);
+    renderRadioList();
+  }
+
+  function resumeRadio() {
+    if (radioActive) playRadioStation(radioActive, { resume: true });
+  }
+
+  function toggleRadio() {
+    if (radioActive && radioPlaying) pauseRadio();
+    else if (radioActive)            resumeRadio();
+    else if (radioFiltered.length)   playRadioStation(radioFiltered[0]);
+  }
+
+  function radioStep(dir) {
+    if (!radioFiltered.length) return;
+    let idx = radioActive ? radioFiltered.findIndex(s => s.url === radioActive.url) : (dir > 0 ? -1 : 0);
+    idx = (idx + dir + radioFiltered.length) % radioFiltered.length;
+    playRadioStation(radioFiltered[idx]);
+  }
+
+  function stopRadioStream() {
+    radioPlayToken++;
+    _releaseStream();
     radioActive = null;
+    radioPlaying = false;
     // Reset player UI
     radioNowName.textContent = '— SELECT A STATION —';
     radioNowMeta.textContent = 'RADIO ONLINE · MACAN';
     setStatus(radioStatus, 'IDLE');
-    if (radioLiveBadge)  radioLiveBadge.style.display = 'none';
-    if (radioVisBars)    radioVisBars.style.display = 'none';
-    if (radioIconPlay)   radioIconPlay.style.display = '';
-    if (radioIconStop)   radioIconStop.style.display = 'none';
+    _setRadioUiPlaying(false);
+    _setPlayerArt(null);
+    // Give the OS media session (SMTC + taskbar) back to the main player
+    if (radioArtBlobUrl) { URL.revokeObjectURL(radioArtBlobUrl); radioArtBlobUrl = null; }
+    if (typeof window.restoreMainMediaSession === 'function') window.restoreMainMediaSession();
     // Remove active highlight
     radioList.querySelectorAll('.rtv-item.active').forEach(el => el.classList.remove('active'));
     renderRadioList();
@@ -371,13 +670,24 @@ const RTV = (() => {
     showLoading(radioList, 'FETCHING STATIONS FROM RADIO-BROWSER.INFO...');
     setStatus(radioStatus, 'CONNECTING TO RADIO-BROWSER.INFO...');
 
-    const RADIO_API = `https://de2.api.radio-browser.info/json/stations/bycountrycodeexact/${code}`;
+    // Try several radio-browser mirrors; most popular first, broken streams hidden.
+    const MIRRORS = ['de2', 'de1', 'at1', 'nl1'];
+    const QS = '?hidebroken=true&order=votes&reverse=true&limit=2000';
     try {
-      const res = await fetch(RADIO_API);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      let data = null, lastErr = null;
+      for (const m of MIRRORS) {
+        try {
+          const res = await fetch(`https://${m}.api.radio-browser.info/json/stations/bycountrycodeexact/${code}${QS}`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          data = await res.json();
+          break;
+        } catch (e) { lastErr = e; }
+      }
+      if (!data) throw lastErr || new Error('No mirror reachable');
+      if (code !== radioCountry) return;           // user switched country meanwhile
+      const seen = new Set();
       radioStations = data
-        .filter(s => s.url_resolved && s.name)
+        .filter(s => s.url_resolved && s.name && !seen.has(s.url_resolved) && seen.add(s.url_resolved))
         .map(s => ({
           name: s.name.trim(),
           url: s.url_resolved,
@@ -385,8 +695,8 @@ const RTV = (() => {
           tags: s.tags || '',
           codec: s.codec || '',
           bitrate: s.bitrate || 0,
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name));
+          favicon: (s.favicon || '').trim(),
+        }));
 
       _saveRadioCountryCache(code, radioStations);
       mergeAndRenderRadio();
@@ -454,6 +764,7 @@ const RTV = (() => {
 
       item.innerHTML = `
         <div class="rtv-item-idx">${idx + 1}</div>
+        <span class="rtv-art-slot"></span>
         <div class="rtv-item-info">
           <div class="rtv-item-name">${escapeHtml(station.name)}</div>
           ${meta ? `<div class="rtv-item-meta">${escapeHtml(meta)}</div>` : ''}
@@ -467,6 +778,21 @@ const RTV = (() => {
         </button>
         ${station._custom ? `<button class="rtv-item-del" title="Delete">✕</button>` : ''}
       `;
+
+      // station artwork: favicon if we have one, generated initials tile otherwise
+      const slot = item.querySelector('.rtv-art-slot');
+      if (station.favicon) {
+        const img = document.createElement('img');
+        img.className = 'rtv-item-art';
+        img.loading = 'lazy';
+        img.referrerPolicy = 'no-referrer';
+        img.alt = '';
+        img.src = station.favicon;
+        img.addEventListener('error', () => img.replaceWith(_fallbackArtEl(station.name)), { once: true });
+        slot.replaceWith(img);
+      } else {
+        slot.replaceWith(_fallbackArtEl(station.name));
+      }
 
       item.addEventListener('click', (e) => {
         if (e.target.closest('.rtv-item-del')) {
@@ -492,37 +818,67 @@ const RTV = (() => {
     radioList.appendChild(frag);
   }
 
-  function playRadioStation(station) {
-    radioActive = station;
+  function _radioVolume() {
+    return radioVolSlider ? parseInt(radioVolSlider.value) / 100 : loadRadioVol() / 100;
+  }
 
-    // Stop main audio player if playing
+  function playRadioStation(station, opts = {}) {
+    const token = ++radioPlayToken;
+    radioActive = station;
+    radioPlaying = false;
+
+    // Stop main audio player if playing (radio takes over the media session)
     if (typeof window.pauseMainPlayer === 'function') window.pauseMainPlayer();
 
-    if (!radioAudio) radioAudio = createAudioEl();
-
-    radioAudio.pause();
-    radioAudio.src = '';
+    const audio = _ensureRadioAudio();
+    _releaseStream();
     setStatus(radioStatus, 'CONNECTING...');
 
     // Update center player UI
     radioNowName.textContent = station.name;
-    radioNowMeta.textContent = [station.city, station.codec, station.bitrate ? station.bitrate + 'kbps' : ''].filter(Boolean).join(' · ') || '—';
-    if (radioLiveBadge) radioLiveBadge.style.display = 'none';
-    if (radioVisBars)   radioVisBars.style.display = 'none';
-    if (radioIconPlay)  radioIconPlay.style.display = 'none';
-    if (radioIconStop)  radioIconStop.style.display = '';
+    radioNowMeta.textContent = _stationMeta(station) || '—';
+    _setRadioUiPlaying(false);
+    if (radioIconPlay) radioIconPlay.style.display = 'none';   // "connecting": show stop
+    if (radioIconStop) radioIconStop.style.display = '';
 
-    radioAudio.src = station.url;
-    radioAudio.volume = radioVolSlider ? parseInt(radioVolSlider.value) / 100 : loadRadioVol() / 100;
-    if (window.AchievementSystem) AchievementSystem.record('radioPlayed');
-    radioAudio.play().then(() => {
+    // Artwork: show the generated tile instantly, upgrade to the favicon when it resolves
+    const fallbackArt = { display: generateStationArt(station.name), dataUrl: generateStationArt(station.name),
+                          remoteUrl: null, fallback: generateStationArt(station.name) };
+    _setPlayerArt(fallbackArt.display);
+
+    // Claim the OS media session (SMTC + taskbar thumbbar)
+    _installRadioSessionHandlers();
+    _pushRadioMetadata(station, fallbackArt, token);
+    _pushTaskbarTrack(station, fallbackArt);
+
+    if (station.favicon) {
+      resolveStationArt(station).then(art => {
+        if (token !== radioPlayToken || art.display === fallbackArt.display) return;
+        _setPlayerArt(art.display);
+        _pushRadioMetadata(station, art, token);
+        _pushTaskbarTrack(station, art);
+      });
+    }
+
+    audio.src = station.url;
+    audio.muted = radioMuted;
+    audio.volume = _radioVolume();
+    if (window.AchievementSystem && !opts.resume) AchievementSystem.record('radioPlayed');
+    audio.play().then(() => {
+      if (token !== radioPlayToken) return;
+      radioPlaying = true;
       setStatus(radioStatus, '● LIVE — ' + station.name);
-      if (radioLiveBadge) radioLiveBadge.style.display = 'inline';
-      if (radioVisBars)   radioVisBars.style.display = 'flex';
+      _setRadioUiPlaying(true);
+      _pushPlayState(true);
+      const api = _pwApi();
+      if (api && !opts.resume) {
+        try { api.show_now_playing_bubble(station.name, _stationMeta(station) || 'Radio Online', fallbackArt.dataUrl).catch(() => {}); } catch (_) {}
+      }
     }).catch(err => {
+      if (token !== radioPlayToken || err.name === 'AbortError') return;
       setStatus(radioStatus, 'ERROR: ' + err.message);
-      if (radioIconPlay)  radioIconPlay.style.display = '';
-      if (radioIconStop)  radioIconStop.style.display = 'none';
+      _setRadioUiPlaying(false);
+      _pushPlayState(false);
     });
 
     renderRadioList();
@@ -1067,8 +1423,7 @@ const RTV = (() => {
   // ─── Helper: update radio volume slider fill color ──────────────
   function _updateRadioVolFill(val) {
     if (!radioVolSlider) return;
-    const pct = val + '%';
-    radioVolSlider.style.background = `linear-gradient(to right, var(--accent, #E8FF00) 0%, var(--accent, #E8FF00) ${pct}, var(--elevated, rgba(255,255,255,0.1)) ${pct})`;
+    radioVolSlider.style.setProperty('--vol', val + '%');
   }
 
   // ─── Helper: update favorites filter button state ───────────────
@@ -1144,53 +1499,46 @@ const RTV = (() => {
   radioCustomName.addEventListener('keydown', e => { if (e.key === 'Enter') radioCustomUrl.focus(); });
 
   // ── Radio player controls ──────────────────────────────────
-  // Play/Stop toggle button
+  // Play/Stop toggle button: playing -> stop, paused/idle -> (re)start
   if (radioPlayBtn) {
     radioPlayBtn.addEventListener('click', () => {
-      if (radioActive) {
-        stopRadioStream();
-      } else if (radioFiltered.length > 0) {
-        playRadioStation(radioFiltered[0]);
-      }
+      if (radioActive && radioPlaying) stopRadioStream();
+      else toggleRadio();
     });
   }
 
-  // Previous station
-  if (radioPrevBtn) {
-    radioPrevBtn.addEventListener('click', () => {
-      if (!radioFiltered.length) return;
-      let idx = radioActive ? radioFiltered.findIndex(s => s.url === radioActive.url) : 0;
-      idx = (idx - 1 + radioFiltered.length) % radioFiltered.length;
-      playRadioStation(radioFiltered[idx]);
-    });
-  }
-
-  // Next station
-  if (radioNextBtn) {
-    radioNextBtn.addEventListener('click', () => {
-      if (!radioFiltered.length) return;
-      let idx = radioActive ? radioFiltered.findIndex(s => s.url === radioActive.url) : -1;
-      idx = (idx + 1) % radioFiltered.length;
-      playRadioStation(radioFiltered[idx]);
-    });
-  }
+  if (radioPrevBtn) radioPrevBtn.addEventListener('click', () => radioStep(-1));
+  if (radioNextBtn) radioNextBtn.addEventListener('click', () => radioStep(+1));
 
   // Volume slider (radio-specific)
+  const radioVolMute = document.getElementById('radio-vol-mute');
+  function _syncRadioMuteIcon() {
+    const wave = document.getElementById('radio-vol-wave');
+    if (wave) wave.style.display = (radioMuted || (radioVolSlider && +radioVolSlider.value === 0)) ? 'none' : '';
+  }
   if (radioVolSlider) {
     // Restore saved volume
     const savedVol = loadRadioVol();
     radioVolSlider.value = savedVol;
     if (radioVolVal) radioVolVal.textContent = savedVol;
-
-    // Update fill gradient on load
     _updateRadioVolFill(savedVol);
+    _syncRadioMuteIcon();
 
     radioVolSlider.addEventListener('input', () => {
       const val = parseInt(radioVolSlider.value);
+      if (radioMuted && val > 0) { radioMuted = false; if (radioAudio) radioAudio.muted = false; }
       if (radioVolVal) radioVolVal.textContent = val;
       if (radioAudio) radioAudio.volume = val / 100;
       saveRadioVol(val);
       _updateRadioVolFill(val);
+      _syncRadioMuteIcon();
+    });
+  }
+  if (radioVolMute) {
+    radioVolMute.addEventListener('click', () => {
+      radioMuted = !radioMuted;
+      if (radioAudio) radioAudio.muted = radioMuted;
+      _syncRadioMuteIcon();
     });
   }
 
@@ -1312,6 +1660,12 @@ const RTV = (() => {
     openTv,    closeTv,
     stopRadioStream,
     stopTvStream,
+    // media-session hooks (used by script.js for SMTC / taskbar / hotkeys)
+    ownsMedia:   () => !!radioActive,
+    isRadioPlaying: () => radioPlaying,
+    toggleRadio,
+    prevStation: () => radioStep(-1),
+    nextStation: () => radioStep(+1),
     showChannelSwitcher,
     hideChannelSwitcher,
     // Allow main script to inform RTV that main player stopped
