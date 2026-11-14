@@ -582,6 +582,7 @@
           <div class="radio-ring radio-ring-2"></div>
         </div>
         <div class="radio-art-icon" id="radio-art-icon">
+          <img class="radio-art-img" id="radio-art-img" alt="" style="display:none">
           <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#E8FF00" stroke-width="1" opacity="0.5">
             <rect x="3" y="10" width="18" height="11" rx="2"/>
             <path d="M7 10V7a5 5 0 0 1 10 0v3"/>
@@ -621,10 +622,12 @@
 
       <!-- Volume -->
       <div class="radio-vol-row">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" opacity="0.6">
-          <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
-          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
-        </svg>
+        <button class="radio-vol-icon" id="radio-vol-mute" title="Mute / Unmute" type="button">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="11,5 6,9 2,9 2,15 6,15 11,19"/>
+            <path id="radio-vol-wave" d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+          </svg>
+        </button>
         <input type="range" id="radio-vol-slider" class="radio-vol-slider" min="0" max="100" value="80">
         <span class="radio-vol-val" id="radio-vol-val">80</span>
       </div>
@@ -635,6 +638,12 @@
 
     <!-- Station list section -->
     <div class="radio-list-section">
+      <!-- Country selector (populated by radio-tv.js) -->
+      <div class="radio-country-row">
+        <label for="radio-country-select">COUNTRY</label>
+        <select id="radio-country-select" class="radio-country-select"></select>
+      </div>
+
       <!-- Search + actions -->
       <div class="radio-search-row">
         <div class="radio-search-wrap">
