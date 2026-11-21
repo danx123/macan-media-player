@@ -13,6 +13,7 @@ import secrets
 import mimetypes
 import urllib.parse
 import sqlite3
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from io import BytesIO
@@ -853,6 +854,9 @@ class MacanMediaAPI:
         # OOM FIX: DB lama menyimpan cover_art base64 ukuran penuh per track.
         # Sudah di-strip saat load; tulis ulang sekali + VACUUM supaya file DB mengecil.
         self._cover_thumb_none = set()
+        self._cover_thumb_mem = OrderedDict()  # LRU cache path -> data-URI (max 256)
+        self._cover_thumb_mem_lock = threading.Lock()
+        self._cover_thumb_dir = None
         if getattr(self, '_legacy_art_stripped', False):
             self._vacuum_after_save = True
             self._save_playlist()
@@ -1422,6 +1426,11 @@ class MacanMediaAPI:
         def _clear_albumart():
             art_path = os.path.join(app_data, 'AlbumArtCache')
             _rmdir(art_path)
+            _rmdir(os.path.join(app_data, 'CoverThumbs'))
+            self._cover_thumb_dir = None
+            self._cover_thumb_none.clear()
+            with self._cover_thumb_mem_lock:
+                self._cover_thumb_mem.clear()
             # Also wipe the SQLite art_cache table so stale references are gone
             try:
                 with self._db_connect() as conn:
@@ -1475,9 +1484,10 @@ class MacanMediaAPI:
     # ─── PLAYLIST MANAGEMENT ─────────────────────────────────────────────────
 
     def get_playlist(self):
-        """OOM FIX: kirim playlist TANPA cover_art (base64 ukuran penuh).
-        Thumbnail kecil diambil lazy per-baris lewat get_cover_thumb()."""
-        return [{**t, 'cover_art': None} for t in self.playlist]
+        """OOM FIX: kirim playlist TANPA cover_art / video_thumb (base64).
+        Thumbnail kecil diambil lazy per-baris (viewport-only) lewat get_cover_thumb()
+        atau get_video_thumbnail()."""
+        return [{**t, 'cover_art': None, 'video_thumb': None} for t in self.playlist]
 
     def add_tracks(self, file_paths):
         """Accept list of file path strings, build track metadata in parallel,
@@ -1866,13 +1876,21 @@ class MacanMediaAPI:
 
     def get_cover_thumb(self, path, force=False):
         """Thumbnail kecil (data-URI ~3-8 KB) untuk baris playlist.
-        Dicache di disk (CoverThumbs/) -> restore ratusan track tidak
-        mendecode / mengirim cover penuh lagi."""
+        Menggunakan 2-tier cache: in-memory LRU (max 256) + disk (CoverThumbs/)
+        agar scroll bolak-balik & restore cepat tanpa decode berulang."""
         path = str(path)
         if force:
             self._cover_thumb_none.discard(path)
-        elif path in self._cover_thumb_none:
-            return None
+            with self._cover_thumb_mem_lock:
+                self._cover_thumb_mem.pop(path, None)
+        else:
+            if path in self._cover_thumb_none:
+                return None
+            with self._cover_thumb_mem_lock:
+                cached_mem = self._cover_thumb_mem.get(path)
+                if cached_mem is not None:
+                    self._cover_thumb_mem.move_to_end(path)
+                    return cached_mem
         try:
             st = os.stat(path)
         except OSError:
@@ -1880,12 +1898,20 @@ class MacanMediaAPI:
         try:
             sig = f"{path}|{int(st.st_mtime)}|{st.st_size}"
             h = hashlib.md5(sig.encode('utf-8', 'ignore')).hexdigest()
-            d = os.path.join(self._get_app_data(), 'CoverThumbs')
-            os.makedirs(d, exist_ok=True)
+            d = self._cover_thumb_dir
+            if not d:
+                d = os.path.join(self._get_app_data(), 'CoverThumbs')
+                os.makedirs(d, exist_ok=True)
+                self._cover_thumb_dir = d
             jpg = os.path.join(d, h + '.jpg')
             if os.path.exists(jpg):
                 with open(jpg, 'rb') as f:
-                    return 'data:image/jpeg;base64,' + base64.b64encode(f.read()).decode()
+                    uri = 'data:image/jpeg;base64,' + base64.b64encode(f.read()).decode()
+                with self._cover_thumb_mem_lock:
+                    self._cover_thumb_mem[path] = uri
+                    if len(self._cover_thumb_mem) > 256:
+                        self._cover_thumb_mem.popitem(last=False)
+                return uri
 
             data = self._extract_cover_bytes(path)
             if not data:
@@ -1906,7 +1932,12 @@ class MacanMediaAPI:
                 return None
             with open(jpg, 'wb') as f:
                 f.write(small)
-            return 'data:image/jpeg;base64,' + base64.b64encode(small).decode()
+            uri = 'data:image/jpeg;base64,' + base64.b64encode(small).decode()
+            with self._cover_thumb_mem_lock:
+                self._cover_thumb_mem[path] = uri
+                if len(self._cover_thumb_mem) > 256:
+                    self._cover_thumb_mem.popitem(last=False)
+            return uri
         except Exception as e:
             print(f"[Thumb] get_cover_thumb error {path}: {e}")
             return None
@@ -3565,11 +3596,14 @@ class MacanMediaAPI:
                     "SELECT data FROM playlist ORDER BY pos"
                 ).fetchall()
             self.playlist = [json.loads(r[0]) for r in rows]
-            # OOM FIX: jangan simpan cover_art penuh di memori / DB.
+            # OOM FIX: jangan simpan cover_art / video_thumb base64 di memori / DB.
             self._legacy_art_stripped = False
             for _t in self.playlist:
                 if _t.get('cover_art'):
                     _t['cover_art'] = None
+                    self._legacy_art_stripped = True
+                if _t.get('video_thumb'):
+                    _t['video_thumb'] = None
                     self._legacy_art_stripped = True
         except Exception as e:
             print(f"[MACAN] Load playlist from DB error: {e}")
