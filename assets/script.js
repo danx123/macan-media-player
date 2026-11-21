@@ -74,8 +74,19 @@ const S = {
 // _persistArtToServer writes art back to Python playlist.json so
 // it also survives full app restarts.
 // ═══════════════════════════════════════════════════════════════
-const thumbCache      = new Map();  // path → dataUrl
-const videoThumbCache = new Map();  // path → dataUrl
+const thumbCache      = new Map();  // path → dataUrl (bounded LRU)
+const videoThumbCache = new Map();  // path → dataUrl (bounded LRU)
+const _THUMB_CACHE_MAX = 350;
+
+function _thumbCacheSet(map, key, val) {
+  if (!key || !val) return;
+  if (map.has(key)) map.delete(key);
+  map.set(key, val);
+  if (map.size > _THUMB_CACHE_MAX) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+}
 
 // Debounced per-path persist — avoids hammering Python on rapid fetches
 // OOM FIX: art tidak lagi dikirim balik ke Python / disimpan di tabel playlist.
@@ -99,38 +110,26 @@ function _persistDurationToServer(path, duration, durationStr) {
 // S.playlist is replaced so the first render is already cache-warm.
 function _seedThumbCache(tracks) {
   for (const t of tracks) {
-    if (t.cover_art   && !thumbCache.has(t.path))      thumbCache.set(t.path, t.cover_art);
-    if (t.video_thumb && !videoThumbCache.has(t.path)) videoThumbCache.set(t.path, t.video_thumb);
+    if (t.cover_art   && !thumbCache.has(t.path))      _thumbCacheSet(thumbCache, t.path, t.cover_art);
+    if (t.video_thumb && !videoThumbCache.has(t.path)) _thumbCacheSet(videoThumbCache, t.path, t.video_thumb);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// LAZY THUMBNAIL LOADER
-// Uses IntersectionObserver to fetch cover art / video thumbnails
-// only when a playlist row scrolls into (or near) the viewport.
-//
-// How it works:
-//   _buildPlaylistItem() renders a <div class="pl-thumb-placeholder"
-//     data-lazy="audio|video" data-path="..."> for rows without art.
-//   _lazyThumbObserver watches these placeholders with rootMargin 300px
-//   so art is pre-fetched slightly before the row becomes visible.
-//   On intersection → fetch → swap placeholder → <img>, persist to Python.
+// LAZY THUMBNAIL LOADER (VIEWPORT-ONLY + BOUNDED CONCURRENCY)
+// Combined with virtual scrolling (PL_VIRT), only rows actually
+// inside the visible viewport are mounted and observed.
+// A bounded queue (MAX_CONCURRENT_THUMBS = 3) prevents IPC bursts
+// and drops any row that scrolled out of the DOM before dispatch.
 // ═══════════════════════════════════════════════════════════════
 
-// _lazyThumbObserver is initialized lazily on first use so that
-// #playlist-body is guaranteed to exist in the DOM.
 let _lazyThumbObserver = null;
-// el -> pending debounce timeout id. Fast-scrolling past a row means it
-// enters and leaves the 300px margin within a fraction of a second; without
-// debouncing, that alone was enough to fire a get_video_thumbnail/
-// get_cover_art IPC call for every row that flashed past, spiking Python-side
-// CPU for thumbnails nobody actually looked at.
-const _lazyPending = new Map();
+const _lazyPending = new Map();       // placeholder el -> debounce timeout id
+const _thumbQueue  = [];              // FIFO of placeholder els awaiting IPC
+const _thumbQueuedSet = new Set();    // dedup guard for _thumbQueue
+let _thumbInFlight = 0;
+const _MAX_CONCURRENT_THUMBS = 3;
 
-// While a folder/file batch is still being scanned by Python, thumbnail
-// work (get_video_thumbnail / get_cover_art IPC + cv2 decode) is HELD so it
-// doesn't compete with the scan and the playlist render. Held placeholders
-// are collected here and released by _endBulkScan() once the list is complete.
 let _bulkScanning = false;
 const _deferredLazyEls = new Set();
 function _beginBulkScan() { _bulkScanning = true; }
@@ -141,9 +140,55 @@ function _endBulkScan() {
   const obs = _getLazyObserver();
   const els = Array.from(_deferredLazyEls);
   _deferredLazyEls.clear();
-  // Re-observe: IntersectionObserver fires an initial callback with the
-  // current state, so only rows actually near the viewport get fetched.
   for (const el of els) if (el.isConnected) obs.observe(el);
+}
+
+function _cancelLazyThumb(rowOrEl) {
+  if (!rowOrEl) return;
+  const el = rowOrEl.matches?.('.pl-thumb-placeholder[data-lazy]')
+    ? rowOrEl
+    : rowOrEl.querySelector?.('.pl-thumb-placeholder[data-lazy]');
+  if (!el) return;
+  const pending = _lazyPending.get(el);
+  if (pending !== undefined) {
+    clearTimeout(pending);
+    _lazyPending.delete(el);
+  }
+  _deferredLazyEls.delete(el);
+  _thumbQueuedSet.delete(el);
+  if (_lazyThumbObserver) {
+    try { _lazyThumbObserver.unobserve(el); } catch (_) {}
+  }
+}
+
+function _resetLazyThumbs() {
+  for (const tid of _lazyPending.values()) clearTimeout(tid);
+  _lazyPending.clear();
+  _thumbQueue.length = 0;
+  _thumbQueuedSet.clear();
+  _deferredLazyEls.clear();
+  if (_lazyThumbObserver) _lazyThumbObserver.disconnect();
+}
+
+function _enqueueLazyThumb(placeholder) {
+  if (!placeholder || !placeholder.isConnected) return;
+  if (_thumbQueuedSet.has(placeholder)) return;
+  _thumbQueuedSet.add(placeholder);
+  _thumbQueue.push(placeholder);
+  _drainThumbQueue();
+}
+
+function _drainThumbQueue() {
+  while (_thumbInFlight < _MAX_CONCURRENT_THUMBS && _thumbQueue.length > 0) {
+    const el = _thumbQueue.shift();
+    _thumbQueuedSet.delete(el);
+    if (!el || !el.isConnected) continue; // scrolled out of viewport — skip IPC!
+    _thumbInFlight++;
+    _fetchLazyThumb(el).finally(() => {
+      _thumbInFlight--;
+      _drainThumbQueue();
+    });
+  }
 }
 
 function _getLazyObserver() {
@@ -152,17 +197,16 @@ function _getLazyObserver() {
     for (const entry of entries) {
       const el = entry.target;
       if (entry.isIntersecting) {
-        if (_lazyPending.has(el)) continue; // already scheduled, don't double-fire
+        if (_lazyPending.has(el)) continue;
         const timeoutId = setTimeout(() => {
           _lazyPending.delete(el);
-          _lazyThumbObserver.unobserve(el);
-          if (_bulkScanning) { _deferredLazyEls.add(el); return; } // hold until list is complete
-          _fetchLazyThumb(el);
-        }, 180); // 150-200ms grace period before actually fetching
+          if (_lazyThumbObserver) _lazyThumbObserver.unobserve(el);
+          if (!el.isConnected) return;
+          if (_bulkScanning) { _deferredLazyEls.add(el); return; }
+          _enqueueLazyThumb(el);
+        }, 100);
         _lazyPending.set(el, timeoutId);
       } else {
-        // Row left the viewport again before the debounce fired — cancel it,
-        // the IPC call is no longer worth making.
         const pending = _lazyPending.get(el);
         if (pending !== undefined) {
           clearTimeout(pending);
@@ -172,14 +216,14 @@ function _getLazyObserver() {
     }
   }, {
     root:       document.getElementById('playlist-body'),
-    rootMargin: '300px 0px',
+    rootMargin: '80px 0px',
     threshold:  0,
   });
   return _lazyThumbObserver;
 }
 
 async function _fetchLazyThumb(placeholder) {
-  if (!pw()) return;
+  if (!pw() || !placeholder.isConnected) return;
   const path    = placeholder.dataset.path;
   const kind    = placeholder.dataset.lazy;   // 'audio' | 'video'
   const idx     = parseInt(placeholder.closest('.pl-item')?.dataset.index ?? '-1', 10);
@@ -189,20 +233,19 @@ async function _fetchLazyThumb(placeholder) {
     let dataUrl = null;
 
     if (kind === 'video') {
-      // Check in-memory cache first (populated by earlier loads)
       dataUrl = videoThumbCache.get(path) || null;
       if (!dataUrl) {
         dataUrl = await pywebview.api.get_video_thumbnail(path);
       }
       if (dataUrl) {
-        videoThumbCache.set(path, dataUrl);
+        _thumbCacheSet(videoThumbCache, path, dataUrl);
         const track = idx >= 0 ? S.playlist[idx] : null;
         if (track) {
           const wasNew = !track.video_thumb;
           track.video_thumb = dataUrl;
           if (!track.cover_art) {
             track.cover_art = dataUrl;
-            thumbCache.set(path, dataUrl);
+            _thumbCacheSet(thumbCache, path, dataUrl);
             if (idx === S.currentIndex) applyArt(dataUrl);
             if (wasNew) _persistArtToServer(path, dataUrl, true);
           }
@@ -210,21 +253,15 @@ async function _fetchLazyThumb(placeholder) {
         }
       }
     } else {
-      // Audio: check memory cache → embedded tags → online fallback
-      // OOM FIX: hanya thumbnail kecil (~96px). Cover penuh TIDAK disimpan
-      // di track.cover_art -- itu hanya dimuat untuk track yang sedang diputar.
       dataUrl = thumbCache.get(path) || null;
       if (!dataUrl) {
         dataUrl = await pywebview.api.get_cover_thumb(path);
       }
-      if (dataUrl) thumbCache.set(path, dataUrl);
+      if (dataUrl) _thumbCacheSet(thumbCache, path, dataUrl);
     }
 
-    if (!dataUrl) return;
+    if (!dataUrl || !placeholder.isConnected) return;
 
-    // Swap placeholder → img in the DOM (placeholder may be gone if row
-    // was removed while fetch was in-flight — guard with isConnected)
-    if (!placeholder.isConnected) return;
     const img = document.createElement('img');
     img.className  = kind === 'video'
       ? 'pl-thumb pl-thumb-video-img'
@@ -1190,7 +1227,7 @@ async function _refreshRowThumb(path) {
   try {
     const t = await pywebview.api.get_cover_thumb(path, true);
     if (!t) return;
-    thumbCache.set(path, t);
+    _thumbCacheSet(thumbCache, path, t);
     const idx = S.playlist.findIndex(x => x.path === path);
     if (idx < 0) return;
     const item = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
@@ -1214,7 +1251,7 @@ async function _refreshRowThumb(path) {
 // paints the thumbnail in when it lands.
 window.onVideoThumbReady = function(path, dataUrl) {
   if (!dataUrl) return;
-  videoThumbCache.set(path, dataUrl);
+  _thumbCacheSet(videoThumbCache, path, dataUrl);
 
   const idx = S.playlist.findIndex(t => t.path === path);
   if (idx >= 0) {
@@ -1223,7 +1260,7 @@ window.onVideoThumbReady = function(path, dataUrl) {
     track.video_thumb = dataUrl;
     if (!track.cover_art) {
       track.cover_art = dataUrl;
-      thumbCache.set(path, dataUrl);
+      _thumbCacheSet(thumbCache, path, dataUrl);
     }
     // Swap the lazy placeholder -> real <img> if this row is still rendered
     const item = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
@@ -2068,13 +2105,35 @@ async function _doStateRestore() {
       pywebview.api.get_app_state().catch(() => ({}))
     ]);
 
-    // ── 1. Restore playlist ──────────────────────────────────
+    // ── 1. Resolve saved index BEFORE rendering playlist ────
+    // Menentukan index lagu terakhir lebih dulu supaya virtual scroll
+    // langsung melompat ke posisi lagu terakhir & hanya merender/memuat
+    // artwork untuk baris yang terlihat di viewport (tidak memuat dari index 0).
+    let savedIdx = (state && typeof state === 'object' && typeof state.currentIndex === 'number')
+      ? state.currentIndex : -1;
+    const savedPath = (state && typeof state === 'object' && typeof state.currentPath === 'string')
+      ? state.currentPath : '';
+
     if (Array.isArray(saved) && saved.length) {
+      if (savedPath) {
+        if (savedIdx < 0 || savedIdx >= saved.length || saved[savedIdx]?.path !== savedPath) {
+          const foundIdx = saved.findIndex(t => t && t.path === savedPath);
+          if (foundIdx >= 0) savedIdx = foundIdx;
+        }
+      }
+      if (savedIdx < 0 || savedIdx >= saved.length) savedIdx = -1;
+
       S.playlist = saved;
+      if (savedIdx >= 0) S.currentIndex = savedIdx;
       _seedThumbCache(S.playlist);
-      renderPlaylist();
+      renderPlaylist({
+        scrollToIndex: savedIdx >= 0 ? savedIdx : 0,
+        instant: true,
+      });
       _rebuildTotalDuration();
       updatePlaylistMeta();
+    } else {
+      savedIdx = -1;
     }
 
     // ── 2. Restore settings ─────────────────────────────────
@@ -2115,7 +2174,6 @@ async function _doStateRestore() {
       }
 
       // ── 3. Restore last track + seek position ──────────────
-      const savedIdx = typeof state.currentIndex === 'number' ? state.currentIndex : -1;
       const savedPos = typeof state.seekPosition  === 'number' ? state.seekPosition : 0;
 
       if (savedIdx >= 0 && savedIdx < S.playlist.length) {
@@ -2123,7 +2181,7 @@ async function _doStateRestore() {
         const track = S.playlist[savedIdx];
 
         updateTrackInfo(track);
-        updatePlaylistHighlight(savedIdx);
+        updatePlaylistHighlight(savedIdx, { instant: true, force: true });
         applyNormalization(track);
         setStatus(`PAUSED — ${track.name}`);
 
@@ -4402,6 +4460,7 @@ async function persistAppState() {
   try {
     const state = {
       currentIndex:  S.currentIndex,
+      currentPath:   S.currentIndex >= 0 ? (S.playlist[S.currentIndex]?.path || '') : '',
       seekPosition:  S.currentIndex >= 0 ? (activePlayer().currentTime || 0) : 0,
       volume:        S.volume,
       isShuffle:     S.isShuffle,
@@ -4609,7 +4668,15 @@ let _filterTimer = null;
 function filterPlaylist(q) {
   filterQ = q.trim().toLowerCase();
   clearTimeout(_filterTimer);
-  _filterTimer = setTimeout(() => renderPlaylist(), 120); // 120ms debounce
+  _filterTimer = setTimeout(() => {
+    if (!filterQ && S.currentIndex >= 0) {
+      renderPlaylist({ scrollToIndex: S.currentIndex, instant: true });
+    } else {
+      const body = PL_VIRT.getBody();
+      if (body) body.scrollTop = 0;
+      renderPlaylist();
+    }
+  }, 120); // 120ms debounce
 }
 
 // ─── DRAG-AND-DROP STATE ──────────────────────────────────────
@@ -4664,8 +4731,9 @@ function _plToggle(track) {
 }
 
 function _plSelectRange(toTrack) {
-  const rows = [...playlistList.querySelectorAll('.pl-item')];
-  const paths = rows.map(r => (S.playlist[parseInt(r.dataset.index, 10)] || {}).path);
+  const paths = PL_VIRT.entries.length
+    ? PL_VIRT.entries.map(e => e.track.path)
+    : S.playlist.map(t => t.path);
   let a = paths.indexOf(_plAnchorPath);
   const b = paths.indexOf(toTrack.path);
   if (b < 0) return;
@@ -4903,6 +4971,277 @@ function _setupPlaylistDelegation() {
   });
 }
 
+// ═══════════════════════════════════════════════════════════════
+// VIRTUAL SCROLL PLAYLIST ENGINE (VIEWPORT-ONLY RENDERING)
+// Hanya merender baris .pl-item yang terlihat di dalam #playlist-body
+// (+ overscan kecil), sehingga ribuan lagu tetap ringan di DOM &
+// hanya artwork di viewport yang di-fetch.
+// ═══════════════════════════════════════════════════════════════
+const PL_VIRT = {
+  rowH: 66,
+  overscan: 6,
+  entries: [],          // [{ track, realIdx }]
+  start: 0,
+  end: 0,
+  nodes: new Map(),     // realIdx -> HTMLElement
+  pendingScrollIdx: -1, // deferred scroll target saat #playlist-body hidden
+  _inited: false,
+  _rafId: 0,
+  _body: null,
+  _resizeObs: null,
+
+  getBody() {
+    if (!this._body) this._body = document.getElementById('playlist-body');
+    return this._body;
+  },
+
+  init() {
+    if (this._inited) return;
+    const body = this.getBody();
+    if (!body) return;
+    this._inited = true;
+
+    body.addEventListener('scroll', () => {
+      if (this._rafId) return;
+      this._rafId = requestAnimationFrame(() => {
+        this._rafId = 0;
+        this.renderWindow(false);
+      });
+    }, { passive: true });
+
+    if (typeof ResizeObserver !== 'undefined') {
+      this._resizeObs = new ResizeObserver(() => {
+        const h = body.clientHeight;
+        if (h <= 0) return;
+        if (this.pendingScrollIdx >= 0) {
+          const targetIdx = this.pendingScrollIdx;
+          this.pendingScrollIdx = -1;
+          this.scrollTo(targetIdx, { behavior: 'auto', force: true });
+        } else if (this.entries.length > 0) {
+          this.renderWindow(false);
+        }
+      });
+      this._resizeObs.observe(body);
+    }
+  },
+
+  buildEntries() {
+    if (!filterQ) {
+      this.entries = S.playlist.map((track, realIdx) => ({ track, realIdx }));
+    } else {
+      const out = [];
+      for (let i = 0; i < S.playlist.length; i++) {
+        const track = S.playlist[i];
+        if (track && track.name && track.name.toLowerCase().includes(filterQ)) {
+          out.push({ track, realIdx: i });
+        }
+      }
+      this.entries = out;
+    }
+  },
+
+  findVisIndex(realIdx) {
+    if (realIdx < 0) return -1;
+    if (!filterQ) return realIdx < this.entries.length ? realIdx : -1;
+    for (let i = 0; i < this.entries.length; i++) {
+      if (this.entries[i].realIdx === realIdx) return i;
+    }
+    return -1;
+  },
+
+  _calcTargetScrollTop(visIdx, viewportH) {
+    const totalH = this.entries.length * this.rowH;
+    const maxScroll = Math.max(0, totalH - viewportH);
+    const ideal = visIdx * this.rowH - (viewportH - this.rowH) / 2;
+    return Math.max(0, Math.min(maxScroll, Math.round(ideal)));
+  },
+
+  renderWindow(forceReplace = false) {
+    const body = this.getBody();
+    const total = this.entries.length;
+
+    if (!total) {
+      _resetLazyThumbs();
+      this.nodes.clear();
+      this.start = 0;
+      this.end = 0;
+      playlistList.style.paddingTop = '0px';
+      playlistList.style.paddingBottom = '0px';
+      playlistList.replaceChildren();
+      return;
+    }
+
+    const viewportH = (body && body.clientHeight > 0) ? body.clientHeight : 600;
+    const scrollTop = body ? body.scrollTop : 0;
+    const firstVis  = Math.floor(scrollTop / this.rowH);
+    const visCount  = Math.ceil(viewportH / this.rowH);
+
+    const newStart = Math.max(0, firstVis - this.overscan);
+    const newEnd   = Math.min(total, firstVis + visCount + this.overscan);
+
+    const padTop = newStart * this.rowH;
+    const padBot = Math.max(0, (total - newEnd) * this.rowH);
+
+    if (!forceReplace && newStart === this.start && newEnd === this.end) {
+      // Tetap sinkronkan paddingBottom kalau panjang daftar baru berubah
+      playlistList.style.paddingBottom = `${padBot}px`;
+      return;
+    }
+
+    playlistList.style.paddingTop    = `${padTop}px`;
+    playlistList.style.paddingBottom = `${padBot}px`;
+
+    const isDisjoint = forceReplace || this.nodes.size === 0 || newEnd <= this.start || newStart >= this.end;
+
+    if (isDisjoint) {
+      _resetLazyThumbs();
+      this.nodes.clear();
+      const frag = document.createDocumentFragment();
+      for (let i = newStart; i < newEnd; i++) {
+        const { track, realIdx } = this.entries[i];
+        const row = _buildPlaylistItem(track, realIdx);
+        this.nodes.set(realIdx, row);
+        frag.appendChild(row);
+      }
+      playlistList.replaceChildren(frag);
+      this.start = newStart;
+      this.end   = newEnd;
+      _observeLazyThumbs(playlistList);
+      return;
+    }
+
+    // Incremental patch saat scroll — pertahankan node yang masih di viewport
+    // agar thumbnail & hover state tidak berkedip.
+    const oldStart = this.start;
+    const oldEnd   = this.end;
+
+    // 1. Lepas node yang keluar di atas
+    for (let i = oldStart; i < newStart; i++) {
+      const entry = this.entries[i];
+      if (!entry) continue;
+      const node = this.nodes.get(entry.realIdx);
+      if (node) {
+        _cancelLazyThumb(node);
+        node.remove();
+        this.nodes.delete(entry.realIdx);
+      }
+    }
+
+    // 2. Lepas node yang keluar di bawah
+    for (let i = newEnd; i < oldEnd; i++) {
+      const entry = this.entries[i];
+      if (!entry) continue;
+      const node = this.nodes.get(entry.realIdx);
+      if (node) {
+        _cancelLazyThumb(node);
+        node.remove();
+        this.nodes.delete(entry.realIdx);
+      }
+    }
+
+    const newlyAdded = [];
+
+    // 3. Sisipkan node baru di atas
+    if (newStart < oldStart) {
+      const fragTop = document.createDocumentFragment();
+      for (let i = newStart; i < oldStart; i++) {
+        const { track, realIdx } = this.entries[i];
+        const row = _buildPlaylistItem(track, realIdx);
+        this.nodes.set(realIdx, row);
+        fragTop.appendChild(row);
+        newlyAdded.push(row);
+      }
+      playlistList.insertBefore(fragTop, playlistList.firstChild);
+    }
+
+    // 4. Tambahkan node baru di bawah
+    if (newEnd > oldEnd) {
+      const fragBot = document.createDocumentFragment();
+      for (let i = oldEnd; i < newEnd; i++) {
+        const { track, realIdx } = this.entries[i];
+        const row = _buildPlaylistItem(track, realIdx);
+        this.nodes.set(realIdx, row);
+        fragBot.appendChild(row);
+        newlyAdded.push(row);
+      }
+      playlistList.appendChild(fragBot);
+    }
+
+    this.start = newStart;
+    this.end   = newEnd;
+
+    // Observe lazy thumbs hanya untuk baris yang baru masuk viewport
+    if (newlyAdded.length) {
+      const obs = _getLazyObserver();
+      for (const row of newlyAdded) {
+        const ph = row.querySelector('.pl-thumb-placeholder[data-lazy]');
+        if (ph) obs.observe(ph);
+      }
+    }
+  },
+
+  scrollTo(realIdx, { behavior = 'smooth', force = false } = {}) {
+    this.init();
+    const body = this.getBody();
+    if (!body) return;
+    const visIdx = this.findVisIndex(realIdx);
+    if (visIdx < 0) return;
+
+    const viewportH = body.clientHeight;
+    if (viewportH <= 0) {
+      // #playlist-body sedang tersembunyi (mis. mode video aktif) — tunda sampai terlihat
+      this.pendingScrollIdx = realIdx;
+      return;
+    }
+    this.pendingScrollIdx = -1;
+
+    // Jika baris sudah ter-render dan tidak dipaksa center, cek apakah sudah nyaman terlihat
+    const existingRow = this.nodes.get(realIdx);
+    if (!force && existingRow && existingRow.isConnected) {
+      const bodyRect = body.getBoundingClientRect();
+      const rowRect  = existingRow.getBoundingClientRect();
+      const relTop   = rowRect.top - bodyRect.top;
+      const relBot   = rowRect.bottom - bodyRect.top;
+      const margin   = Math.min(90, bodyRect.height * 0.22);
+      if (relTop >= margin && relBot <= bodyRect.height - margin) {
+        return; // sudah berada di area tengah viewport
+      }
+      const targetTop = Math.max(
+        0,
+        body.scrollTop + relTop - (bodyRect.height - rowRect.height) / 2
+      );
+      if (behavior === 'auto') {
+        body.scrollTop = targetTop;
+        this.renderWindow(false);
+      } else {
+        body.scrollTo({ top: targetTop, behavior: 'smooth' });
+      }
+      return;
+    }
+
+    const targetTop = this._calcTargetScrollTop(visIdx, viewportH);
+    if (behavior === 'auto') {
+      body.scrollTop = targetTop;
+      this.renderWindow(true);
+      // Micro-refinement pada frame berikutnya bila tinggi aktual baris sedikit berbeda
+      requestAnimationFrame(() => {
+        const mounted = this.nodes.get(realIdx);
+        if (!mounted || !mounted.isConnected || body.clientHeight <= 0) return;
+        const bRect = body.getBoundingClientRect();
+        const rRect = mounted.getBoundingClientRect();
+        const relTop = rRect.top - bRect.top;
+        const delta = relTop - (bRect.height - rRect.height) / 2;
+        if (Math.abs(delta) > 24) {
+          body.scrollTop = Math.max(0, body.scrollTop + delta);
+          this.renderWindow(false);
+        }
+      });
+    } else {
+      body.scrollTo({ top: targetTop, behavior: 'smooth' });
+    }
+  },
+};
+
 // Register all lazy placeholders in a container with the IntersectionObserver.
 // Call AFTER the container is inserted into the live DOM.
 function _observeLazyThumbs(container) {
@@ -4912,42 +5251,51 @@ function _observeLazyThumbs(container) {
   });
 }
 
-// Append only new rows to the list — used by streaming loader
+// Append only new rows to the virtual list — used by streaming loader
 function _appendPlaylistRows(tracks, startIdx) {
-  const frag = document.createDocumentFragment();
-  tracks.forEach((track, i) => {
-    frag.appendChild(_buildPlaylistItem(track, startIdx + i));
-  });
-  playlistList.appendChild(frag);
-  // Observe after insertion so IntersectionObserver has real layout positions
-  _observeLazyThumbs(playlistList);
+  PL_VIRT.init();
+  for (let i = 0; i < tracks.length; i++) {
+    const track = tracks[i];
+    const realIdx = startIdx + i;
+    if (!filterQ || (track && track.name && track.name.toLowerCase().includes(filterQ))) {
+      PL_VIRT.entries.push({ track, realIdx });
+    }
+  }
+  PL_VIRT.renderWindow(false);
 }
 
-function renderPlaylist() {
-  const list = filterQ
-    ? S.playlist.filter(t => t.name.toLowerCase().includes(filterQ))
-    : S.playlist;
+function renderPlaylist(opts = {}) {
+  PL_VIRT.init();
+  PL_VIRT.buildEntries();
 
-  playlistEmpty.classList.toggle('hidden', list.length > 0);
-
-  // Disconnect existing observations before rebuilding the list
-  _getLazyObserver().disconnect();
-
-  // Build all items into a DocumentFragment — single DOM insertion,
-  // eliminates per-item reflow that caused jank with 100+ tracks.
-  const frag = document.createDocumentFragment();
-  list.forEach((track, i) => {
-    const realIdx = filterQ ? S.playlist.indexOf(track) : i;
-    frag.appendChild(_buildPlaylistItem(track, realIdx));
-  });
-
-  // Single DOM write — replaces the entire list in one operation
-  playlistList.replaceChildren(frag);
-
-  // Observe all lazy placeholders now that they're in the live DOM
-  _observeLazyThumbs(playlistList);
-
+  const total = PL_VIRT.entries.length;
+  playlistEmpty.classList.toggle('hidden', total > 0);
   plCount.textContent = `${S.playlist.length} TRACK${S.playlist.length !== 1 ? 'S' : ''}`;
+
+  if (!total) {
+    PL_VIRT.renderWindow(true);
+    return;
+  }
+
+  const body = PL_VIRT.getBody();
+  if (typeof opts.scrollToIndex === 'number' && opts.scrollToIndex >= 0) {
+    const visIdx = PL_VIRT.findVisIndex(opts.scrollToIndex);
+    if (visIdx >= 0 && body) {
+      const viewportH = body.clientHeight;
+      if (viewportH > 0) {
+        // Set scrollTop SEBELUM mount/observe agar hanya viewport lagu terakhir yang di-render!
+        body.scrollTop = PL_VIRT._calcTargetScrollTop(visIdx, viewportH);
+        PL_VIRT.pendingScrollIdx = -1;
+      } else {
+        PL_VIRT.pendingScrollIdx = opts.scrollToIndex;
+      }
+    }
+  } else if (!opts.preserveScroll && body) {
+    const maxScroll = Math.max(0, total * PL_VIRT.rowH - (body.clientHeight || 600));
+    if (body.scrollTop > maxScroll) body.scrollTop = maxScroll;
+  }
+
+  PL_VIRT.renderWindow(true);
 }
 
 function _dndShowIndicator(refEl, insertAfter) {
@@ -4982,7 +5330,7 @@ function _doPlaylistReorder(fromIdx, toIdx) {
     S.currentIndex++;
   }
 
-  renderPlaylist();
+  renderPlaylist({ preserveScroll: true });
   updatePlaylistMeta();
   if (pw()) pywebview.api.reorder_playlist(fromIdx, insertAt).catch(() => {});
   scheduleStateSave();
@@ -5492,14 +5840,21 @@ async function showInlineTagEditor(track) {
   });
 }
 
-function updatePlaylistHighlight(idx) {
+function updatePlaylistHighlight(idx, opts = {}) {
   if (window.VideoPlaylist) VideoPlaylist.syncActive(idx);
   // Remove active from previous — track via data attribute lookup (O(1))
   const prev = playlistList.querySelector('.pl-item.active');
   if (prev) prev.classList.remove('active');
-  // Add active to new
+  // Add active to new (if currently mounted in viewport)
   const next = playlistList.querySelector(`.pl-item[data-index="${idx}"]`);
   if (next) next.classList.add('active');
+  // Auto-scroll vertical scrollbar agar selalu mengikuti lagu yang sedang diputar
+  if (opts.scroll !== false && idx >= 0) {
+    PL_VIRT.scrollTo(idx, {
+      behavior: opts.instant ? 'auto' : 'smooth',
+      force: !!opts.force,
+    });
+  }
 }
 
 // Cached total duration — updated incrementally to avoid O(n) reduce on every call
