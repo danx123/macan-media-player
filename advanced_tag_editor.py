@@ -1,5 +1,5 @@
 """
-Advanced Tag Editor — Enterprise Edition v4.6.0
+Advanced Tag Editor — Enterprise Edition v4.6.1
 © Macan Angkasa. All Rights Reserved.
 
 New in v4.1.1:
@@ -45,6 +45,21 @@ from mutagen.flac import FLAC, Picture as FLACPicture
 from mutagen.mp4 import MP4, MP4Cover
 
 import subprocess
+import math
+import struct
+import tempfile
+import wave
+
+# Explicit top-level numpy import so Nuitka static analysis bundles numpy.
+# media_engine.decode_audio / detect_bpm use pyo3-numpy (Rust) which panics
+# and force-closes the process if numpy is missing from a Nuitka build!
+try:
+    import numpy as np
+    _ = np.zeros(1, dtype=np.float32)
+    _NUMPY_AVAILABLE = True
+except Exception:
+    np = None
+    _NUMPY_AVAILABLE = False
 
 # media_engine (Rust): native module used for BOTH BPM detection and
 # playback preview (see PlayerEngine below) -- gantiin subprocess
@@ -63,6 +78,93 @@ except ImportError:
 FFMPEG_AVAILABLE = _MEDIA_ENGINE
 
 
+def _detect_bpm_from_wav_pure_python(wav_path, max_seconds=90):
+    """Pure-Python energy-envelope autocorrelation BPM estimator (no numpy).
+    Used as a crash-proof fallback if numpy was excluded from a Nuitka build."""
+    with wave.open(wav_path, 'rb') as wf:
+        n_channels = wf.getnchannels()
+        sampwidth  = wf.getsampwidth()
+        sr         = wf.getframerate()
+        n_frames   = wf.getnframes()
+        if sr <= 0 or n_frames <= 0 or sampwidth != 2:
+            raise RuntimeError("Unsupported WAV format for fallback BPM analysis.")
+
+        max_frames = min(n_frames, int(sr * max_seconds))
+        hop = max(1, int(sr * 0.01))  # 10ms energy frames (~100 Hz)
+        energies = []
+        frames_read = 0
+        chunk_frames = hop * 64
+        scale = 1.0 / (32768.0 * max(1, n_channels))
+
+        while frames_read < max_frames:
+            to_read = min(chunk_frames, max_frames - frames_read)
+            raw = wf.readframes(to_read)
+            if not raw:
+                break
+            total_samples = len(raw) // 2
+            samples = struct.unpack(f'<{total_samples}h', raw)
+            actual_frames = total_samples // n_channels
+            frames_read += actual_frames
+
+            for f_start in range(0, actual_frames, hop):
+                f_end = min(actual_frames, f_start + hop)
+                e = 0.0
+                if n_channels == 1:
+                    for i in range(f_start, f_end):
+                        v = samples[i] * scale
+                        e += v * v
+                else:
+                    for i in range(f_start, f_end):
+                        base = i * n_channels
+                        v = 0.0
+                        for c in range(n_channels):
+                            v += samples[base + c]
+                        v *= scale
+                        e += v * v
+                energies.append(math.sqrt(e / max(1, f_end - f_start)))
+
+    if len(energies) < 200:
+        raise RuntimeError("Audio too short for BPM analysis.")
+
+    # Onset strength (half-wave rectified first difference)
+    onset = [0.0] * len(energies)
+    for i in range(1, len(energies)):
+        d = energies[i] - energies[i - 1]
+        onset[i] = d if d > 0.0 else 0.0
+
+    mean_o = sum(onset) / len(onset)
+    if mean_o < 1e-6:
+        raise RuntimeError("Audio too quiet for BPM analysis.")
+    onset = [v - mean_o for v in onset]
+
+    # Search 60..190 BPM in onset-frame lags
+    fps = sr / float(hop)
+    min_lag = max(1, int(round(fps * 60.0 / 190.0)))
+    max_lag = min(len(onset) // 2, int(round(fps * 60.0 / 60.0)))
+    if min_lag >= max_lag:
+        raise RuntimeError("Audio too short for BPM analysis.")
+
+    n = len(onset)
+    best_lag = min_lag
+    best_score = -1e18
+    for lag in range(min_lag, max_lag + 1):
+        s = 0.0
+        limit = n - lag
+        for i in range(limit):
+            s += onset[i] * onset[i + lag]
+        s /= limit
+        if s > best_score:
+            best_score = s
+            best_lag = lag
+
+    bpm = 60.0 * fps / float(best_lag)
+    while bpm < 70.0:
+        bpm *= 2.0
+    while bpm > 180.0:
+        bpm *= 0.5
+    return round(float(bpm), 1)
+
+
 def _detect_bpm_media_engine(file_path, sample_rate=44100):
     """
     Detect BPM via media_engine: decode full-track PCM in-process
@@ -70,22 +172,71 @@ def _detect_bpm_media_engine(file_path, sample_rate=44100):
     beat tracker used elsewhere in the suite (media_engine.detect_bpm,
     implemented in Rust -- no per-sample Python loop / temp WAV file
     anymore). Returns float BPM or raises RuntimeError.
+
+    Nuitka safety: media_engine.decode_audio / detect_bpm rely on pyo3-numpy
+    which panics in Rust (hard force-close) if numpy is not bundled. We guard
+    with _NUMPY_AVAILABLE and fall back to convert_media -> temp WAV + pure
+    Python autocorrelation if numpy is absent.
     """
+    if not file_path or not os.path.isfile(file_path):
+        raise RuntimeError("Audio file not found.")
     if not _MEDIA_ENGINE:
         raise RuntimeError("media_engine module not found/built.")
+
+    if _NUMPY_AVAILABLE:
+        try:
+            y = media_engine.decode_audio(str(file_path), int(sample_rate))
+        except Exception as e:
+            raise RuntimeError(f"media_engine decode error: {e}")
+        if y is None or len(y) == 0:
+            raise RuntimeError("media_engine could not decode this file (unsupported format?).")
+        try:
+            y_arr = np.ascontiguousarray(y, dtype=np.float32)
+            bpm = media_engine.detect_bpm(y_arr, int(sample_rate))
+        except Exception as e:
+            raise RuntimeError(f"media_engine BPM error: {e}")
+        if not bpm or bpm <= 0:
+            raise RuntimeError("Audio too short or too quiet for BPM analysis.")
+        return round(float(bpm), 1)
+
+    # Fallback path when numpy is unavailable (prevents Rust pyo3-numpy panic)
+    if str(file_path).lower().endswith('.wav'):
+        return _detect_bpm_from_wav_pure_python(str(file_path))
+
+    tmp_fd, tmp_wav = tempfile.mkstemp(prefix='macan_bpm_', suffix='.wav')
+    os.close(tmp_fd)
     try:
-        y = media_engine.decode_audio(file_path, sample_rate)
+        media_engine.convert_media(
+            str(file_path), tmp_wav,
+            video_codec=None, audio_codec='pcm_s16le',
+            drop_video=True, drop_audio=False,
+        )
+        return _detect_bpm_from_wav_pure_python(tmp_wav)
     except Exception as e:
-        raise RuntimeError(f"media_engine decode error: {e}")
-    if y is None or len(y) == 0:
-        raise RuntimeError("media_engine could not decode this file (unsupported format?).")
-    try:
-        bpm = media_engine.detect_bpm(y, sample_rate)
-    except Exception as e:
-        raise RuntimeError(f"media_engine BPM error: {e}")
-    if not bpm or bpm <= 0:
-        raise RuntimeError("Audio too short or too quiet for BPM analysis.")
-    return round(float(bpm), 1)
+        raise RuntimeError(f"BPM fallback error (numpy not bundled): {e}")
+    finally:
+        try:
+            if os.path.exists(tmp_wav):
+                os.remove(tmp_wav)
+        except OSError:
+            pass
+
+
+class BPMWorker(QThread):
+    """Run BPM analysis off the Qt main thread to keep the UI responsive."""
+    finished_bpm = Signal(str, float)   # (file_path, bpm)
+    failed_bpm   = Signal(str, str)     # (file_path, error_msg)
+
+    def __init__(self, file_path, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+
+    def run(self):
+        try:
+            bpm = _detect_bpm_media_engine(self.file_path)
+            self.finished_bpm.emit(self.file_path, bpm)
+        except Exception as e:
+            self.failed_bpm.emit(self.file_path, str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2480,21 +2631,37 @@ class AdvancedTagEditor(QMainWindow):
                                 "Make sure the app was built with the media_engine "
                                 "module included.")
             return
+        if getattr(self, '_bpm_worker', None) is not None and self._bpm_worker.isRunning():
+            return
+        target_path = self.current_file_path
         self.lbl_bpm.setText("Analyzing…")
         self.btn_detect_bpm.setEnabled(False)
+        self.bpm_action.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        QApplication.processEvents()
-        try:
-            bpm = _detect_bpm_media_engine(self.current_file_path)
+
+        worker = BPMWorker(target_path, self)
+        worker.finished_bpm.connect(self._on_bpm_finished)
+        worker.failed_bpm.connect(self._on_bpm_failed)
+        worker.finished.connect(self._on_bpm_done)
+        self._bpm_worker = worker
+        worker.start()
+
+    def _on_bpm_finished(self, file_path, bpm):
+        if file_path == self.current_file_path:
             self.lbl_bpm.setText(f"{bpm:.1f} BPM")
-            self.status_bar.showMessage(f"BPM detected: {bpm:.1f}", 5000)
-            self._log(f"BPM: {os.path.basename(self.current_file_path)} → {bpm:.1f}")
-        except Exception as e:
+        self.status_bar.showMessage(f"BPM detected: {bpm:.1f}", 5000)
+        self._log(f"BPM: {os.path.basename(file_path)} → {bpm:.1f}")
+
+    def _on_bpm_failed(self, file_path, err):
+        if file_path == self.current_file_path:
             self.lbl_bpm.setText("Error")
-            self._log(f"BPM error: {e}")
-        finally:
-            self.btn_detect_bpm.setEnabled(True)
-            QApplication.restoreOverrideCursor()
+        self._log(f"BPM error: {err}")
+
+    def _on_bpm_done(self):
+        self.btn_detect_bpm.setEnabled(bool(self.current_file_path) and FFMPEG_AVAILABLE)
+        self.bpm_action.setEnabled(bool(self.current_file_path) and FFMPEG_AVAILABLE)
+        QApplication.restoreOverrideCursor()
+        self._bpm_worker = None
 
     # ── Processing Queue ─────────────────────
     def add_to_queue(self):
@@ -2745,11 +2912,11 @@ class AdvancedTagEditor(QMainWindow):
         html = """
         <div style="font-family: Arial, sans-serif; line-height: 1.6;">
             <h2 style="color: #2980b9;">Advanced Tag Editor</h2>
-            <b>Enterprise Edition v4.6.0</b>
+            <b>Enterprise Edition v4.6.1</b>
             <hr>
             <p>Professional-grade audio metadata management for archivists, engineers,
             and audiophiles.</p>
-            <p><b>v4.6.0 Enterprise Features:</b></p>
+            <p><b>v4.6.1 Enterprise Features:</b></p>
             <ul>
                 <li>Batch rename with template engine</li>
                 <li>Undo / Redo per-file history stack</li>
